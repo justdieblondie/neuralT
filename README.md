@@ -31,3 +31,5 @@ After a successful build, start the application with:
 ```bash
 ./neuralT
 ```
+
+Press 'o' to load Neuro NPC example and F5 for more info. 
