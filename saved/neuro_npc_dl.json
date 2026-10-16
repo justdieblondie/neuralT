@@ -28,7 +28,7 @@
     {
       "id": 0,
       "label": "NPC_Health",
-      "desc": "Zdrowie podejmującego decyzję NPC, 0–1.",
+      "desc": "Health of the decision-making NPC, 0–1.",
       "isInput": true,
       "value": 0.640077,
       "speed": 0.874506,
@@ -40,7 +40,7 @@
     {
       "id": 1,
       "label": "NPC_Stamina",
-      "desc": "Aktualna wytrzymałość podejmującego decyzję NPC, 0–1.",
+      "desc": "Current stamina of the decision-making NPC, 0–1.",
       "isInput": true,
       "value": 0.0783921,
       "speed": 0.404614,
@@ -52,7 +52,7 @@
     {
       "id": 2,
       "label": "NPC_ResourceNeed",
-      "desc": "Potrzeba zdobycia zasobów, 0–1.",
+      "desc": "Need to acquire resources, 0–1.",
       "isInput": true,
       "value": 0.0628981,
       "speed": 0.228661,
@@ -64,7 +64,7 @@
     {
       "id": 3,
       "label": "NPC_Aggression",
-      "desc": "Profil zachowania: skłonność do agresji, 0–1.",
+      "desc": "Behavior profile: tendency toward aggression, 0–1.",
       "isInput": true,
       "value": 0.415129,
       "speed": 0.997481,
@@ -76,7 +76,7 @@
     {
       "id": 4,
       "label": "NPC_Loyalty",
-      "desc": "Profil zachowania: skłonność do ochrony sojuszników, 0–1.",
+      "desc": "Behavior profile: tendency to protect allies, 0–1.",
       "isInput": true,
       "value": 0.337949,
       "speed": 0.241208,
@@ -88,7 +88,7 @@
     {
       "id": 5,
       "label": "NPC_Greed",
-      "desc": "Profil zachowania: znaczenie osobistego zysku, 0–1.",
+      "desc": "Behavior profile: importance of personal gain, 0–1.",
       "isInput": true,
       "value": 0.0945342,
       "speed": 0.392033,
@@ -100,7 +100,7 @@
     {
       "id": 6,
       "label": "NPC_Caution",
-      "desc": "Profil zachowania: ostrożność, 0–1.",
+      "desc": "Behavior profile: caution, 0–1.",
       "isInput": true,
       "value": 0.596851,
       "speed": 0.159091,
@@ -112,7 +112,7 @@
     {
       "id": 7,
       "label": "NPC_RiskTolerance",
-      "desc": "Profil zachowania: akceptacja ryzyka, 0–1.",
+      "desc": "Behavior profile: risk tolerance, 0–1.",
       "isInput": true,
       "value": 0.632019,
       "speed": 0.597383,
@@ -124,7 +124,7 @@
     {
       "id": 8,
       "label": "NPC_Equipment",
-      "desc": "Zagregowana użyteczność aktualnego wyposażenia, 0–1.",
+      "desc": "Aggregate usefulness of the current equipment, 0–1.",
       "isInput": true,
       "value": 0.195008,
       "speed": 0.232286,
@@ -136,7 +136,7 @@
     {
       "id": 9,
       "label": "NPC_GoalUrgency",
-      "desc": "Pilność bieżącego celu (dowolnego rodzaju), 0–1.",
+      "desc": "Urgency of the current goal, 0–1.",
       "isInput": true,
       "value": 0.617276,
       "speed": 0.406624,
@@ -148,7 +148,7 @@
     {
       "id": 10,
       "label": "NPC_MemoryValence",
-      "desc": "Zagregowany emocjonalny bilans wcześniejszych wydarzeń, 0–1; neutralny = 0.5.",
+      "desc": "Aggregate emotional balance of earlier events, 0–1; neutral = 0.5.",
       "isInput": true,
       "value": 0.436678,
       "speed": 0.214204,
@@ -160,7 +160,7 @@
     {
       "id": 11,
       "label": "NPC_RecentActionSuccess",
-      "desc": "Zagregowana skuteczność ostatnio podejmowanych działań tego NPC (0–1). Nie dotyczy żadnej określonej postaci. Relacje z aktualnym podmiotem lub obiektem są przekazywane osobno przez Src_Relation, Tgt_Relation i Focus_Relation.",
+      "desc": "Aggregate effectiveness of this NPC’s recent actions, 0–1.",
       "isInput": true,
       "value": 0.935726,
       "speed": 0.177694,
@@ -172,7 +172,7 @@
     {
       "id": 12,
       "label": "Scene_ThreatLevel",
-      "desc": "Zagregowany poziom zagrożenia otoczenia, 0–1.",
+      "desc": "Aggregate threat level of the environment, 0–1.",
       "isInput": true,
       "value": 0.391008,
       "speed": 0.395473,
@@ -184,7 +184,7 @@
     {
       "id": 13,
       "label": "Scene_NearbyActorCount",
-      "desc": "Liczba pobliskich postaci, skalowana do 0–1.",
+      "desc": "Number of nearby actors, scaled to 0–1.",
       "isInput": true,
       "value": 0.368786,
       "speed": 0.749233,
@@ -196,7 +196,7 @@
     {
       "id": 14,
       "label": "Scene_HostileActorCount",
-      "desc": "Liczba postaci uznanych za wrogie, skalowana do 0–1.",
+      "desc": "Number of actors considered hostile, scaled to 0–1.",
       "isInput": true,
       "value": 0.501455,
       "speed": 0.388466,
@@ -208,7 +208,7 @@
     {
       "id": 15,
       "label": "Scene_FriendlyActorCount",
-      "desc": "Liczba postaci uznanych za przyjazne, skalowana do 0–1.",
+      "desc": "Number of actors considered friendly, scaled to 0–1.",
       "isInput": true,
       "value": 0.68593,
       "speed": 0.508237,
@@ -220,7 +220,7 @@
     {
       "id": 16,
       "label": "Scene_ExitAccess",
-      "desc": "Dostępność ewakuacji ze sceny, 0–1.",
+      "desc": "Availability of an exit from the scene, 0–1.",
       "isInput": true,
       "value": 0.534127,
       "speed": 0.487591,
@@ -232,7 +232,7 @@
     {
       "id": 17,
       "label": "Scene_Visibility",
-      "desc": "Ogólna widoczność, 0–1.",
+      "desc": "Overall visibility, 0–1.",
       "isInput": true,
       "value": 0.203857,
       "speed": 0.183764,
@@ -244,7 +244,7 @@
     {
       "id": 18,
       "label": "Scene_Noise",
-      "desc": "Natężenie aktualnego hałasu, 0–1.",
+      "desc": "Current noise intensity, 0–1.",
       "isInput": true,
       "value": 0.547472,
       "speed": 0.690719,
@@ -256,7 +256,7 @@
     {
       "id": 19,
       "label": "Scene_EnvironmentalHazard",
-      "desc": "Poziom zagrożeń środowiskowych, 0–1.",
+      "desc": "Level of environmental hazards, 0–1.",
       "isInput": true,
       "value": 0.409462,
       "speed": 0.930268,
@@ -268,7 +268,7 @@
     {
       "id": 20,
       "label": "Scene_CoverAvailability",
-      "desc": "Dostępność osłon w scenie, 0–1.",
+      "desc": "Availability of cover in the scene, 0–1.",
       "isInput": true,
       "value": 0.534559,
       "speed": 0.955624,
@@ -280,7 +280,7 @@
     {
       "id": 21,
       "label": "Scene_TimePressure",
-      "desc": "Presja czasu, 0–1.",
+      "desc": "Current time pressure, 0–1.",
       "isInput": true,
       "value": 0.342666,
       "speed": 0.6038,
@@ -292,7 +292,7 @@
     {
       "id": 22,
       "label": "Scene_ResourceAvailability",
-      "desc": "Łatwość pozyskania zasobów na scenie, 0–1.",
+      "desc": "Ease of acquiring resources in the scene, 0–1.",
       "isInput": true,
       "value": 0.45653,
       "speed": 0.52469,
@@ -304,7 +304,7 @@
     {
       "id": 23,
       "label": "Scene_SafeRouteAvailability",
-      "desc": "Dostępność względnie bezpiecznych przejść, 0–1.",
+      "desc": "Availability of relatively safe routes, 0–1.",
       "isInput": true,
       "value": 0.511291,
       "speed": 0.893805,
@@ -316,7 +316,7 @@
     {
       "id": 24,
       "label": "Act_MOVE_TO",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla MOVE_TO, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for MOVE_TO, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.521859,
       "speed": 0.452413,
@@ -328,7 +328,7 @@
     {
       "id": 25,
       "label": "Act_MOVE_AWAY",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla MOVE_AWAY, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for MOVE_AWAY, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.496257,
       "speed": 0.443648,
@@ -340,7 +340,7 @@
     {
       "id": 26,
       "label": "Act_CLIMB",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla CLIMB, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for CLIMB, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.546176,
       "speed": 0.17227,
@@ -352,7 +352,7 @@
     {
       "id": 27,
       "label": "Act_HIDE_BEHIND",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla HIDE_BEHIND, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for HIDE_BEHIND, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.294686,
       "speed": 0.872451,
@@ -364,7 +364,7 @@
     {
       "id": 28,
       "label": "Act_TAKE_COVER",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla TAKE_COVER, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for TAKE_COVER, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.705791,
       "speed": 0.685659,
@@ -376,7 +376,7 @@
     {
       "id": 29,
       "label": "Act_ESCAPE",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla ESCAPE, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for ESCAPE, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.706175,
       "speed": 0.535821,
@@ -388,7 +388,7 @@
     {
       "id": 30,
       "label": "Act_PICK_UP",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla PICK_UP, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for PICK_UP, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.412954,
       "speed": 0.114644,
@@ -400,7 +400,7 @@
     {
       "id": 31,
       "label": "Act_DROP",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla DROP, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for DROP, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.0413374,
       "speed": 0.237097,
@@ -412,7 +412,7 @@
     {
       "id": 32,
       "label": "Act_PUSH",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla PUSH, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for PUSH, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.546567,
       "speed": 0.75691,
@@ -424,7 +424,7 @@
     {
       "id": 33,
       "label": "Act_PULL",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla PULL, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for PULL, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.36565,
       "speed": 0.118487,
@@ -436,7 +436,7 @@
     {
       "id": 34,
       "label": "Act_THROW",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla THROW, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for THROW, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.623692,
       "speed": 0.402106,
@@ -448,7 +448,7 @@
     {
       "id": 35,
       "label": "Act_ROTATE",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla ROTATE, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for ROTATE, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.915113,
       "speed": 0.279556,
@@ -460,7 +460,7 @@
     {
       "id": 36,
       "label": "Act_CARRY",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla CARRY, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for CARRY, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.600626,
       "speed": 0.271056,
@@ -472,7 +472,7 @@
     {
       "id": 37,
       "label": "Act_OPEN",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla OPEN, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for OPEN, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.780358,
       "speed": 0.372444,
@@ -484,7 +484,7 @@
     {
       "id": 38,
       "label": "Act_CLOSE",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla CLOSE, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for CLOSE, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.733645,
       "speed": 0.884538,
@@ -496,7 +496,7 @@
     {
       "id": 39,
       "label": "Act_BREAK",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla BREAK, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for BREAK, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.425455,
       "speed": 0.352722,
@@ -508,7 +508,7 @@
     {
       "id": 40,
       "label": "Act_CUT",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla CUT, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for CUT, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.3343,
       "speed": 0.466678,
@@ -520,7 +520,7 @@
     {
       "id": 41,
       "label": "Act_IGNITE",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla IGNITE, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for IGNITE, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.586824,
       "speed": 0.803568,
@@ -532,7 +532,7 @@
     {
       "id": 42,
       "label": "Act_EXTINGUISH",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla EXTINGUISH, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for EXTINGUISH, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.743555,
       "speed": 0.217712,
@@ -544,7 +544,7 @@
     {
       "id": 43,
       "label": "Act_ATTACH",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla ATTACH, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for ATTACH, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.696125,
       "speed": 0.90669,
@@ -556,7 +556,7 @@
     {
       "id": 44,
       "label": "Act_DETACH",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla DETACH, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for DETACH, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.644437,
       "speed": 0.297703,
@@ -568,7 +568,7 @@
     {
       "id": 45,
       "label": "Act_ATTACK",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla ATTACK, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for ATTACK, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.66433,
       "speed": 0.777496,
@@ -580,7 +580,7 @@
     {
       "id": 46,
       "label": "Act_DEFEND",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla DEFEND, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for DEFEND, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.43048,
       "speed": 0.386569,
@@ -592,7 +592,7 @@
     {
       "id": 47,
       "label": "Act_HELP",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla HELP, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for HELP, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.189912,
       "speed": 0.714582,
@@ -604,7 +604,7 @@
     {
       "id": 48,
       "label": "Act_RESTRAIN",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla RESTRAIN, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for RESTRAIN, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.560648,
       "speed": 0.235454,
@@ -616,7 +616,7 @@
     {
       "id": 49,
       "label": "Act_GIVE",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla GIVE, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for GIVE, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.866329,
       "speed": 0.491108,
@@ -628,7 +628,7 @@
     {
       "id": 50,
       "label": "Act_TAKE_FROM",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla TAKE_FROM, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for TAKE_FROM, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.566464,
       "speed": 0.681824,
@@ -640,7 +640,7 @@
     {
       "id": 51,
       "label": "Act_TALK",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla TALK, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for TALK, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.788601,
       "speed": 0.79529,
@@ -652,7 +652,7 @@
     {
       "id": 52,
       "label": "Act_THREATEN",
-      "desc": "Kod typu działania kandydata (one-hot): 1 dla THREATEN, 0 dla innych. Ten sam zestaw operacji obowiązuje w każdej scenie; niedostępne interakcje nie są generowane.",
+      "desc": "Candidate action type code (one-hot): 1 for THREATEN, 0 otherwise. The same action set applies in every scene; unavailable interactions are not generated.",
       "isInput": true,
       "value": 0.159974,
       "speed": 0.454019,
@@ -664,7 +664,7 @@
     {
       "id": 53,
       "label": "Src_Exists",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Czy slot zawiera istniejący obiekt lub jednostkę (0 albo 1); jeśli 0, pozostałe pola tego slotu = 0. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: whether the slot contains an existing object or entity (0 or 1). The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.581801,
       "speed": 0.548626,
@@ -676,7 +676,7 @@
     {
       "id": 54,
       "label": "Src_IsActor",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Czy slot dotyczy jednostki/postaci (1), a nie obiektu lub elementu otoczenia (0). Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: whether the slot refers to an actor rather than an object (0 or 1). The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.356747,
       "speed": 0.333984,
@@ -688,7 +688,7 @@
     {
       "id": 55,
       "label": "Src_Health",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Bieżący stan zdrowia jednostki lub integralność/trwałość obiektu, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: current entity health or object integrity, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.782522,
       "speed": 0.575508,
@@ -700,7 +700,7 @@
     {
       "id": 56,
       "label": "Src_Threat",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Zagrożenie stwarzane przez daną jednostkę lub obiekt, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: threat posed by the entity or object, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.149726,
       "speed": 0.497718,
@@ -712,7 +712,7 @@
     {
       "id": 57,
       "label": "Src_Relation",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Nastawienie podejmującego decyzję NPC wobec danej jednostki: 0=wrogie, 0.5=neutralne, 1=przyjazne. Dla obiektu=0.5. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: NPC attitude toward the entity: 0 = hostile, 0.5 = neutral, 1 = friendly. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.685972,
       "speed": 0.239609,
@@ -724,7 +724,7 @@
     {
       "id": 58,
       "label": "Src_Distance",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Odległość od podejmującego decyzję NPC, znormalizowana do 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: distance from the decision-making NPC, normalized to 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.727858,
       "speed": 0.955095,
@@ -736,7 +736,7 @@
     {
       "id": 59,
       "label": "Src_Mass",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Znormalizowana masa obiektu lub jednostki, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: normalized entity or object mass, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.448256,
       "speed": 0.4188,
@@ -748,7 +748,7 @@
     {
       "id": 60,
       "label": "Src_Fragility",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Kruchość/podatność na uszkodzenie, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: fragility or susceptibility to damage, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.374187,
       "speed": 0.48881,
@@ -760,7 +760,7 @@
     {
       "id": 61,
       "label": "Src_Flammability",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Stopień palności materiału, 0–1; jeśli nie dotyczy, 0. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: material flammability, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.569845,
       "speed": 0.465145,
@@ -772,7 +772,7 @@
     {
       "id": 62,
       "label": "Src_Movable",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Możliwość przesunięcia obiektu lub jednostki, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: whether the entity or object can be moved, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.766748,
       "speed": 0.110889,
@@ -784,7 +784,7 @@
     {
       "id": 63,
       "label": "Src_Throwable",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Możliwość rzucenia danym obiektem, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: whether the object can be thrown, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.497696,
       "speed": 0.818859,
@@ -796,7 +796,7 @@
     {
       "id": 64,
       "label": "Src_Breakable",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Możliwość zniszczenia/rozbicia, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: whether the object can be destroyed or broken, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.590184,
       "speed": 0.812796,
@@ -808,7 +808,7 @@
     {
       "id": 65,
       "label": "Src_ContainsFuel",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Dostępna ilość paliwa/łatwopalnej zawartości, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: available amount of fuel or flammable contents, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.435086,
       "speed": 0.683903,
@@ -820,7 +820,7 @@
     {
       "id": 66,
       "label": "Src_CoverValue",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Potencjał ochrony/osłony, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: protection or cover potential, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.503136,
       "speed": 0.88063,
@@ -832,7 +832,7 @@
     {
       "id": 67,
       "label": "Src_Blockable",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Potencjał ograniczania dostępu lub ruchu, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: potential to restrict access or movement, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.264004,
       "speed": 0.3475,
@@ -844,7 +844,7 @@
     {
       "id": 68,
       "label": "Src_Climbable",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Możliwość wspięcia się na dany obiekt, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: whether the object can be climbed, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.402125,
       "speed": 0.546928,
@@ -856,7 +856,7 @@
     {
       "id": 69,
       "label": "Src_Value",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Wartość zasobowa lub ekonomiczna, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: resource or economic value, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.184204,
       "speed": 0.573207,
@@ -868,7 +868,7 @@
     {
       "id": 70,
       "label": "Src_Visibility",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Widoczność danego obiektu lub jednostki dla NPC, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: visibility to the NPC, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.813286,
       "speed": 0.597474,
@@ -880,7 +880,7 @@
     {
       "id": 71,
       "label": "Src_Reachability",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Osiągalność danego obiektu lub jednostki, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: reachability, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.54192,
       "speed": 0.481572,
@@ -892,7 +892,7 @@
     {
       "id": 72,
       "label": "Src_GoalRelevance",
-      "desc": "Źródło lub narzędzie bieżącej akcji: dowolna jednostka albo obiekt. Znaczenie tego obiektu lub jednostki dla bieżącego celu NPC, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Source or tool of the current action: relevance to the current NPC goal, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.238633,
       "speed": 0.427792,
@@ -904,7 +904,7 @@
     {
       "id": 73,
       "label": "Tgt_Exists",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Czy slot zawiera istniejący obiekt lub jednostkę (0 albo 1); jeśli 0, pozostałe pola tego slotu = 0. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: whether the slot contains an existing object or entity (0 or 1). The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.772156,
       "speed": 0.610622,
@@ -916,7 +916,7 @@
     {
       "id": 74,
       "label": "Tgt_IsActor",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Czy slot dotyczy jednostki/postaci (1), a nie obiektu lub elementu otoczenia (0). Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: whether the slot refers to an actor rather than an object (0 or 1). The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.68569,
       "speed": 0.66748,
@@ -928,7 +928,7 @@
     {
       "id": 75,
       "label": "Tgt_Health",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Bieżący stan zdrowia jednostki lub integralność/trwałość obiektu, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: current entity health or object integrity, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.868903,
       "speed": 0.535685,
@@ -940,7 +940,7 @@
     {
       "id": 76,
       "label": "Tgt_Threat",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Zagrożenie stwarzane przez daną jednostkę lub obiekt, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: threat posed by the entity or object, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.509697,
       "speed": 0.125718,
@@ -952,7 +952,7 @@
     {
       "id": 77,
       "label": "Tgt_Relation",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Nastawienie podejmującego decyzję NPC wobec danej jednostki: 0=wrogie, 0.5=neutralne, 1=przyjazne. Dla obiektu=0.5. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: NPC attitude toward the entity: 0 = hostile, 0.5 = neutral, 1 = friendly. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.751105,
       "speed": 0.83167,
@@ -964,7 +964,7 @@
     {
       "id": 78,
       "label": "Tgt_Distance",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Odległość od podejmującego decyzję NPC, znormalizowana do 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: distance from the decision-making NPC, normalized to 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.551217,
       "speed": 0.980557,
@@ -976,7 +976,7 @@
     {
       "id": 79,
       "label": "Tgt_Mass",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Znormalizowana masa obiektu lub jednostki, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: normalized entity or object mass, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.690258,
       "speed": 0.28295,
@@ -988,7 +988,7 @@
     {
       "id": 80,
       "label": "Tgt_Fragility",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Kruchość/podatność na uszkodzenie, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: fragility or susceptibility to damage, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.344692,
       "speed": 0.860496,
@@ -1000,7 +1000,7 @@
     {
       "id": 81,
       "label": "Tgt_Flammability",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Stopień palności materiału, 0–1; jeśli nie dotyczy, 0. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: material flammability, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.932,
       "speed": 0.287972,
@@ -1012,7 +1012,7 @@
     {
       "id": 82,
       "label": "Tgt_Movable",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Możliwość przesunięcia obiektu lub jednostki, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: whether the entity or object can be moved, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.73035,
       "speed": 0.346046,
@@ -1024,7 +1024,7 @@
     {
       "id": 83,
       "label": "Tgt_Throwable",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Możliwość rzucenia danym obiektem, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: whether the object can be thrown, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.586817,
       "speed": 0.975775,
@@ -1036,7 +1036,7 @@
     {
       "id": 84,
       "label": "Tgt_Breakable",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Możliwość zniszczenia/rozbicia, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: whether the object can be destroyed or broken, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.772139,
       "speed": 0.331599,
@@ -1048,7 +1048,7 @@
     {
       "id": 85,
       "label": "Tgt_ContainsFuel",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Dostępna ilość paliwa/łatwopalnej zawartości, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: available amount of fuel or flammable contents, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.513648,
       "speed": 0.573885,
@@ -1060,7 +1060,7 @@
     {
       "id": 86,
       "label": "Tgt_CoverValue",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Potencjał ochrony/osłony, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: protection or cover potential, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.739858,
       "speed": 0.597697,
@@ -1072,7 +1072,7 @@
     {
       "id": 87,
       "label": "Tgt_Blockable",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Potencjał ograniczania dostępu lub ruchu, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: potential to restrict access or movement, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.0264075,
       "speed": 0.824266,
@@ -1084,7 +1084,7 @@
     {
       "id": 88,
       "label": "Tgt_Climbable",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Możliwość wspięcia się na dany obiekt, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: whether the object can be climbed, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.160278,
       "speed": 0.576638,
@@ -1096,7 +1096,7 @@
     {
       "id": 89,
       "label": "Tgt_Value",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Wartość zasobowa lub ekonomiczna, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: resource or economic value, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.331841,
       "speed": 0.308376,
@@ -1108,7 +1108,7 @@
     {
       "id": 90,
       "label": "Tgt_Visibility",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Widoczność danego obiektu lub jednostki dla NPC, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: visibility to the NPC, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.476742,
       "speed": 0.36431,
@@ -1120,7 +1120,7 @@
     {
       "id": 91,
       "label": "Tgt_Reachability",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Osiągalność danego obiektu lub jednostki, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: reachability, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.62433,
       "speed": 0.300408,
@@ -1132,7 +1132,7 @@
     {
       "id": 92,
       "label": "Tgt_GoalRelevance",
-      "desc": "Bezpośredni cel bieżącej akcji: dowolna jednostka albo obiekt. Znaczenie tego obiektu lub jednostki dla bieżącego celu NPC, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Direct target of the current action: relevance to the current NPC goal, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.608033,
       "speed": 0.64489,
@@ -1144,7 +1144,7 @@
     {
       "id": 93,
       "label": "Focus_Exists",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Czy slot zawiera istniejący obiekt lub jednostkę (0 albo 1); jeśli 0, pozostałe pola tego slotu = 0. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: whether the slot contains an existing object or entity (0 or 1). The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.446629,
       "speed": 0.426635,
@@ -1156,7 +1156,7 @@
     {
       "id": 94,
       "label": "Focus_IsActor",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Czy slot dotyczy jednostki/postaci (1), a nie obiektu lub elementu otoczenia (0). Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: whether the slot refers to an actor rather than an object (0 or 1). The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.262534,
       "speed": 0.682607,
@@ -1168,7 +1168,7 @@
     {
       "id": 95,
       "label": "Focus_Health",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Bieżący stan zdrowia jednostki lub integralność/trwałość obiektu, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: current entity health or object integrity, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.284068,
       "speed": 0.418799,
@@ -1180,7 +1180,7 @@
     {
       "id": 96,
       "label": "Focus_Threat",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Zagrożenie stwarzane przez daną jednostkę lub obiekt, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: threat posed by the entity or object, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.38714,
       "speed": 0.476437,
@@ -1192,7 +1192,7 @@
     {
       "id": 97,
       "label": "Focus_Relation",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Nastawienie podejmującego decyzję NPC wobec danej jednostki: 0=wrogie, 0.5=neutralne, 1=przyjazne. Dla obiektu=0.5. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: NPC attitude toward the entity: 0 = hostile, 0.5 = neutral, 1 = friendly. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.694601,
       "speed": 0.284228,
@@ -1204,7 +1204,7 @@
     {
       "id": 98,
       "label": "Focus_Distance",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Odległość od podejmującego decyzję NPC, znormalizowana do 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: distance from the decision-making NPC, normalized to 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.856409,
       "speed": 0.142244,
@@ -1216,7 +1216,7 @@
     {
       "id": 99,
       "label": "Focus_Mass",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Znormalizowana masa obiektu lub jednostki, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: normalized entity or object mass, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.371141,
       "speed": 0.515457,
@@ -1228,7 +1228,7 @@
     {
       "id": 100,
       "label": "Focus_Fragility",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Kruchość/podatność na uszkodzenie, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: fragility or susceptibility to damage, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.377793,
       "speed": 0.708986,
@@ -1240,7 +1240,7 @@
     {
       "id": 101,
       "label": "Focus_Flammability",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Stopień palności materiału, 0–1; jeśli nie dotyczy, 0. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: material flammability, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.402915,
       "speed": 0.202916,
@@ -1252,7 +1252,7 @@
     {
       "id": 102,
       "label": "Focus_Movable",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Możliwość przesunięcia obiektu lub jednostki, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: whether the entity or object can be moved, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.532696,
       "speed": 0.944798,
@@ -1264,7 +1264,7 @@
     {
       "id": 103,
       "label": "Focus_Throwable",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Możliwość rzucenia danym obiektem, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: whether the object can be thrown, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.23713,
       "speed": 0.232172,
@@ -1276,7 +1276,7 @@
     {
       "id": 104,
       "label": "Focus_Breakable",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Możliwość zniszczenia/rozbicia, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: whether the object can be destroyed or broken, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.537849,
       "speed": 0.362069,
@@ -1288,7 +1288,7 @@
     {
       "id": 105,
       "label": "Focus_ContainsFuel",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Dostępna ilość paliwa/łatwopalnej zawartości, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: available amount of fuel or flammable contents, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.282292,
       "speed": 0.665554,
@@ -1300,7 +1300,7 @@
     {
       "id": 106,
       "label": "Focus_CoverValue",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Potencjał ochrony/osłony, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: protection or cover potential, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.217562,
       "speed": 0.184608,
@@ -1312,7 +1312,7 @@
     {
       "id": 107,
       "label": "Focus_Blockable",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Potencjał ograniczania dostępu lub ruchu, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: potential to restrict access or movement, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.2398,
       "speed": 0.916407,
@@ -1324,7 +1324,7 @@
     {
       "id": 108,
       "label": "Focus_Climbable",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Możliwość wspięcia się na dany obiekt, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: whether the object can be climbed, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.629624,
       "speed": 0.898041,
@@ -1336,7 +1336,7 @@
     {
       "id": 109,
       "label": "Focus_Value",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Wartość zasobowa lub ekonomiczna, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: resource or economic value, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.592762,
       "speed": 0.354945,
@@ -1348,7 +1348,7 @@
     {
       "id": 110,
       "label": "Focus_Visibility",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Widoczność danego obiektu lub jednostki dla NPC, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: visibility to the NPC, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.738517,
       "speed": 0.852626,
@@ -1360,7 +1360,7 @@
     {
       "id": 111,
       "label": "Focus_Reachability",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Osiągalność danego obiektu lub jednostki, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: reachability, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.571969,
       "speed": 0.12375,
@@ -1372,7 +1372,7 @@
     {
       "id": 112,
       "label": "Focus_GoalRelevance",
-      "desc": "Opcjonalna jednostka lub obiekt będący punktem odniesienia dla aktualnego celu NPC. Znaczenie tego obiektu lub jednostki dla bieżącego celu NPC, 0–1. Identyczny schemat i kolejność pól dla Src, Tgt, Focus.",
+      "desc": "Optional reference entity or object for the current NPC goal: relevance to the current NPC goal, 0–1. The same field scheme and order apply to Src, Tgt, and Focus.",
       "isInput": true,
       "value": 0.450995,
       "speed": 0.280516,
@@ -1384,7 +1384,7 @@
     {
       "id": 113,
       "label": "Cand_SourceTargetDistance",
-      "desc": "Odległość pomiędzy źródłem a celem działania, 0–1.",
+      "desc": "Distance between the source and target of the action, 0–1.",
       "isInput": true,
       "value": 0.44023,
       "speed": 0.951547,
@@ -1396,7 +1396,7 @@
     {
       "id": 114,
       "label": "Cand_Effort",
-      "desc": "Fizyczny wysiłek wymagany przez akcję, 0–1.",
+      "desc": "Physical effort required by the action, 0–1.",
       "isInput": true,
       "value": 0.516636,
       "speed": 0.467982,
@@ -1408,7 +1408,7 @@
     {
       "id": 115,
       "label": "Cand_TravelTime",
-      "desc": "Przewidywany czas dotarcia i wykonania działania, 0–1.",
+      "desc": "Expected time to reach and perform the action, 0–1.",
       "isInput": true,
       "value": 0.692451,
       "speed": 0.596604,
@@ -1420,7 +1420,7 @@
     {
       "id": 116,
       "label": "Cand_ResourceCost",
-      "desc": "Zasoby niezbędne do wykonania działania, 0–1.",
+      "desc": "Resources required to perform the action, 0–1.",
       "isInput": true,
       "value": 0.560518,
       "speed": 0.456345,
@@ -1432,7 +1432,7 @@
     {
       "id": 117,
       "label": "Cand_Noise",
-      "desc": "Szacowana głośność działania, 0–1.",
+      "desc": "Estimated loudness of the action, 0–1.",
       "isInput": true,
       "value": 0.316359,
       "speed": 0.383651,
@@ -1444,7 +1444,7 @@
     {
       "id": 118,
       "label": "Cand_Exposure",
-      "desc": "Stopień ekspozycji NPC podczas działania, 0–1.",
+      "desc": "Degree of NPC exposure during the action, 0–1.",
       "isInput": true,
       "value": 0.465943,
       "speed": 0.626702,
@@ -1456,7 +1456,7 @@
     {
       "id": 119,
       "label": "Cand_EnvironmentEffect",
-      "desc": "Przewidywany wpływ działania na dowolne właściwości i stan otoczenia, 0–1. Nie ogranicza się do ognia ani konkretnego rodzaju środowiska.",
+      "desc": "Expected effect of the action on the environment, 0–1.",
       "isInput": true,
       "value": 0.71145,
       "speed": 0.82258,
@@ -1468,7 +1468,7 @@
     {
       "id": 120,
       "label": "Cand_ProtectionChange",
-      "desc": "Skala przewidywanej zmiany możliwości ochrony lub osłony przed zagrożeniem, 0–1.",
+      "desc": "Magnitude of the expected change in protection or cover from threats, 0–1.",
       "isInput": true,
       "value": 0.505821,
       "speed": 0.856371,
@@ -1480,7 +1480,7 @@
     {
       "id": 121,
       "label": "Cand_AccessChange",
-      "desc": "Skala przewidywanej zmiany dostępności obszarów, przejść lub obiektów, 0–1.",
+      "desc": "Magnitude of the expected change in access to areas, routes, or objects, 0–1.",
       "isInput": true,
       "value": 0.266784,
       "speed": 0.51515,
@@ -1492,7 +1492,7 @@
     {
       "id": 122,
       "label": "Cand_AreaEffect",
-      "desc": "Zasięg przestrzenny skutku działania, 0–1.",
+      "desc": "Spatial range of the action’s effect, 0–1.",
       "isInput": true,
       "value": 0.960368,
       "speed": 0.354097,
@@ -1504,7 +1504,7 @@
     {
       "id": 123,
       "label": "Cand_EntitiesAffected",
-      "desc": "Znormalizowana liczba jednostek i obiektów, na które działanie może wpłynąć, 0–1.",
+      "desc": "Normalized number of entities and objects the action can affect, 0–1.",
       "isInput": true,
       "value": 0.362327,
       "speed": 0.670477,
@@ -1516,7 +1516,7 @@
     {
       "id": 124,
       "label": "Cand_RequiresTool",
-      "desc": "Czy akcja wymaga użycia narzędzia, 0/1.",
+      "desc": "Whether the action requires a tool, 0 or 1.",
       "isInput": true,
       "value": 0.387039,
       "speed": 0.674599,
@@ -1528,7 +1528,7 @@
     {
       "id": 125,
       "label": "Cand_Range",
-      "desc": "Wymagany zasięg akcji w normalizacji 0–1.",
+      "desc": "Required action range, normalized to 0–1.",
       "isInput": true,
       "value": 0.514414,
       "speed": 0.732785,
@@ -1540,7 +1540,7 @@
     {
       "id": 126,
       "label": "Cand_Feasibility",
-      "desc": "Szacowana wykonalność według silnika, 0–1; lista kandydatów nadal wymaga twardej walidacji legalności.",
+      "desc": "Engine-estimated feasibility, 0–1; candidates still require legality validation.",
       "isInput": true,
       "value": 0.237594,
       "speed": 0.599167,
@@ -1552,7 +1552,7 @@
     {
       "id": 127,
       "label": "H1_1",
-      "desc": "Warstwa 1, neuron 1.",
+      "desc": "Layer 1, neuron 1.",
       "isInput": false,
       "value": 2.70823,
       "speed": 0,
@@ -1564,7 +1564,7 @@
     {
       "id": 128,
       "label": "H1_2",
-      "desc": "Warstwa 1, neuron 2.",
+      "desc": "Layer 1, neuron 2.",
       "isInput": false,
       "value": 6.26443,
       "speed": 0,
@@ -1576,7 +1576,7 @@
     {
       "id": 129,
       "label": "H1_3",
-      "desc": "Warstwa 1, neuron 3.",
+      "desc": "Layer 1, neuron 3.",
       "isInput": false,
       "value": 6.28758,
       "speed": 0,
@@ -1588,7 +1588,7 @@
     {
       "id": 130,
       "label": "H1_4",
-      "desc": "Warstwa 1, neuron 4.",
+      "desc": "Layer 1, neuron 4.",
       "isInput": false,
       "value": 1.8902,
       "speed": 0,
@@ -1600,7 +1600,7 @@
     {
       "id": 131,
       "label": "H1_5",
-      "desc": "Warstwa 1, neuron 5.",
+      "desc": "Layer 1, neuron 5.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1612,7 +1612,7 @@
     {
       "id": 132,
       "label": "H1_6",
-      "desc": "Warstwa 1, neuron 6.",
+      "desc": "Layer 1, neuron 6.",
       "isInput": false,
       "value": 7.05697,
       "speed": 0,
@@ -1624,7 +1624,7 @@
     {
       "id": 133,
       "label": "H1_7",
-      "desc": "Warstwa 1, neuron 7.",
+      "desc": "Layer 1, neuron 7.",
       "isInput": false,
       "value": 2.71362,
       "speed": 0,
@@ -1636,7 +1636,7 @@
     {
       "id": 134,
       "label": "H1_8",
-      "desc": "Warstwa 1, neuron 8.",
+      "desc": "Layer 1, neuron 8.",
       "isInput": false,
       "value": 4.65846,
       "speed": 0,
@@ -1648,7 +1648,7 @@
     {
       "id": 135,
       "label": "H1_9",
-      "desc": "Warstwa 1, neuron 9.",
+      "desc": "Layer 1, neuron 9.",
       "isInput": false,
       "value": 2.4597,
       "speed": 0,
@@ -1660,7 +1660,7 @@
     {
       "id": 136,
       "label": "H1_10",
-      "desc": "Warstwa 1, neuron 10.",
+      "desc": "Layer 1, neuron 10.",
       "isInput": false,
       "value": 2.08087,
       "speed": 0,
@@ -1672,7 +1672,7 @@
     {
       "id": 137,
       "label": "H1_11",
-      "desc": "Warstwa 1, neuron 11.",
+      "desc": "Layer 1, neuron 11.",
       "isInput": false,
       "value": 4.20816,
       "speed": 0,
@@ -1684,7 +1684,7 @@
     {
       "id": 138,
       "label": "H1_12",
-      "desc": "Warstwa 1, neuron 12.",
+      "desc": "Layer 1, neuron 12.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1696,7 +1696,7 @@
     {
       "id": 139,
       "label": "H1_13",
-      "desc": "Warstwa 1, neuron 13.",
+      "desc": "Layer 1, neuron 13.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1708,7 +1708,7 @@
     {
       "id": 140,
       "label": "H1_14",
-      "desc": "Warstwa 1, neuron 14.",
+      "desc": "Layer 1, neuron 14.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1720,7 +1720,7 @@
     {
       "id": 141,
       "label": "H1_15",
-      "desc": "Warstwa 1, neuron 15.",
+      "desc": "Layer 1, neuron 15.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1732,7 +1732,7 @@
     {
       "id": 142,
       "label": "H1_16",
-      "desc": "Warstwa 1, neuron 16.",
+      "desc": "Layer 1, neuron 16.",
       "isInput": false,
       "value": 6.42246,
       "speed": 0,
@@ -1744,7 +1744,7 @@
     {
       "id": 143,
       "label": "H1_17",
-      "desc": "Warstwa 1, neuron 17.",
+      "desc": "Layer 1, neuron 17.",
       "isInput": false,
       "value": 4.53772,
       "speed": 0,
@@ -1756,7 +1756,7 @@
     {
       "id": 144,
       "label": "H1_18",
-      "desc": "Warstwa 1, neuron 18.",
+      "desc": "Layer 1, neuron 18.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1768,7 +1768,7 @@
     {
       "id": 145,
       "label": "H1_19",
-      "desc": "Warstwa 1, neuron 19.",
+      "desc": "Layer 1, neuron 19.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1780,7 +1780,7 @@
     {
       "id": 146,
       "label": "H1_20",
-      "desc": "Warstwa 1, neuron 20.",
+      "desc": "Layer 1, neuron 20.",
       "isInput": false,
       "value": 6.72551,
       "speed": 0,
@@ -1792,7 +1792,7 @@
     {
       "id": 147,
       "label": "H1_21",
-      "desc": "Warstwa 1, neuron 21.",
+      "desc": "Layer 1, neuron 21.",
       "isInput": false,
       "value": 1.44383,
       "speed": 0,
@@ -1804,7 +1804,7 @@
     {
       "id": 148,
       "label": "H1_22",
-      "desc": "Warstwa 1, neuron 22.",
+      "desc": "Layer 1, neuron 22.",
       "isInput": false,
       "value": 3.89808,
       "speed": 0,
@@ -1816,7 +1816,7 @@
     {
       "id": 149,
       "label": "H1_23",
-      "desc": "Warstwa 1, neuron 23.",
+      "desc": "Layer 1, neuron 23.",
       "isInput": false,
       "value": 7.15189,
       "speed": 0,
@@ -1828,7 +1828,7 @@
     {
       "id": 150,
       "label": "H1_24",
-      "desc": "Warstwa 1, neuron 24.",
+      "desc": "Layer 1, neuron 24.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1840,7 +1840,7 @@
     {
       "id": 151,
       "label": "H1_25",
-      "desc": "Warstwa 1, neuron 25.",
+      "desc": "Layer 1, neuron 25.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1852,7 +1852,7 @@
     {
       "id": 152,
       "label": "H1_26",
-      "desc": "Warstwa 1, neuron 26.",
+      "desc": "Layer 1, neuron 26.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1864,7 +1864,7 @@
     {
       "id": 153,
       "label": "H1_27",
-      "desc": "Warstwa 1, neuron 27.",
+      "desc": "Layer 1, neuron 27.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1876,7 +1876,7 @@
     {
       "id": 154,
       "label": "H1_28",
-      "desc": "Warstwa 1, neuron 28.",
+      "desc": "Layer 1, neuron 28.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1888,7 +1888,7 @@
     {
       "id": 155,
       "label": "H1_29",
-      "desc": "Warstwa 1, neuron 29.",
+      "desc": "Layer 1, neuron 29.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1900,7 +1900,7 @@
     {
       "id": 156,
       "label": "H1_30",
-      "desc": "Warstwa 1, neuron 30.",
+      "desc": "Layer 1, neuron 30.",
       "isInput": false,
       "value": 4.23068,
       "speed": 0,
@@ -1912,7 +1912,7 @@
     {
       "id": 157,
       "label": "H1_31",
-      "desc": "Warstwa 1, neuron 31.",
+      "desc": "Layer 1, neuron 31.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1924,7 +1924,7 @@
     {
       "id": 158,
       "label": "H1_32",
-      "desc": "Warstwa 1, neuron 32.",
+      "desc": "Layer 1, neuron 32.",
       "isInput": false,
       "value": 7.69378,
       "speed": 0,
@@ -1936,7 +1936,7 @@
     {
       "id": 159,
       "label": "H1_33",
-      "desc": "Warstwa 1, neuron 33.",
+      "desc": "Layer 1, neuron 33.",
       "isInput": false,
       "value": 0.428484,
       "speed": 0,
@@ -1948,7 +1948,7 @@
     {
       "id": 160,
       "label": "H1_34",
-      "desc": "Warstwa 1, neuron 34.",
+      "desc": "Layer 1, neuron 34.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1960,7 +1960,7 @@
     {
       "id": 161,
       "label": "H1_35",
-      "desc": "Warstwa 1, neuron 35.",
+      "desc": "Layer 1, neuron 35.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1972,7 +1972,7 @@
     {
       "id": 162,
       "label": "H1_36",
-      "desc": "Warstwa 1, neuron 36.",
+      "desc": "Layer 1, neuron 36.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -1984,7 +1984,7 @@
     {
       "id": 163,
       "label": "H1_37",
-      "desc": "Warstwa 1, neuron 37.",
+      "desc": "Layer 1, neuron 37.",
       "isInput": false,
       "value": 3.61425,
       "speed": 0,
@@ -1996,7 +1996,7 @@
     {
       "id": 164,
       "label": "H1_38",
-      "desc": "Warstwa 1, neuron 38.",
+      "desc": "Layer 1, neuron 38.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2008,7 +2008,7 @@
     {
       "id": 165,
       "label": "H1_39",
-      "desc": "Warstwa 1, neuron 39.",
+      "desc": "Layer 1, neuron 39.",
       "isInput": false,
       "value": 0.315301,
       "speed": 0,
@@ -2020,7 +2020,7 @@
     {
       "id": 166,
       "label": "H1_40",
-      "desc": "Warstwa 1, neuron 40.",
+      "desc": "Layer 1, neuron 40.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2032,7 +2032,7 @@
     {
       "id": 167,
       "label": "H1_41",
-      "desc": "Warstwa 1, neuron 41.",
+      "desc": "Layer 1, neuron 41.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2044,7 +2044,7 @@
     {
       "id": 168,
       "label": "H1_42",
-      "desc": "Warstwa 1, neuron 42.",
+      "desc": "Layer 1, neuron 42.",
       "isInput": false,
       "value": 1.92847,
       "speed": 0,
@@ -2056,7 +2056,7 @@
     {
       "id": 169,
       "label": "H1_43",
-      "desc": "Warstwa 1, neuron 43.",
+      "desc": "Layer 1, neuron 43.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2068,7 +2068,7 @@
     {
       "id": 170,
       "label": "H1_44",
-      "desc": "Warstwa 1, neuron 44.",
+      "desc": "Layer 1, neuron 44.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2080,7 +2080,7 @@
     {
       "id": 171,
       "label": "H1_45",
-      "desc": "Warstwa 1, neuron 45.",
+      "desc": "Layer 1, neuron 45.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2092,7 +2092,7 @@
     {
       "id": 172,
       "label": "H1_46",
-      "desc": "Warstwa 1, neuron 46.",
+      "desc": "Layer 1, neuron 46.",
       "isInput": false,
       "value": 3.42301,
       "speed": 0,
@@ -2104,7 +2104,7 @@
     {
       "id": 173,
       "label": "H1_47",
-      "desc": "Warstwa 1, neuron 47.",
+      "desc": "Layer 1, neuron 47.",
       "isInput": false,
       "value": 1.76734,
       "speed": 0,
@@ -2116,7 +2116,7 @@
     {
       "id": 174,
       "label": "H1_48",
-      "desc": "Warstwa 1, neuron 48.",
+      "desc": "Layer 1, neuron 48.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2128,7 +2128,7 @@
     {
       "id": 175,
       "label": "H2_1",
-      "desc": "Warstwa 2, neuron 1.",
+      "desc": "Layer 2, neuron 1.",
       "isInput": false,
       "value": 41.351,
       "speed": 0,
@@ -2140,7 +2140,7 @@
     {
       "id": 176,
       "label": "H2_2",
-      "desc": "Warstwa 2, neuron 2.",
+      "desc": "Layer 2, neuron 2.",
       "isInput": false,
       "value": 62.768,
       "speed": 0,
@@ -2152,7 +2152,7 @@
     {
       "id": 177,
       "label": "H2_3",
-      "desc": "Warstwa 2, neuron 3.",
+      "desc": "Layer 2, neuron 3.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2164,7 +2164,7 @@
     {
       "id": 178,
       "label": "H2_4",
-      "desc": "Warstwa 2, neuron 4.",
+      "desc": "Layer 2, neuron 4.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2176,7 +2176,7 @@
     {
       "id": 179,
       "label": "H2_5",
-      "desc": "Warstwa 2, neuron 5.",
+      "desc": "Layer 2, neuron 5.",
       "isInput": false,
       "value": 22.8617,
       "speed": 0,
@@ -2188,7 +2188,7 @@
     {
       "id": 180,
       "label": "H2_6",
-      "desc": "Warstwa 2, neuron 6.",
+      "desc": "Layer 2, neuron 6.",
       "isInput": false,
       "value": 91.4837,
       "speed": 0,
@@ -2200,7 +2200,7 @@
     {
       "id": 181,
       "label": "H2_7",
-      "desc": "Warstwa 2, neuron 7.",
+      "desc": "Layer 2, neuron 7.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2212,7 +2212,7 @@
     {
       "id": 182,
       "label": "H2_8",
-      "desc": "Warstwa 2, neuron 8.",
+      "desc": "Layer 2, neuron 8.",
       "isInput": false,
       "value": 103.221,
       "speed": 0,
@@ -2224,7 +2224,7 @@
     {
       "id": 183,
       "label": "H2_9",
-      "desc": "Warstwa 2, neuron 9.",
+      "desc": "Layer 2, neuron 9.",
       "isInput": false,
       "value": 15.5855,
       "speed": 0,
@@ -2236,7 +2236,7 @@
     {
       "id": 184,
       "label": "H2_10",
-      "desc": "Warstwa 2, neuron 10.",
+      "desc": "Layer 2, neuron 10.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2248,7 +2248,7 @@
     {
       "id": 185,
       "label": "H2_11",
-      "desc": "Warstwa 2, neuron 11.",
+      "desc": "Layer 2, neuron 11.",
       "isInput": false,
       "value": 103.925,
       "speed": 0,
@@ -2260,7 +2260,7 @@
     {
       "id": 186,
       "label": "H2_12",
-      "desc": "Warstwa 2, neuron 12.",
+      "desc": "Layer 2, neuron 12.",
       "isInput": false,
       "value": 28.9645,
       "speed": 0,
@@ -2272,7 +2272,7 @@
     {
       "id": 187,
       "label": "H2_13",
-      "desc": "Warstwa 2, neuron 13.",
+      "desc": "Layer 2, neuron 13.",
       "isInput": false,
       "value": 4.32818,
       "speed": 0,
@@ -2284,7 +2284,7 @@
     {
       "id": 188,
       "label": "H2_14",
-      "desc": "Warstwa 2, neuron 14.",
+      "desc": "Layer 2, neuron 14.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2296,7 +2296,7 @@
     {
       "id": 189,
       "label": "H2_15",
-      "desc": "Warstwa 2, neuron 15.",
+      "desc": "Layer 2, neuron 15.",
       "isInput": false,
       "value": 0,
       "speed": 0,
@@ -2308,7 +2308,7 @@
     {
       "id": 199,
       "label": "ActionPreference",
-      "desc": "Główny wynik scorera dla jednego aktualnego kandydata, 0–1. Kandydat określa akcję, źródło i cel. Porównanie wyników różnych kandydatów służy wyborowi następnej akcji.",
+      "desc": "Primary scorer output for one current candidate, 0–1. The candidate defines an action, source, and target.",
       "isInput": false,
       "value": 1,
       "speed": 0,
@@ -2320,7 +2320,7 @@
     {
       "id": 200,
       "label": "SuccessChance",
-      "desc": "Predykcja prawdopodobieństwa poprawnego wykonania tej akcji, 0–1. Wymaga sygnału treningowego z rezultatów symulacji.",
+      "desc": "Predicted probability of successfully performing this action, 0–1.",
       "isInput": false,
       "value": 3.93219e-35,
       "speed": 0,
@@ -2332,7 +2332,7 @@
     {
       "id": 201,
       "label": "SelfHarmRisk",
-      "desc": "Przewidywane ryzyko obrażeń dla podejmującego decyzję NPC, 0–1.",
+      "desc": "Predicted risk of injury to the decision-making NPC, 0–1.",
       "isInput": false,
       "value": 5.34367e-33,
       "speed": 0,
@@ -2344,7 +2344,7 @@
     {
       "id": 202,
       "label": "FocusHarmRisk",
-      "desc": "Przewidywane ryzyko uszkodzenia Focus (dowolnej istotnej postaci lub obiektu), 0–1; gdy nie ma Focus, maskować lub ustawiać 0.",
+      "desc": "Predicted risk of damage to Focus, 0–1; use 0 when Focus is absent.",
       "isInput": false,
       "value": 5.95603e-16,
       "speed": 0,
@@ -2356,7 +2356,7 @@
     {
       "id": 203,
       "label": "GoalProgressDelta",
-      "desc": "Przewidywana zmiana postępu bieżącego celu po tej akcji: 0=duże pogorszenie, 0.5=brak zmiany, 1=duża poprawa.",
+      "desc": "Predicted change in current-goal progress after this action: 0 = major decline, 0.5 = no change, 1 = major improvement.",
       "isInput": false,
       "value": 1,
       "speed": 0,
@@ -2368,7 +2368,7 @@
     {
       "id": 204,
       "label": "ResourceDelta",
-      "desc": "Przewidywana zmiana zasobów NPC po akcji: 0=duża strata, 0.5=brak zmiany, 1=duży zysk.",
+      "desc": "Predicted change in NPC resources after the action: 0 = major loss, 0.5 = no change, 1 = major gain.",
       "isInput": false,
       "value": 1,
       "speed": 0,
@@ -2380,7 +2380,7 @@
     {
       "id": 205,
       "label": "ExecutionIntensity",
-      "desc": "Siła/stanowczość wykonania, 0–1; silnik interpretuje tylko dla działań, dla których ten parametr ma sens, i ogranicza go fizyką/regułami.",
+      "desc": "Execution strength or decisiveness, 0–1; constrained by physics and rules.",
       "isInput": false,
       "value": 1,
       "speed": 0,
