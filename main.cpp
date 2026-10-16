@@ -1,5 +1,6 @@
 
-// main.cpp  - NeuralT - Neural Editor v2.7
+// main.cpp  - NeuralT - Neural Editor v3.0
+// Author: justdieblondie
 #include <cfloat>
 #include <cstdarg>
 #include <cstddef>
@@ -770,6 +771,38 @@ static void NG_InsertHiddenAfterCurrent(NeuralGraph& g){
     g.currentLayer = insertPos;
     // Add a single neuron to keep connectivity meaningful and rebuild edges/layout
     NG_AddNeuron(g, g.currentLayer);
+}
+
+static bool NG_RemoveCurrentHiddenLayer(NeuralGraph& g){
+    const int layerIdx=g.currentLayer;
+    if(layerIdx<0 || layerIdx>=(int)g.layers.size()) return false;
+    if(g.layers[layerIdx].kind!=LayerKind::Hidden){
+        Logf("Only hidden layers can be deleted.");
+        return false;
+    }
+
+    std::vector<int> removedIndices=g.layers[layerIdx].nodeIdx;
+    std::vector<int> removedIds;
+    removedIds.reserve(removedIndices.size());
+    for(int idx:removedIndices)
+        if(idx>=0 && idx<(int)g.nodes.size()) removedIds.push_back(g.nodes[idx].id);
+
+    g.layers.erase(g.layers.begin()+layerIdx);
+    std::sort(removedIndices.begin(),removedIndices.end(),std::greater<int>());
+    for(int removedIdx:removedIndices){
+        if(removedIdx<0 || removedIdx>=(int)g.nodes.size()) continue;
+        g.nodes.erase(g.nodes.begin()+removedIdx);
+        for(Layer& layer:g.layers)
+            for(int& idx:layer.nodeIdx) if(idx>removedIdx) --idx;
+    }
+
+    if(std::find(removedIds.begin(),removedIds.end(),g.selected)!=removedIds.end()) g.selected=-1;
+    g.currentLayer=std::clamp(layerIdx-1,0,std::max(0,(int)g.layers.size()-1));
+    NG_RebuildEdges(g);
+    g.layoutLayers(g.lastCanvasW>0?g.lastCanvasW:800.0f,
+                   g.lastCanvasH>0?g.lastCanvasH:500.0f);
+    Logf("Hidden layer deleted; neighbouring layers reconnected.");
+    return true;
 }
 // Build a specific multi-layer topology
 static void NG_BuildTopology(NeuralGraph& g, int inN, const std::vector<int>& hidden, int outN){
@@ -1542,6 +1575,37 @@ static bool IsVisibleInput(const NeuralGraph& graph, int nodeIndex){
     return graph.expandedInputGroup.empty() || InputGroupName(graph.nodes[nodeIndex].label) == graph.expandedInputGroup;
 }
 
+static int InputDisplaySlotCount(const NeuralGraph& graph){
+    const auto groups = InputGroups(graph);
+    int slots = 0;
+    for(const auto& group : groups)
+        slots += (group.first == graph.expandedInputGroup) ? (int)group.second.size() : 1;
+    return std::max(1, slots);
+}
+
+static float CompactInputSlotY(int slot, int count, float y0, float y1, float radius){
+    if(count<=1) return (y0+y1)*0.5f;
+    // Keep the block as tight as possible while leaving a small visual gap
+    // between neighbouring circles/plots. If necessary, shrink to available
+    // height rather than pushing the first and last inputs against the edges.
+    const float safeGap=std::max(28.0f,radius*2.0f+8.0f);
+    const float blockSpan=std::min(y1-y0,safeGap*(float)(count-1));
+    const float blockTop=(y0+y1-blockSpan)*0.5f;
+    return blockTop+blockSpan*(float)slot/(float)(count-1);
+}
+
+static float CompactNeuronSlotY(int slot, int count, float y0, float y1,
+                                float radius, LayerKind kind){
+    if(count<=1) return (y0+y1)*0.5f;
+    // Hidden labels sit below their circles, while output labels sit beside
+    // them. Reserve only the space each presentation actually needs.
+    const float labelSpace=kind==LayerKind::Hidden ? ImGui::GetTextLineHeight()+4.0f : 4.0f;
+    const float safeGap=std::max(16.0f,radius*2.0f+labelSpace);
+    const float blockSpan=std::min(y1-y0,safeGap*(float)(count-1));
+    const float blockTop=(y0+y1-blockSpan)*0.5f;
+    return blockTop+blockSpan*(float)slot/(float)(count-1);
+}
+
 void NeuralGraph::buildDemo(){
     nodes.clear(); edges.clear(); layers.clear();
     selected = -1; std::memset(editBuf,0,sizeof(editBuf));
@@ -1608,9 +1672,7 @@ void NeuralGraph::layoutLayers(float W, float H){
     float y1g = H - marginY;
     float minSpacingY = 1e9f;
     for(const auto& Lchk : layers){
-        int N = 0;
-        for(int idx : Lchk.nodeIdx)
-            if(Lchk.kind != LayerKind::Input || IsVisibleInput(*this, idx)) ++N;
+        int N = Lchk.kind == LayerKind::Input ? InputDisplaySlotCount(*this) : (int)Lchk.nodeIdx.size();
         if(N>1){
             float span = (y1g - y0g);
             float sp = span / (float)(N-1);
@@ -1626,6 +1688,9 @@ void NeuralGraph::layoutLayers(float W, float H){
     float rHorizInput = std::max(6.0f, 0.5f*colW - (10.0f + kMiniPlotW + 6.0f));
     float rHoriz = std::min(rHorizGeneric, rHorizInput);
     float globalR = std::clamp(std::min(rVert, rHoriz), 6.0f, 38.0f);
+    // Inputs and outputs are the equally important endpoints of the graph.
+    // Do not let dense hidden layers shrink either endpoint to tiny dots.
+    const float endpointR=std::clamp(ImGui::GetFontSize()*0.75f,12.0f,18.0f);
 
     float x = marginX;
     size_t displayColumn = 0;
@@ -1639,16 +1704,28 @@ void NeuralGraph::layoutLayers(float W, float H){
         std::vector<int> visible;
         for(int idx : L.nodeIdx)
             if(L.kind != LayerKind::Input || IsVisibleInput(*this, idx)) visible.push_back(idx);
-        int N = (int)visible.size();
+        int N = L.kind == LayerKind::Input ? InputDisplaySlotCount(*this) : (int)visible.size();
         float y0 = y0g;
         float y1 = y1g;
-        float span = (N>1) ? (y1 - y0) : 0.f;
-        for(int i=0;i<N;i++){
+        if(L.kind == LayerKind::Input){
+            for(int idx:L.nodeIdx) nodes[idx].radius=endpointR;
+            int slot=0;
+            for(const auto& group : InputGroups(*this)){
+                if(group.first == expandedInputGroup){
+                    for(int idx : group.second){
+                        float yy=CompactInputSlotY(slot,N,y0,y1,endpointR);
+                        nodes[idx].x=x+colW*0.5f; nodes[idx].y=yy;
+                        ++slot;
+                    }
+                } else ++slot; // one row is occupied by the group's pseudoneuron
+            }
+        } else for(int i=0;i<(int)visible.size();i++){
             int idx = visible[i];
-            float yy = (N>1)? y0 + (span * (float)i/(float)(N-1)) : ((y0+y1)*0.5f);
-            nodes[idx].x = x + colW*0.5f;
-            nodes[idx].y = yy;
-            nodes[idx].radius = globalR;
+            // Hidden/output layers form a compact block centred vertically in
+            // the panel instead of stretching a small layer from top to bottom.
+            const float layerRadius=L.kind==LayerKind::Output?endpointR:globalR;
+            float yy=CompactNeuronSlotY(i,N,y0,y1,layerRadius,L.kind);
+            nodes[idx].x=x+colW*0.5f; nodes[idx].y=yy; nodes[idx].radius=layerRadius;
         }
         L.x0 = x + 6.f;
         L.x1 = x + colW - 6.f;
@@ -1715,8 +1792,10 @@ void NeuralGraph::stepLayout(float dt, float W, float H){
     // Recompute forward pass whenever inputs may have changed
     ForwardPass(*this);
 
-    const float rep = 1200.0f;
-    const float damp= 0.90f;
+    const float headerH=3.0f*ImGui::GetTextLineHeightWithSpacing()+6.0f;
+    const float y0=40.0f+headerH;
+    const float y1=H-40.0f;
+    const float follow=1.0f-std::exp(-std::max(0.0f,dt)*12.0f);
     for(size_t idxA=0; idxA<nodes.size(); ++idxA){
         auto& a = nodes[idxA];
         // Input rows are deliberately static.  With many inputs the force layout
@@ -1728,32 +1807,21 @@ void NeuralGraph::stepLayout(float dt, float W, float H){
             a.vy = 0.0f;
             continue;
         }
-        float fx=0, fy=0;
-        for(size_t idxB=0; idxB<nodes.size(); ++idxB){
-            if(idxA==idxB) continue;
-            auto& b = nodes[idxB];
-            float dx=a.x-b.x, dy=a.y-b.y;
-            float d2 = dx*dx+dy*dy + 1e-2f;
-            float inv = 1.0f / d2;
-            float f = rep * inv;
-            fx += dx * f; fy += dy * f;
-        }
         float targetX = a.x;
-        for(auto& L: layers){
-            if(std::find(L.nodeIdx.begin(), L.nodeIdx.end(), (int)idxA) != L.nodeIdx.end()){
+        float targetY = a.y;
+        for(const auto& L: layers){
+            auto pos=std::find(L.nodeIdx.begin(),L.nodeIdx.end(),(int)idxA);
+            if(pos!=L.nodeIdx.end()){
                 targetX = (L.x0 + L.x1)*0.5f;
+                const int count=(int)L.nodeIdx.size();
+                const int order=(int)std::distance(L.nodeIdx.begin(),pos);
+                targetY=CompactNeuronSlotY(order,count,y0,y1,a.radius,L.kind);
                 break;
             }
         }
-        fx += (targetX - a.x) * 5.0f;
-        fy += (H*0.5f - a.y) * 0.4f;
-
-        a.vx = (a.vx + fx*dt) * damp;
-        a.vy = (a.vy + fy*dt) * damp;
-    }
-    for(auto& a: nodes){
-        if(a.isInput) continue;
-        a.x += a.vx*dt; a.y += a.vy*dt;
+        a.x += (targetX-a.x)*follow;
+        a.y += (targetY-a.y)*follow;
+        a.vx=0.0f; a.vy=0.0f;
         a.x = std::clamp(a.x, 30.0f, W-30.0f);
         a.y = std::clamp(a.y, 30.0f, H-30.0f);
     }
@@ -1775,8 +1843,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height){
         // Split: top=canvas, optional bottom=live feed.  Keep the preference
         // local to this editor so opening a large network does not force a
         // tall feed panel back into view.
-        static bool showLiveFeed = true;
-        static float liveFeedH = 220.0f;
+        static bool showLiveFeed = false;
+        constexpr float preferredLiveFeedH = 220.0f;
         ImVec2 avail = ImGui::GetContentRegionAvail();
         if(avail.x < 100) avail.x = 100;
         if(avail.y < 140) avail.y = 140;
@@ -1789,37 +1857,17 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height){
         }
 
         ImGui::Checkbox("Live Feed", &showLiveFeed);
-        if(showLiveFeed){
-            ImGui::SameLine();
-            const float maxFeedH = std::max(80.0f, avail.y - 120.0f);
-            liveFeedH = std::clamp(liveFeedH, 80.0f, maxFeedH);
-            ImGui::SetNextItemWidth(180.0f);
-            ImGui::SliderFloat("Height##live_feed", &liveFeedH, 80.0f, maxFeedH, "%.0f px");
-        }
         ImGui::SameLine();
         if(ImGui::Button(collapseHiddenLayers ? "Show hidden layers" : "Hide hidden layers")){
             collapseHiddenLayers = !collapseHiddenLayers;
             layoutLayers(lastCanvasW > 0 ? lastCanvasW : 800.0f, lastCanvasH > 0 ? lastCanvasH : 500.0f);
         }
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(180.0f);
-        if(ImGui::BeginCombo("Input group", expandedInputGroup.c_str())){
-            for(const auto& group : inputGroups){
-                const bool chosen = group.first == expandedInputGroup;
-                std::string caption = group.first + " (" + std::to_string(group.second.size()) + ")";
-                if(ImGui::Selectable(caption.c_str(), chosen)){
-                    expandedInputGroup = group.first;
-                    layoutLayers(lastCanvasW > 0 ? lastCanvasW : 800.0f, lastCanvasH > 0 ? lastCanvasH : 500.0f);
-                }
-                if(chosen) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
 
         // The small control row is the only space retained when the feed is
         // collapsed, allowing the graph to fill all remaining editor space.
         const float controlsH = ImGui::GetFrameHeightWithSpacing();
-        const float feedH = showLiveFeed ? liveFeedH : 0.0f;
+        const float maxFeedH = std::max(80.0f, avail.y - 120.0f);
+        const float feedH = showLiveFeed ? std::clamp(preferredLiveFeedH, 80.0f, maxFeedH) : 0.0f;
         float canvasH = avail.y - controlsH - feedH - (showLiveFeed ? 8.0f : 0.0f);
         if(canvasH < 80.0f) canvasH = 80.0f;
         ImVec2 canvasSize = ImVec2(avail.x, canvasH);
@@ -1865,11 +1913,10 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height){
             ImVec2 hp(a.x + 8.0f, a.y + 6.0f);
 
             // 1) layer name
-            const std::string shownLayerName = L.kind == LayerKind::Input ? expandedInputGroup : L.name;
+            const std::string shownLayerName = L.name;
             dl->AddText(hp, ImGui::GetColorU32(ImVec4(1,1,0.85f,1)), shownLayerName.c_str());
             // 2) neuron count
-            int shownCount = 0;
-            for(int idx : L.nodeIdx) if(L.kind != LayerKind::Input || IsVisibleInput(*this, idx)) ++shownCount;
+            const int shownCount = (int)L.nodeIdx.size();
             char ln[64]; std::snprintf(ln, sizeof(ln), "Neurons: %d", shownCount);
             dl->AddText(ImVec2(hp.x, hp.y + lh), ImGui::GetColorU32(ImVec4(0.85f,0.9f,1,1)), ln);
             // 3) activation - clickable
@@ -1891,6 +1938,56 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height){
                                    ImVec2(std::max(1.0f, b.x-a.x), std::max(1.0f, b.y-a.y)));
             if(ImGui::IsItemClicked(ImGuiMouseButton_Left) || ImGui::IsItemClicked(ImGuiMouseButton_Right)){
                 currentLayer = (int)li;
+            }
+        }
+
+        // Collapsed input groups stay visible as named pseudoneurons.  They
+        // occupy exactly one layout row and expand in-place when clicked.
+        std::vector<std::pair<std::string, ImVec2>> collapsedInputHubs;
+        bool inputGroupClickConsumed=false;
+        std::string requestedInputGroup;
+        if(!inputGroups.empty()){
+            const Layer* inputLayer=nullptr;
+            for(const Layer& layer:layers) if(layer.kind==LayerKind::Input){ inputLayer=&layer; break; }
+            if(inputLayer){
+                const int slots=InputDisplaySlotCount(*this);
+                const float headerH=3.0f*ImGui::GetTextLineHeightWithSpacing()+6.0f;
+                const float y0=40.0f+headerH, y1=canvasSize.y-40.0f;
+                int slot=0;
+                for(const auto& group:inputGroups){
+                    if(group.first==expandedInputGroup){ slot+=(int)group.second.size(); continue; }
+                    float inputRadius=14.0f;
+                    if(!inputLayer->nodeIdx.empty()) inputRadius=nodes[inputLayer->nodeIdx.front()].radius;
+                    const float yy=CompactInputSlotY(slot,slots,y0,y1,inputRadius);
+                    ImVec2 p(origin.x+(inputLayer->x0+inputLayer->x1)*0.5f, origin.y+yy);
+                    collapsedInputHubs.push_back({group.first,p});
+                    const float radius=inputRadius;
+                    dl->AddCircleFilled(p,radius,ImGui::GetColorU32(ImVec4(.12f,.42f,.38f,1.0f)),32);
+                    dl->AddCircle(p,radius,ImGui::GetColorU32(ImVec4(.25f,.95f,.82f,1.0f)),32,2.5f);
+                    dl->AddText(ImVec2(p.x-4.0f,p.y-ImGui::GetTextLineHeight()*0.5f),
+                                ImGui::GetColorU32(ImVec4(.92f,1,.96f,1)),">");
+                    std::string title=group.first+" ("+std::to_string(group.second.size())+")";
+                    ImVec2 textSize=ImGui::CalcTextSize(title.c_str());
+                    dl->AddText(ImVec2(p.x-radius-10.0f-textSize.x,p.y-textSize.y*0.5f),
+                                ImGui::GetColorU32(ImVec4(1,1,.86f,1)),title.c_str());
+                    const ImVec2 mousePos=ImGui::GetIO().MousePos;
+                    const float hitRadius=radius+6.0f;
+                    const float hitDx=mousePos.x-p.x, hitDy=mousePos.y-p.y;
+                    const bool groupHovered=hitDx*hitDx+hitDy*hitDy <= hitRadius*hitRadius;
+                    if(groupHovered){
+                        dl->AddCircle(p,hitRadius,ImGui::GetColorU32(ImVec4(1,.92f,.30f,.95f)),32,2.0f);
+                        ImGui::SetTooltip("Expand input group: %s",group.first.c_str());
+                        if(ImGui::IsMouseClicked(ImGuiMouseButton_Left)){
+                            requestedInputGroup=group.first;
+                            inputGroupClickConsumed=true;
+                        }
+                    }
+                    ++slot;
+                }
+                if(!requestedInputGroup.empty()){
+                    expandedInputGroup=requestedInputGroup;
+                    layoutLayers(canvasSize.x,canvasSize.y);
+                }
             }
         }
 
@@ -2025,6 +2122,28 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height){
                 dl->AddBezierCubic(hiddenHub, ImVec2(hiddenHub.x+65,hiddenHub.y), ImVec2(p.x-50,p.y), p, flowGlow, 5.0f);
                 dl->AddBezierCubic(hiddenHub, ImVec2(hiddenHub.x+65,hiddenHub.y), ImVec2(p.x-50,p.y), p, flow, 1.2f);
             }
+            for(const auto& groupHub:collapsedInputHubs){
+                const ImVec2 p=groupHub.second;
+                dl->AddBezierCubic(p,ImVec2(p.x+50,p.y),ImVec2(hiddenHub.x-65,hiddenHub.y),hiddenHub,flowGlow,5.0f);
+                dl->AddBezierCubic(p,ImVec2(p.x+50,p.y),ImVec2(hiddenHub.x-65,hiddenHub.y),hiddenHub,flow,1.2f);
+            }
+        } else if(!collapsedInputHubs.empty()){
+            // One aggregate connection per collapsed group communicates that
+            // the group still participates in the network without restoring
+            // every individual edge.
+            const Layer* firstHidden=nullptr;
+            for(const Layer& layer:layers) if(layer.kind==LayerKind::Hidden){ firstHidden=&layer; break; }
+            if(firstHidden && !firstHidden->nodeIdx.empty()){
+                ImVec2 target(0,0);
+                for(int idx:firstHidden->nodeIdx){ target.x+=nodes[idx].x; target.y+=nodes[idx].y; }
+                target.x=origin.x+target.x/(float)firstHidden->nodeIdx.size();
+                target.y=origin.y+target.y/(float)firstHidden->nodeIdx.size();
+                for(const auto& groupHub:collapsedInputHubs){
+                    ImVec2 p=groupHub.second;
+                    dl->AddBezierCubic(p,ImVec2(p.x+45,p.y),ImVec2(target.x-45,target.y),target,
+                        ImGui::GetColorU32(ImVec4(.25f,.95f,.82f,.65f)),1.5f);
+                }
+            }
         }
 
         // selection handled below; mini-plot is not clickable
@@ -2105,7 +2224,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height){
                 ImU32 labelCol = ImGui::GetColorU32( (isTopIn || isTopOut)
                     ? ImVec4(0.0f,0.0f,0.0f,1.0f)
                     : ImVec4(1.0f,1.0f,0.85f,1.0f) );
-                dl->AddText(tl, labelCol, n.label.c_str());
+                dl->AddText(ImGui::GetFont(),ImGui::GetFontSize(),tl,labelCol,n.label.c_str());
                 // Tooltip over label area
                 ImVec2 br = ImVec2(tl.x + ts.x, tl.y + ts.y);
                 if(ImGui::IsMouseHoveringRect(tl, br)){
@@ -2169,7 +2288,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height){
         }
 
         // click elsewhere on canvas selects neuron but doesn't toggle live/value
-        if(isHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)){
+        if(isHovered && !inputGroupClickConsumed && ImGui::IsMouseClicked(ImGuiMouseButton_Left)){
             if(Neuron* hit = findAt(mx,my)){
                 selected = hit->id;
                 std::snprintf(editBuf, sizeof(editBuf), "%s", hit->label.c_str());
@@ -3222,6 +3341,7 @@ void Engine::render(){
         ImGui::BulletText("N                    - add neuron to current layer");
         ImGui::BulletText("A                    - add a hidden layer to the right of current");
         ImGui::BulletText("D                    - remove last neuron from current layer");
+        ImGui::BulletText("Delete               - remove current hidden layer and reconnect neighbours");
         ImGui::BulletText("S                    - save network (open Save dialog)");
         ImGui::BulletText("O                    - load network (open Load dialog)");
         ImGui::BulletText("M                    - add a lesson from current IN/OUT values");
@@ -3630,6 +3750,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods){
     if(key==GLFW_KEY_N){ NG_AddNeuron(graph, graph.currentLayer); return; }
     if(key==GLFW_KEY_D){ NG_RemoveLastNeuron(graph, graph.currentLayer); return; }
     if(key==GLFW_KEY_A){ NG_InsertHiddenAfterCurrent(graph); return; }
+    if(key==GLFW_KEY_DELETE){ NG_RemoveCurrentHiddenLayer(graph); return; }
     if(key==GLFW_KEY_TAB){
         static bool s_allInputsLive = true; // toggled by TAB
         s_allInputsLive = !s_allInputsLive;

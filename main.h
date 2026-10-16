@@ -2,6 +2,7 @@
 // -*- coding: utf-8 -*-
 // Main header for NeuralT + Neural Editor
 // Type declarations used in main.cpp + paths and font helper.
+// Author: justdieblondie
 
 #include <string>
 #include <vector>
@@ -12,7 +13,7 @@
 // ─────────────────────────────────────────
 // Paths and version
 // ─────────────────────────────────────────
-inline constexpr const char* kAppVersion             = "v2.7";
+inline constexpr const char* kAppVersion             = "v3.0";
 inline constexpr const char* kEngineConfFile         = "engine.conf";
 inline constexpr const char* kLessonsFile            = "lessons.json";
 inline constexpr const char* kNetworkFile            = "network.json";
