@@ -134,7 +134,7 @@ struct TurbineModel{
 };
 
 // ─────────────────────────────────────────
-// Sieć neuronowa – dane i graf
+// Neural network — data and graph
 // ─────────────────────────────────────────
 enum class LayerKind { Input, Hidden, Output };
 enum class Act { Linear, ReLU, Sigmoid, Tanh };

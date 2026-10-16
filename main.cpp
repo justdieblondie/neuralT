@@ -3229,7 +3229,7 @@ void Engine::render(){
             }
             ImGui::Separator();
 
-            ImGui::Text("Folder: %s", "saved/");
+            ImGui::Text("Directory: %s", "saved/");
             ImVec2 listSize = ImVec2(-1, ImGui::GetTextLineHeightWithSpacing()*14.0f);
             if(ImGui::BeginListBox("##saved_list", listSize)){
                 for(int i=0;i<(int)files.size();++i){
@@ -3279,7 +3279,7 @@ void Engine::render(){
     if(gShowSaveMenu){
         ImGui::SetNextWindowSize(ImVec2(480, 140), ImGuiCond_FirstUseEver);
         if(ImGui::Begin("Save Network", &gShowSaveMenu, ImGuiWindowFlags_NoCollapse)){
-            ImGui::Text("Folder: saved/");
+            ImGui::Text("Directory: saved/");
             ImGui::InputText("File name", gSaveName, IM_ARRAYSIZE(gSaveName));
             
             // Check for Enter key press to confirm save - only when input field is focused
@@ -3537,9 +3537,9 @@ ImGui::BulletText("Train (B or T) after setting parameters");
         }
     }
 
-    /* Stirlitz przyszedł na tajne spotkanie pod umówiony adres o umówionej godzinie i minucie. 
-       Zapukał umówieone 286 razy, ale nikt nie otworzył. Stirlitz wychylił się i spojrzał na parapet. 
-       Stało tam 7 żelazek - znak wpadki. */
+    /* Stirlitz arrived at a secret meeting at the agreed address, hour, and minute.
+       He knocked exactly 286 times, but nobody answered. Stirlitz leaned out and looked at the windowsill.
+       There were 7 irons there — a sign that the operation was blown. */
 
     // Draw result window even when HUD is hidden or training inactive
 #ifdef USE_IMGUI
@@ -3889,9 +3889,9 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods){
             gLiveFeedCurrentInput = 0;
             gLiveFeedInputTimer = 0.0f;
             gLiveFeedWavePhase = 0.0f;
-            Logf("Sekwencyjne sinusoidy dla wejść uruchomione (W)");
+            Logf("Sequential input sinusoids enabled (W)");
         } else {
-            Logf("Sekwencyjne sinusoidy dla wejść wyłączone (W)");
+            Logf("Sequential input sinusoids disabled (W)");
         }
         return;
     }
