@@ -166,6 +166,10 @@ struct Layer
     Act act = Act::Linear;
     std::vector<int> nodeIdx;
     float x0=0,y0=0,x1=0,y1=0;
+    // Per-layer variation for the wind effect on connections.
+    float windStrengthScale=1.0f;
+    float windSpeedScale=1.0f;
+    float windJitterScale=1.0f;
 };
 
 struct Neuron

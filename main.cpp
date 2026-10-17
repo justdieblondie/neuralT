@@ -98,6 +98,18 @@ struct WindParams
 };
 static WindParams gWind;
 
+static float RandomRange(float minimum, float maximum)
+{
+    return minimum + (maximum - minimum) * (rand() / (float)RAND_MAX);
+}
+
+static void RandomizeLayerWind(Layer& layer)
+{
+    layer.windStrengthScale = RandomRange(0.65f, 1.35f);
+    layer.windSpeedScale = RandomRange(0.70f, 1.30f);
+    layer.windJitterScale = RandomRange(0.60f, 1.40f);
+}
+
 static float gWindInterpolant = 0.0f;
 static float gWindStrengthPhase = 0.0f;
 static float gWindSpeedPhase = 0.0f;
@@ -881,6 +893,7 @@ static void NG_InsertHiddenAfterCurrent(NeuralGraph& g)
     if(g.layers[li].kind != LayerKind::Hidden) return;
     int insertPos = li + 1;
     Layer L; L.kind = LayerKind::Hidden; L.act = Act::ReLU;
+    RandomizeLayerWind(L);
     int hiddenCount = 0; for(const auto& Ly : g.layers) if(Ly.kind==LayerKind::Hidden) hiddenCount++;
     L.name = std::string("HL ") + std::to_string(hiddenCount + 1);
     L.nodeIdx.clear(); L.x0=L.y0=L.x1=L.y1=0.0f;
@@ -947,6 +960,7 @@ static void NG_BuildTopology(NeuralGraph& g, int inN, const std::vector<int>& hi
     // Inputs
     {
         Layer L; L.kind = LayerKind::Input; L.name = "Inputs"; L.act = Act::Linear;
+        RandomizeLayerWind(L);
         for(int i=0;i<inN;i++){ Neuron n; n.id=id++; n.isInput=true; n.label="In"+std::to_string(i+1); n.speed=0.0f; n.amp=1.0f; g.nodes.push_back(n); L.nodeIdx.push_back((int)g.nodes.size()-1); }
         g.layers.push_back(std::move(L));
     }
@@ -955,6 +969,7 @@ static void NG_BuildTopology(NeuralGraph& g, int inN, const std::vector<int>& hi
     for(size_t li=0; li<hidden.size(); ++li)
     {
         Layer L; L.kind = LayerKind::Hidden; L.name = "HL "+std::to_string((int)li+1); L.act = Act::ReLU;
+        RandomizeLayerWind(L);
         for(int i=0;i<hidden[li]; ++i){ Neuron n; n.id=id++; n.isInput=false; n.label="H"+std::to_string((int)li+1)+"."+std::to_string(i+1); g.nodes.push_back(n); L.nodeIdx.push_back((int)g.nodes.size()-1); }
         g.layers.push_back(std::move(L));
     }
@@ -962,6 +977,7 @@ static void NG_BuildTopology(NeuralGraph& g, int inN, const std::vector<int>& hi
     // Outputs
     {
         Layer L; L.kind = LayerKind::Output; L.name = "Outputs"; L.act = Act::Sigmoid;
+        RandomizeLayerWind(L);
         for(int i=0;i<outN;i++){ Neuron n; n.id=id++; n.isInput=false; n.label="Out"+std::to_string(i+1); g.nodes.push_back(n); L.nodeIdx.push_back((int)g.nodes.size()-1); }
         g.layers.push_back(std::move(L));
     }
@@ -1310,6 +1326,7 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
         L.kind = (k=="Input")? LayerKind::Input : (k=="Output")? LayerKind::Output : LayerKind::Hidden;
         L.name = m[2].str();
         L.act = strToAct(m[3].str());
+        RandomizeLayerWind(L);
         L.nodeIdx.clear();
         std::string ids = m[4].str();
         std::stringstream ss(ids);
@@ -1887,7 +1904,8 @@ void NeuralGraph::buildDemo()
 
     // Inputs
     {
-        Layer L; 
+        Layer L;
+        RandomizeLayerWind(L);
         L.kind = LayerKind::Input; 
         L.name = "Inputs"; 
         L.act = Act::Linear;
@@ -1902,7 +1920,8 @@ void NeuralGraph::buildDemo()
     // HL1..HL3
     for(int li=0; li<3; ++li)
     {
-        Layer L; 
+        Layer L;
+        RandomizeLayerWind(L);
         L.kind = LayerKind::Hidden; 
         L.name = "HL " + std::to_string(li+1);
         L.act = Act::ReLU;
@@ -1916,7 +1935,8 @@ void NeuralGraph::buildDemo()
 
     // Outputs
     {
-        Layer L; L.kind = LayerKind::Output; 
+        Layer L; L.kind = LayerKind::Output;
+        RandomizeLayerWind(L);
         L.name = "Outputs"; 
         L.act = Act::Sigmoid;
         layers.push_back(L);
@@ -2366,6 +2386,17 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             }
             return nullptr;
         };
+        auto findLayerForNode = [&](int nodeIndex) -> const Layer*
+        {
+            for(const auto& layer : layers)
+            {
+                if(std::find(layer.nodeIdx.begin(), layer.nodeIdx.end(), nodeIndex) != layer.nodeIdx.end())
+                {
+                    return &layer;
+                }
+            }
+            return nullptr;
+        };
 
         const UITheme& _theme = (gEngine ? gEngine->renderer.theme : UITheme::Cyberpunk());
         for(auto& e: edges)
@@ -2376,6 +2407,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             const int ai = int(A - nodes.data()), bi = int(B - nodes.data());
             if(!IsVisibleInput(*this, ai) || !IsVisibleInput(*this, bi)) continue;
             if(collapseHiddenLayers) continue;
+            const Layer* layerA = findLayerForNode(ai);
+            const Layer* layerB = findLayerForNode(bi);
             ImVec2 p1(origin.x+A->x, origin.y+A->y), p2(origin.x+B->x, origin.y+B->y);
             // (thickness computed below)
             // Map weight [-1,1] -> theme gradient and style
@@ -2406,6 +2439,21 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 float currentJitter = gJitterSineEnabled ? 
                     (0.25f + 0.25f * std::sin(gWindJitterPhase)) : 
                     gWind.jitter;
+
+                // A connection inherits the mean wind properties of the two
+                // layers it joins, so each layer pair sways independently.
+                const float strengthScale = (layerA && layerB)
+                    ? (layerA->windStrengthScale + layerB->windStrengthScale) * 0.5f
+                    : 1.0f;
+                const float speedScale = (layerA && layerB)
+                    ? (layerA->windSpeedScale + layerB->windSpeedScale) * 0.5f
+                    : 1.0f;
+                const float jitterScale = (layerA && layerB)
+                    ? (layerA->windJitterScale + layerB->windJitterScale) * 0.5f
+                    : 1.0f;
+                currentStrength *= strengthScale;
+                currentSpeed *= speedScale;
+                currentJitter *= jitterScale;
 
                 // Wind sway: stronger turbine => more bend, same direction for all (with slight jitter)
                 float rpm = 0.0f;
