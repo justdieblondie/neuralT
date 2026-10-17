@@ -2740,9 +2740,41 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         };
 
         const float timeNow = (float)ImGui::GetTime();
-        const bool denseGraph = edges.size() > 2500; // fewer glow passes keep big graphs fluid
-        struct Spark { ImVec2 p0, c1, c2, p3; float phase; float act; };
+        const bool denseGraph = edges.size() > 2500;
+
+        // Signal wave: one batch of particles crosses every layer gap at the same
+        // time; when a batch reaches the next layer it continues into the next gap
+        // in that gap's colour, so the wave visibly hands off layer to layer.
+        constexpr float kWaveGapsPerSec = 0.45f;
+        const float wavePos = timeNow * kWaveGapsPerSec;
+        const float waveT = wavePos - std::floor(wavePos);   // 0..1 within each gap
+        static const ImVec4 kWaveColors[] = {
+            ImVec4(1.00f,0.96f,0.86f,1), ImVec4(0.55f,0.95f,1.00f,1), ImVec4(1.00f,0.62f,0.95f,1),
+            ImVec4(1.00f,0.88f,0.40f,1), ImVec4(0.60f,1.00f,0.70f,1), ImVec4(0.80f,0.72f,1.00f,1) };
+        constexpr int kWaveColorCount = (int)(sizeof(kWaveColors)/sizeof(kWaveColors[0]));
+        struct Spark { ImVec2 p0, c1, c2, p3; float act; int gap; };
         std::vector<Spark> sparks;
+        sparks.reserve(edges.size()/2);
+
+        // Stable per-edge random numbers in [-1,1] (so each strand keeps its own shape)
+        auto edgeHash = [](int a, int b, unsigned salt)->float
+        {
+            unsigned h = (unsigned)a*73856093u ^ (unsigned)b*19349663u ^ salt*83492791u;
+            h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+            return (float)(h & 0xFFFF) / 32767.5f - 1.0f;
+        };
+
+        float currentStrength = gStrengthSineEnabled ?
+            (150.0f + 150.0f * std::sin(gWindStrengthPhase)) : gWind.strength;
+        float currentSpeed = gSpeedSineEnabled ?
+            (2.5f + 2.5f * std::sin(gWindSpeedPhase)) : gWind.speed;
+        const float windGain = (currentStrength / 150.0f) * (0.25f + 0.75f*gWindInterpolant);
+
+        // position of each node inside its layer (drives the strand families)
+        std::vector<int> nodeSlot(nodes.size(), 0);
+        for(const Layer& L : layers)
+            for(size_t j=0;j<L.nodeIdx.size();++j) if(L.nodeIdx[j]>=0 && L.nodeIdx[j]<(int)nodes.size()) nodeSlot[L.nodeIdx[j]]=(int)j;
+
         for(size_t ei=0; ei<edges.size(); ++ei)
         {
             auto& e = edges[ei];
@@ -2754,99 +2786,77 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             if(!IsVisibleInput(*this, ai) || !IsVisibleInput(*this, bi)) continue;
             if(collapseHiddenLayers) continue;
             ImVec2 p1(origin.x+A->x, origin.y+A->y), p2(origin.x+B->x, origin.y+B->y);
-            // (thickness computed below)
-            // Map weight [-1,1] -> theme gradient and style
+
+            // Colour: theme gradient by weight; memory edges lavender -> magenta
+            float t = (e.w + 1.0f) * 0.5f; t = t<0?0: (t>1?1:t);
+            auto mixf = [](float a, float b, float tt){ return a + (b-a)*tt; };
+            float r = mixf(_theme.edgeStart.x, _theme.edgeEnd.x, t);
+            float g = mixf(_theme.edgeStart.y, _theme.edgeEnd.y, t);
+            float b = mixf(_theme.edgeStart.z, _theme.edgeEnd.z, t);
+            float a = _theme.edgeAlpha;
+            if(recurrentEdge)
             {
-                float t = (e.w + 1.0f) * 0.5f; t = t<0?0: (t>1?1:t);
-                auto mixf = [](float a, float b, float tt){ return a + (b-a)*tt; };
-                float r = mixf(_theme.edgeStart.x, _theme.edgeEnd.x, t);
-                float g = mixf(_theme.edgeStart.y, _theme.edgeEnd.y, t);
-                float b = mixf(_theme.edgeStart.z, _theme.edgeEnd.z, t);
-                float a = _theme.edgeAlpha;
-                if(recurrentEdge)
-                {
-                    // Edges touching a GRU memory: lavender -> magenta, pinker leaving the memory
-                    float tr = std::clamp(t*0.6f + (isGRUNode(ai) ? 0.4f : 0.0f), 0.0f, 1.0f);
-                    r = mixf(0.66f, 1.0f, tr); g = mixf(0.42f, 0.40f, tr); b = mixf(1.0f, 0.88f, tr);
-                    a *= 0.42f; // individual strands stay visible in the lattice
-                }
-                float thick = (_theme.edgeBase + _theme.edgeScale * std::fabs(e.w)) * zoomY;
-                if(denseGraph) thick = recurrentEdge ? std::clamp(thick, 1.0f, 1.6f) : std::clamp(thick, 1.3f, 2.4f);
-
-                // Pulsing glow
-                float time = timeNow;
-                float pulse = 0.5f + 0.5f*std::sin(time*2.0f + 0.15f*(float)(A->id + B->id));
-                ImU32 glowCol = ImGui::GetColorU32(ImVec4(r,g,b, (recurrentEdge ? 0.05f : (denseGraph ? 0.10f : 0.18f)) * (0.6f + 0.4f*pulse)));
-                float w1 = thick * (2.5f + 2.0f*pulse);
-                float w2 = thick * (1.8f + 1.2f*pulse);
-                float w3 = thick * (1.2f + 0.6f*pulse);
-
-                // Moving strands: each edge bows perpendicular to itself (the whole bundle
-                // breathes together) plus its own travelling wave, so long lines sway like
-                // fibres. Wind panel strength scales it; R (rotate) fades it in/out.
-                float currentStrength = gStrengthSineEnabled ?
-                    (150.0f + 150.0f * std::sin(gWindStrengthPhase)) : gWind.strength;
-                float currentSpeed = gSpeedSineEnabled ?
-                    (2.5f + 2.5f * std::sin(gWindSpeedPhase)) : gWind.speed;
-                const float windGain = (currentStrength / 150.0f) * (0.25f + 0.75f*gWindInterpolant);
-
-                ImVec2 d = ImVec2(p2.x - p1.x, p2.y - p1.y);
-                const float len = std::sqrt(d.x*d.x + d.y*d.y) + 1e-3f;
-                const ImVec2 nrm(-d.y/len, d.x/len);
-                const float seed = 0.37f*(float)A->id + 0.11f*(float)B->id;
-                const float bow  = 0.06f*len * std::sin(time*0.45f*currentSpeed);
-                const float wave = 0.09f*len * std::sin(time*1.1f*currentSpeed + seed);
-                const float wave2= 0.07f*len * std::sin(time*0.8f*currentSpeed + seed*1.7f + 1.0f);
-                const float k1 = (bow + wave)  * windGain;
-                const float k2 = (bow - wave2) * windGain;
-                // Curves leave and enter neurons horizontally, which makes each layer-to-layer
-                // bundle pinch into an hourglass fan; the sway rides on top of that.
-                // Only the endpoint fans (inputs / outputs) get the pinched hourglass; the
-                // lattice between hidden and memory layers stays near-straight.
-                const bool endpointFan = A->isInput || (nodeLayer[bi] >= 0 && layers[nodeLayer[bi]].kind == LayerKind::Output);
-                ImVec2 c1, c2;
-                if(endpointFan)
-                {
-                    const float hx = d.x * 0.5f;
-                    c1 = ImVec2(p1.x + hx + nrm.x*k1*0.6f, p1.y + nrm.y*k1);
-                    c2 = ImVec2(p2.x - hx + nrm.x*k2*0.6f, p2.y + nrm.y*k2);
-                }
-                else
-                {
-                    const float ks = recurrentEdge ? 0.45f : 0.7f;
-                    c1 = ImVec2(p1.x + d.x*0.33f + nrm.x*k1*ks, p1.y + d.y*0.33f + nrm.y*k1*ks);
-                    c2 = ImVec2(p1.x + d.x*0.66f + nrm.x*k2*ks, p1.y + d.y*0.66f + nrm.y*k2*ks);
-                }
-
-                const int segs = denseGraph ? 12 : 0;
-                if(!denseGraph) dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w1);
-                dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w2, segs);
-                dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w3, segs);
-                dl->AddBezierCubic(p1, c1, c2, p2, ImGui::GetColorU32(ImVec4(r,g,b,a)), thick, segs);
-
-                // Signal particles travel along a subset of the memory edges
-                if((recurrentEdge && (ei % 3) == 0) || (!recurrentEdge && (ei % 9) == 0))
-                {
-                    const float h = std::fmod((float)(e.a*7919 + e.b*104729) * 0.000137f, 1.0f);
-                    sparks.push_back({p1, c1, c2, p2, h, std::fabs(A->value)});
-                }
+                float tr = std::clamp(t*0.6f + (isGRUNode(ai) ? 0.4f : 0.0f), 0.0f, 1.0f);
+                r = mixf(0.72f, 1.0f, tr); g = mixf(0.48f, 0.42f, tr); b = mixf(1.0f, 0.90f, tr);
+                a *= 0.40f;
             }
+            else a *= 0.70f;
+            // Thin, crisp strands so every line can be followed end to end
+            float thick = (_theme.edgeBase + _theme.edgeScale * std::fabs(e.w)) * zoomY;
+            if(denseGraph) thick = std::clamp(thick * 0.7f, 0.8f, 1.15f);
+
+            // Shape: every strand has its own bow (direction + depth) and a little
+            // S-twist, which weaves the bundle into a lattice; on top of that each
+            // strand sways slowly with its own phase.
+            ImVec2 d = ImVec2(p2.x - p1.x, p2.y - p1.y);
+            const float len = std::sqrt(d.x*d.x + d.y*d.y) + 1e-3f;
+            const ImVec2 nrm(-d.y/len, d.x/len);
+            const float h1 = edgeHash(e.a, e.b, 1u), h2 = edgeHash(e.a, e.b, 2u), h3 = edgeHash(e.a, e.b, 3u);
+            // Strands from neighbouring neurons sweep together in families (smooth in
+            // source/target slot), leaving the woven diamond gaps; a little per-strand
+            // noise keeps them from looking combed.
+            const bool endpointFan = A->isInput || (nodeLayer[bi] >= 0 && layers[nodeLayer[bi]].kind == LayerKind::Output);
+            const float family = std::sin(0.55f*(float)nodeSlot[ai] + 0.23f*(float)nodeSlot[bi] + 0.9f*(float)nodeLayer[ai]);
+            const float bowMax = endpointFan ? 0.09f : 0.22f;
+            const float bow   = len * bowMax * (0.8f*family + 0.2f*h1);
+            const float twist = len * (endpointFan ? 0.03f : 0.06f) * h2;
+            const float sway  = len * 0.045f * windGain * std::sin(timeNow*(0.6f + 0.5f*std::fabs(h3))*currentSpeed + 6.2831f*h3);
+            const float k1 = bow + twist + sway;
+            const float k2 = bow - twist + sway*0.6f;
+            ImVec2 c1 = ImVec2(p1.x + d.x*0.33f + nrm.x*k1, p1.y + d.y*0.33f + nrm.y*k1);
+            ImVec2 c2 = ImVec2(p1.x + d.x*0.66f + nrm.x*k2, p1.y + d.y*0.66f + nrm.y*k2);
+
+            const int segs = denseGraph ? 16 : 0;
+            if(!denseGraph)
+            {
+                // small graphs can afford a soft glow under each strand
+                const float pulse = 0.5f + 0.5f*std::sin(timeNow*2.0f + 0.15f*(float)(A->id + B->id));
+                dl->AddBezierCubic(p1, c1, c2, p2, ImGui::GetColorU32(ImVec4(r,g,b,0.15f*pulse)), thick*3.0f);
+            }
+            dl->AddBezierCubic(p1, c1, c2, p2, ImGui::GetColorU32(ImVec4(r,g,b,a)), thick, segs);
+
+            // Wave particles ride on a subset of strands (denser through the memories)
+            const int stride = recurrentEdge ? 2 : 4;
+            if(((unsigned)(e.a*31 + e.b) % (unsigned)stride) == 0 && nodeLayer[ai] >= 0)
+                sparks.push_back({p1, c1, c2, p2, std::fabs(A->value), nodeLayer[ai]});
         }
 
-        // Particle streams: short dotted trails gliding along memory edges
+        // Draw the wave: each dot with a short tail; strength follows the activation
+        // of the neuron that sent it (silent neurons send faint signals).
+        const int waveIndex = (int)std::floor(wavePos);
         for(const Spark& sp : sparks)
         {
-            const float speed = 0.18f + 0.22f*std::min(1.0f, sp.act);
-            const float head = std::fmod(timeNow*speed + sp.phase, 1.0f);
+            const ImVec4 wc = kWaveColors[((sp.gap + waveIndex) % kWaveColorCount + kWaveColorCount) % kWaveColorCount];
+            const float strength = 0.30f + 0.70f*std::min(1.0f, sp.act);
             for(int k=0;k<4;++k)
             {
-                const float t = head - 0.018f*(float)k;
-                if(t < 0.0f) continue;
-                const float u = 1.0f - t;
-                ImVec2 q(u*u*u*sp.p0.x + 3*u*u*t*sp.c1.x + 3*u*t*t*sp.c2.x + t*t*t*sp.p3.x,
-                         u*u*u*sp.p0.y + 3*u*u*t*sp.c1.y + 3*u*t*t*sp.c2.y + t*t*t*sp.p3.y);
-                const float alpha = (0.85f - 0.2f*(float)k) * (0.55f + 0.45f*std::min(1.0f, sp.act));
-                dl->AddCircleFilled(q, 1.9f - 0.3f*(float)k, ImGui::GetColorU32(ImVec4(1.0f,0.88f,1.0f,alpha)), 6);
+                const float tt = waveT - 0.022f*(float)k;
+                if(tt < 0.0f) continue;
+                const float u = 1.0f - tt;
+                ImVec2 q(u*u*u*sp.p0.x + 3*u*u*tt*sp.c1.x + 3*u*tt*tt*sp.c2.x + tt*tt*tt*sp.p3.x,
+                         u*u*u*sp.p0.y + 3*u*u*tt*sp.c1.y + 3*u*tt*tt*sp.c2.y + tt*tt*tt*sp.p3.y);
+                const float alpha = (0.95f - 0.22f*(float)k) * strength;
+                dl->AddCircleFilled(q, (2.2f - 0.4f*(float)k) * zoomY, ImGui::GetColorU32(ImVec4(wc.x,wc.y,wc.z,alpha)), 8);
             }
         }
 
