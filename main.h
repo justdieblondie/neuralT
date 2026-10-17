@@ -144,6 +144,8 @@ struct TurbineModel
     {
         float rpm=60;
         float current_rpm=0.0f;
+        float startupTime=4.0f;
+        float shutdownTime=6.0f;
         int   blades=3;
         float shaftLength=1.6f, shaftRadius=0.08f;
         float hubRadius=0.2f;

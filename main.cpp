@@ -161,6 +161,7 @@ static float gLiveFeedWaveSpeed = 2.0f;
 static int gLiveFeedCurrentInput = 0;
 static float gLiveFeedInputDelay = 0.3f; // delay between inputs in seconds
 static float gLiveFeedInputTimer = 0.0f;
+static bool gRandomLiveFeedActive = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Math impl
@@ -623,12 +624,12 @@ static Vec3 ColorHex(unsigned int value)
     };
 }
 
-static const std::array<GRUTheme, 8>& GRUThemes()
+static const std::array<GRUTheme, 16>& GRUThemes()
 {
     // Compact two-colour harmonies adapted from combinations catalogued by
     // Sanzo Wada. Dark column grounds are derived from the same hues so the
     // palettes remain readable over every existing MLP theme.
-    static const std::array<GRUTheme, 8> themes = {{
+    static const std::array<GRUTheme, 16> themes = {{
         {"English Red / Cerulean", ColorHex(0x24100d), ColorHex(0xd96629), ColorHex(0x0093a5),
             ColorHex(0xd96629), ColorHex(0x0093a5), ColorHex(0xffefae), ColorHex(0x0093a5)},
         {"Yellow Orange / Tyrian Blue", ColorHex(0x091724), ColorHex(0xf99d1b), ColorHex(0x12354e),
@@ -644,7 +645,23 @@ static const std::array<GRUTheme, 8>& GRUThemes()
         {"Orange / Glaucous Green", ColorHex(0x12201b), ColorHex(0xf37420), ColorHex(0xb4cdc2),
             ColorHex(0xf37420), ColorHex(0xb4cdc2), ColorHex(0xffefae), ColorHex(0x78aa98)},
         {"Turquoise / Burnt Sienna", ColorHex(0x102322), ColorHex(0xb5decc), ColorHex(0xa34f2c),
-            ColorHex(0xb5decc), ColorHex(0xa34f2c), ColorHex(0xf5ecc2), ColorHex(0xd07045)}
+            ColorHex(0xb5decc), ColorHex(0xa34f2c), ColorHex(0xf5ecc2), ColorHex(0xd07045)},
+        {"Cinnamon Rufous / Lavender", ColorHex(0x20151d), ColorHex(0xa9522d), ColorHex(0xb7a8c7),
+            ColorHex(0xa9522d), ColorHex(0xb7a8c7), ColorHex(0xf0d7c5), ColorHex(0x80638f)},
+        {"Violet Red / Dull Blue Violet", ColorHex(0x1c1020), ColorHex(0xb0436d), ColorHex(0x71659a),
+            ColorHex(0xb0436d), ColorHex(0x71659a), ColorHex(0xe8bfd2), ColorHex(0x9182bd)},
+        {"Cinnamon Rufous / Dark Citrine", ColorHex(0x211b0e), ColorHex(0xa9522d), ColorHex(0x7f6b20),
+            ColorHex(0xa9522d), ColorHex(0xb29a3a), ColorHex(0xf1d59a), ColorHex(0x7f6b20)},
+        {"Ivory Buff / Mineral Gray", ColorHex(0x151a1b), ColorHex(0xebd3a2), ColorHex(0x607477),
+            ColorHex(0xebd3a2), ColorHex(0x607477), ColorHex(0xfff2cf), ColorHex(0x8ba0a1)},
+        {"Isabella / Green Blue", ColorHex(0x0d2020), ColorHex(0xc5a56e), ColorHex(0x16706f),
+            ColorHex(0xc5a56e), ColorHex(0x16706f), ColorHex(0xf1dbad), ColorHex(0x43a09b)},
+        {"Raw Sienna / Veronia Purple", ColorHex(0x1d1123), ColorHex(0xc8873e), ColorHex(0x604878),
+            ColorHex(0xc8873e), ColorHex(0x82649d), ColorHex(0xf2c77f), ColorHex(0x604878)},
+        {"Spinel Red / Naples Yellow", ColorHex(0x24131a), ColorHex(0xbe3b62), ColorHex(0xf0cf75),
+            ColorHex(0xbe3b62), ColorHex(0xf0cf75), ColorHex(0xffe9a8), ColorHex(0xd65e7d)},
+        {"Benzol Green / Grayish Lavender", ColorHex(0x111c1c), ColorHex(0x267b72), ColorHex(0xb7a8c7),
+            ColorHex(0x267b72), ColorHex(0xb7a8c7), ColorHex(0xc9eee5), ColorHex(0x88779d)}
     }};
     return themes;
 }
@@ -653,31 +670,55 @@ static size_t gGRUThemeIndex = 0;
 static GRUTheme gGRUTheme = GRUThemes()[gGRUThemeIndex];
 static int gPairedThemeIndex = -1;
 
-static const std::array<size_t, 8>& GRUPairOrder()
+static const std::array<size_t, 16>& GRUPairOrder()
 {
     // Each existing MLP theme is paired with a contrasting Wada harmony.
-    static const std::array<size_t, 8> order = {4, 2, 5, 0, 7, 6, 1, 3};
+    static const std::array<size_t, 16> order = {4, 2, 5, 0, 7, 6, 1, 3, 8, 9, 10, 11, 12, 13, 14, 15};
     return order;
 }
 
 static UITheme PairedMLPTheme(size_t index)
 {
-    switch(index % 8)
+    if(index < 8)
     {
-        case 0: return UITheme::NeonNoir();
-        case 1: return UITheme::DeepSpace();
-        case 2: return UITheme::SolarFlare();
-        case 3: return UITheme::Sunset();
-        case 4: return UITheme::EmberForge();
-        case 5: return UITheme::Cyberpunk();
-        case 6: return UITheme::Crimson();
-        default: return UITheme::Ruby();
+        switch(index)
+        {
+            case 0: return UITheme::NeonNoir();
+            case 1: return UITheme::DeepSpace();
+            case 2: return UITheme::SolarFlare();
+            case 3: return UITheme::Sunset();
+            case 4: return UITheme::EmberForge();
+            case 5: return UITheme::Cyberpunk();
+            case 6: return UITheme::Crimson();
+            default: return UITheme::Ruby();
+        }
     }
+
+    const GRUTheme& harmony = GRUThemes()[GRUPairOrder()[index % 16]];
+    UITheme theme{};
+    theme.name = "WadaPair" + std::to_string(index + 1);
+    theme.bg = {0.025f, 0.028f, 0.032f};
+    theme.panel = {0.075f, 0.080f, 0.090f};
+    theme.accent = harmony.unitBorder;
+    theme.grid = {harmony.unitFill.x * 0.32f, harmony.unitFill.y * 0.32f, harmony.unitFill.z * 0.32f};
+    theme.text = {0.94f, 0.93f, 0.88f};
+    theme.mesh = harmony.unitFill;
+    theme.nInput = harmony.unitBorder;
+    theme.nHidden = harmony.unitFill;
+    theme.nOutput = harmony.particle;
+    theme.nRing = harmony.particle;
+    theme.nHighlight = harmony.connectionEnd;
+    theme.edgeStart = harmony.unitBorder;
+    theme.edgeEnd = harmony.unitFill;
+    theme.edgeAlpha = 0.90f;
+    theme.edgeBase = 0.65f;
+    theme.edgeScale = 0.90f;
+    return theme;
 }
 
 static void ApplyPairedTheme(Renderer& renderer, size_t pairIndex)
 {
-    pairIndex %= 8;
+    pairIndex %= 16;
     renderer.theme = PairedMLPTheme(pairIndex);
     gGRUThemeIndex = GRUPairOrder()[pairIndex];
     gGRUTheme = GRUThemes()[gGRUThemeIndex];
@@ -1500,6 +1541,30 @@ static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
     out << "  \"target_mse\": " << TrainGetTargetMSE() << ",\n";
     out << "  \"paired_theme\": " << gPairedThemeIndex << ",\n";
 
+    const TurbineModel::Params* turbineParams = gEngine ? &gEngine->turbine.params : nullptr;
+    out << "  \"f2_settings\": {\n";
+    out << "    \"rpm\": " << (turbineParams ? turbineParams->rpm : 60.0f) << ",\n";
+    out << "    \"startup_time\": " << (turbineParams ? turbineParams->startupTime : 4.0f) << ",\n";
+    out << "    \"shutdown_time\": " << (turbineParams ? turbineParams->shutdownTime : 6.0f) << ",\n";
+    out << "    \"blades\": " << (turbineParams ? turbineParams->blades : 3) << ",\n";
+    out << "    \"wind_strength\": " << gWind.strength << ",\n";
+    out << "    \"wind_speed\": " << gWind.speed << ",\n";
+    out << "    \"wind_jitter\": " << gWind.jitter << ",\n";
+    out << "    \"strength_sine\": " << (gStrengthSineEnabled ? "true" : "false") << ",\n";
+    out << "    \"speed_sine\": " << (gSpeedSineEnabled ? "true" : "false") << ",\n";
+    out << "    \"jitter_sine\": " << (gJitterSineEnabled ? "true" : "false") << ",\n";
+    out << "    \"strength_phase\": " << gWindStrengthPhase << ",\n";
+    out << "    \"speed_phase\": " << gWindSpeedPhase << ",\n";
+    out << "    \"jitter_phase\": " << gWindJitterPhase << ",\n";
+    out << "    \"live_wave_active\": " << (gLiveFeedWaveActive ? "true" : "false") << ",\n";
+    out << "    \"live_wave_phase\": " << gLiveFeedWavePhase << ",\n";
+    out << "    \"live_wave_speed\": " << gLiveFeedWaveSpeed << ",\n";
+    out << "    \"live_current_input\": " << gLiveFeedCurrentInput << ",\n";
+    out << "    \"live_input_delay\": " << gLiveFeedInputDelay << ",\n";
+    out << "    \"random_live_feed\": " << (gRandomLiveFeedActive ? "true" : "false") << ",\n";
+    out << "    \"all_inputs_live\": " << (g.liveInputs ? "true" : "false") << "\n";
+    out << "  },\n";
+
     // Theme information
     const UITheme& theme = (gEngine && gEngine->window ? gEngine->renderer.theme : UITheme::Cyberpunk());
     out << "  \"theme\": {\n";
@@ -1550,6 +1615,8 @@ static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
         out << "      \"speed\": " << n.speed << ",\n";
         out << "      \"bias\": " << ng_get_bias(n) << ",\n";
         out << "      \"amp\": " << n.amp << ",\n";
+        out << "      \"live\": " << (n.live ? "true" : "false") << ",\n";
+        out << "      \"phase\": " << n.phase << ",\n";
         out << "      \"x\": " << n.x << ",\n";
         out << "      \"y\": " << n.y << "\n";
         out << "    }";
@@ -1703,7 +1770,65 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
         int   _ep = parseIntC("epochs", TrainGetEpochs());
         TrainApplyParams(_lr, _l1, _l2, _ep, _tm);
         gPairedThemeIndex = parseIntC("paired_theme", -1);
-        if(gPairedThemeIndex < -1 || gPairedThemeIndex > 7) gPairedThemeIndex = -1;
+        if(gPairedThemeIndex < -1 || gPairedThemeIndex > 15) gPairedThemeIndex = -1;
+
+        std::regex f2Expression(R"(\"f2_settings\"\s*:\s*\{([^{}]*)\})");
+        std::smatch f2Match;
+        if(std::regex_search(s, f2Match, f2Expression))
+        {
+            const std::string section = f2Match[1].str();
+            auto parseF2Float = [&](const char* key, float fallback)
+            {
+                std::regex expression(std::string("\\\"") + key + "\\\"\\s*:\\s*([-+eE0-9\\.]+)");
+                std::smatch match;
+                return std::regex_search(section, match, expression) ? std::stof(match[1].str()) : fallback;
+            };
+            auto parseF2Int = [&](const char* key, int fallback)
+            {
+                std::regex expression(std::string("\\\"") + key + "\\\"\\s*:\\s*(-?[0-9]+)");
+                std::smatch match;
+                return std::regex_search(section, match, expression) ? std::stoi(match[1].str()) : fallback;
+            };
+            auto parseF2Bool = [&](const char* key, bool fallback)
+            {
+                std::regex expression(std::string("\\\"") + key + "\\\"\\s*:\\s*(true|false)");
+                std::smatch match;
+                return std::regex_search(section, match, expression) ? match[1].str() == "true" : fallback;
+            };
+
+            gWind.strength = std::clamp(parseF2Float("wind_strength", gWind.strength), 0.0f, 300.0f);
+            gWind.speed = std::clamp(parseF2Float("wind_speed", gWind.speed), 0.0f, 5.0f);
+            gWind.jitter = std::clamp(parseF2Float("wind_jitter", gWind.jitter), 0.0f, 0.5f);
+            gStrengthSineEnabled = parseF2Bool("strength_sine", gStrengthSineEnabled);
+            gSpeedSineEnabled = parseF2Bool("speed_sine", gSpeedSineEnabled);
+            gJitterSineEnabled = parseF2Bool("jitter_sine", gJitterSineEnabled);
+            gWindStrengthPhase = parseF2Float("strength_phase", gWindStrengthPhase);
+            gWindSpeedPhase = parseF2Float("speed_phase", gWindSpeedPhase);
+            gWindJitterPhase = parseF2Float("jitter_phase", gWindJitterPhase);
+            gLiveFeedWaveActive = parseF2Bool("live_wave_active", gLiveFeedWaveActive);
+            gLiveFeedWavePhase = parseF2Float("live_wave_phase", gLiveFeedWavePhase);
+            gLiveFeedWaveSpeed = std::clamp(parseF2Float("live_wave_speed", gLiveFeedWaveSpeed), 0.5f, 5.0f);
+            gLiveFeedCurrentInput = std::max(0, parseF2Int("live_current_input", gLiveFeedCurrentInput));
+            gLiveFeedInputDelay = std::clamp(parseF2Float("live_input_delay", gLiveFeedInputDelay), 0.1f, 1.0f);
+            gRandomLiveFeedActive = parseF2Bool("random_live_feed", gRandomLiveFeedActive);
+            g.liveInputs = parseF2Bool("all_inputs_live", g.liveInputs);
+            gLiveFeedInputTimer = 0.0f;
+
+            if(gEngine)
+            {
+                gEngine->turbine.params.rpm = std::clamp(parseF2Float("rpm", gEngine->turbine.params.rpm), 0.0f, 15000.0f);
+                gEngine->turbine.params.startupTime = std::clamp(
+                    parseF2Float("startup_time", gEngine->turbine.params.startupTime), 0.1f, 60.0f);
+                gEngine->turbine.params.shutdownTime = std::clamp(
+                    parseF2Float("shutdown_time", gEngine->turbine.params.shutdownTime), 0.1f, 60.0f);
+                const int loadedBlades = std::clamp(parseF2Int("blades", gEngine->turbine.params.blades), 1, 10);
+                if(loadedBlades != gEngine->turbine.params.blades)
+                {
+                    gEngine->turbine.params.blades = loadedBlades;
+                    gEngine->turbine.rebuild();
+                }
+            }
+        }
     }catch(...){}
 
     auto find_section = [&](const char* key)->std::string
@@ -1731,16 +1856,17 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
     g.nodes.clear(); g.layers.clear(); g.edges.clear();
 
     // Try regex with desc, fall back to legacy regex without desc
+    std::regex rxNodeFull(R"(\{[^{}]*\"id\"\s*:\s*(-?\d+)[^{}]*\"label\"\s*:\s*\"([^\"]*)\"[^{}]*\"desc\"\s*:\s*\"([^\"]*)\"[^{}]*\"isInput\"\s*:\s*(true|false)[^{}]*\"value\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"speed\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"bias\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"amp\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"live\"\s*:\s*(true|false)[^{}]*\"phase\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"x\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"y\"\s*:\s*([-+eE0-9\.]+)[^{}]*\})");
     std::regex rxNodeDesc(R"(\{[^{}]*\"id\"\s*:\s*(-?\d+)[^{}]*\"label\"\s*:\s*\"([^\"]*)\"[^{}]*\"desc\"\s*:\s*\"([^\"]*)\"[^{}]*\"isInput\"\s*:\s*(true|false)[^{}]*\"value\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"speed\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"bias\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"x\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"y\"\s*:\s*([-+eE0-9\.]+)[^{}]*\})");
     std::regex rxNodeLegacy(R"(\{[^{}]*\"id\"\s*:\s*(-?\d+)[^{}]*\"label\"\s*:\s*\"([^\"]*)\"[^{}]*\"isInput\"\s*:\s*(true|false)[^{}]*\"value\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"speed\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"bias\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"x\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"y\"\s*:\s*([-+eE0-9\.]+)[^{}]*\})");
-    auto it = std::sregex_iterator(nodesSec.begin(), nodesSec.end(), rxNodeDesc);
+    auto itFull = std::sregex_iterator(nodesSec.begin(), nodesSec.end(), rxNodeFull);
     std::unordered_map<int, int> id2idx;
     int idx=0;
-    if(it != std::sregex_iterator())
+    if(itFull != std::sregex_iterator())
     {
-        for(; it!=std::sregex_iterator(); ++it)
+        for(; itFull!=std::sregex_iterator(); ++itFull)
         {
-            auto m=*it; Neuron n;
+            auto m=*itFull; Neuron n;
             n.id = std::atoi(m[1].str().c_str());
             n.label = m[2].str();
             n.desc = m[3].str();
@@ -1748,28 +1874,41 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
             n.value = std::atof(m[5].str().c_str());
             n.speed = std::atof(m[6].str().c_str());
             n.bias = std::atof(m[7].str().c_str());
-            n.x = std::atof(m[8].str().c_str());
-            n.y = std::atof(m[9].str().c_str());
+            n.amp = std::atof(m[8].str().c_str());
+            n.live = m[9].str() == "true";
+            n.phase = std::atof(m[10].str().c_str());
+            n.x = std::atof(m[11].str().c_str());
+            n.y = std::atof(m[12].str().c_str());
             g.nodes.push_back(n);
             id2idx[n.id] = idx++;
         }
-    } 
+    }
     else 
     {
-        auto it2 = std::sregex_iterator(nodesSec.begin(), nodesSec.end(), rxNodeLegacy);
-        for(; it2!=std::sregex_iterator(); ++it2)
+        auto it = std::sregex_iterator(nodesSec.begin(), nodesSec.end(), rxNodeDesc);
+        if(it != std::sregex_iterator())
         {
-            auto m=*it2; Neuron n;
-            n.id = std::atoi(m[1].str().c_str());
-            n.label = m[2].str();
-            n.isInput = (m[3].str()=="true");
-            n.value = std::atof(m[4].str().c_str());
-            n.speed = std::atof(m[5].str().c_str());
-            n.bias = std::atof(m[6].str().c_str());
-            n.x = std::atof(m[7].str().c_str());
-            n.y = std::atof(m[8].str().c_str());
-            g.nodes.push_back(n);
-            id2idx[n.id] = idx++;
+            for(; it!=std::sregex_iterator(); ++it)
+            {
+                auto m=*it; Neuron n;
+                n.id=std::atoi(m[1].str().c_str()); n.label=m[2].str(); n.desc=m[3].str();
+                n.isInput=m[4].str()=="true"; n.value=std::atof(m[5].str().c_str());
+                n.speed=std::atof(m[6].str().c_str()); n.bias=std::atof(m[7].str().c_str());
+                n.x=std::atof(m[8].str().c_str()); n.y=std::atof(m[9].str().c_str());
+                g.nodes.push_back(n); id2idx[n.id]=idx++;
+            }
+        }
+        else
+        {
+            auto it2 = std::sregex_iterator(nodesSec.begin(), nodesSec.end(), rxNodeLegacy);
+            for(; it2!=std::sregex_iterator(); ++it2)
+            {
+                auto m=*it2; Neuron n;
+                n.id=std::atoi(m[1].str().c_str()); n.label=m[2].str(); n.isInput=m[3].str()=="true";
+                n.value=std::atof(m[4].str().c_str()); n.speed=std::atof(m[5].str().c_str());
+                n.bias=std::atof(m[6].str().c_str()); n.x=std::atof(m[7].str().c_str());
+                n.y=std::atof(m[8].str().c_str()); g.nodes.push_back(n); id2idx[n.id]=idx++;
+            }
         }
     }
     if(g.nodes.empty()){ if(msg) *msg="No nodes found."; return false; }
@@ -2006,6 +2145,8 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
     float H = g.lastCanvasH>0? g.lastCanvasH : 500.0f;
     g.layoutLayers(W, H);
     for(auto& n : g.nodes){ n.vx=0.0f; n.vy=0.0f; }
+    if(!g.layers.empty() && !g.layers.front().nodeIdx.empty())
+        gLiveFeedCurrentInput %= (int)g.layers.front().nodeIdx.size();
     return true;
 }
 
@@ -2686,8 +2827,11 @@ void NeuralGraph::layoutLayers(float W, float H)
 {
     const float marginX = 40.f, marginY = 40.f;
     const float colGap  = (W - 2*marginX);
-    const size_t visibleColumns = collapseHiddenLayers ? 3u : std::max<size_t>(1, layers.size());
-    const float colW    = colGap / (float)visibleColumns;
+    const size_t expandedColumns = std::max<size_t>(1, layers.size());
+    const float colW = colGap / (float)expandedColumns;
+    const float layoutStartX = collapseHiddenLayers
+        ? (W - colW * 3.0f) * 0.5f
+        : marginX;
 
     // Compute a global radius so that all neurons fit vertically and horizontally
     float headerH = 3.0f * ImGui::GetTextLineHeightWithSpacing() + 6.0f; // 3 header lines
@@ -2722,14 +2866,15 @@ void NeuralGraph::layoutLayers(float W, float H)
     // Do not let dense hidden layers shrink either endpoint to tiny dots.
     const float endpointR=std::clamp(ImGui::GetFontSize()*0.75f,12.0f,18.0f);
 
-    float x = marginX;
+    float x = layoutStartX;
     size_t displayColumn = 0;
     for(size_t li=0; li<layers.size(); ++li)
     {
         Layer& L = layers[li];
         if(collapseHiddenLayers && (L.kind == LayerKind::Hidden || L.kind == LayerKind::GRU))
         {
-            L.x0 = marginX + colW + 6.f; L.x1 = marginX + colW*2.f - 6.f;
+            L.x0 = layoutStartX + colW + 6.f;
+            L.x1 = layoutStartX + colW*2.f - 6.f;
             L.y0 = marginY * 0.5f; L.y1 = H - marginY * 0.3f;
             continue;
         }
@@ -2771,8 +2916,12 @@ void NeuralGraph::layoutLayers(float W, float H)
         L.y0 = marginY * 0.5f;
         L.y1 = H - marginY * 0.3f;
         ++displayColumn;
-        x = marginX + colW*(float)displayColumn;
-        if(collapseHiddenLayers && L.kind == LayerKind::Input){ ++displayColumn; x = marginX + colW*(float)displayColumn; }
+        x = layoutStartX + colW*(float)displayColumn;
+        if(collapseHiddenLayers && L.kind == LayerKind::Input)
+        {
+            ++displayColumn;
+            x = layoutStartX + colW*(float)displayColumn;
+        }
     }
 }
 
@@ -2885,6 +3034,9 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
     ImGuiCond cond = gForceRelayoutWindows ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
     ImGui::SetNextWindowSize(ImVec2(width, height), cond);
     ImGui::SetNextWindowPos(ImVec2(10,10), cond);
+    
+    //F1 window transparency
+    ImGui::SetNextWindowBgAlpha(0.50f);
 
     char editorTitle[128];
     std::snprintf(editorTitle, sizeof(editorTitle), "Neural Network (Neurons: %zu)###Neural Editor", nodes.size());
@@ -2938,8 +3090,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         ImVec2 canvasMax = ImVec2(origin.x + canvasSize.x, origin.y + canvasSize.y);
 
         // CANVAS background
-        dl->AddRectFilled(origin, canvasMax, ImGui::GetColorU32(ImVec4(0.08f,0.08f,0.095f,1.0f)), 6.0f);
-        dl->AddRect(origin, canvasMax, ImGui::GetColorU32(ImVec4(0.25f,0.25f,0.3f,1.0f)), 6.0f);
+        dl->AddRectFilled(origin, canvasMax, ImGui::GetColorU32(ImVec4(0.08f,0.08f,0.095f,0.42f)), 6.0f);
+        dl->AddRect(origin, canvasMax, ImGui::GetColorU32(ImVec4(0.25f,0.25f,0.3f,6.0f)), 6.0f);
 
         ImVec2 _csize = ImVec2(std::max(1.0f, canvasSize.x), std::max(1.0f, canvasSize.y));
         ImGui::InvisibleButton("canvas", _csize);
@@ -2962,12 +3114,12 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             ImU32 colBg = isGRULayer
                 ? ImGui::GetColorU32((int(li)==currentLayer
                     ? ImVec4(gGRUTheme.columnBackground.x*1.35f, gGRUTheme.columnBackground.y*1.35f,
-                             gGRUTheme.columnBackground.z*1.35f, 0.97f)
+                             gGRUTheme.columnBackground.z*1.35f, 0.86f)
                     : ImVec4(gGRUTheme.columnBackground.x, gGRUTheme.columnBackground.y,
-                             gGRUTheme.columnBackground.z, 0.90f)))
+                             gGRUTheme.columnBackground.z, 0.72f)))
                 : ((int(li)==currentLayer
-                    ? ImGui::GetColorU32(ImVec4(0.18f,0.20f,0.28f,0.95f))
-                    : ImGui::GetColorU32(ImVec4(0.12f,0.12f,0.15f,0.75f))));
+                    ? ImGui::GetColorU32(ImVec4(0.18f,0.20f,0.28f,0.84f))
+                    : ImGui::GetColorU32(ImVec4(0.12f,0.12f,0.15f,0.66f))));
             dl->AddRectFilled(a, b, colBg, 8.0f);
             dl->AddRect(a, b, ImGui::GetColorU32(isGRULayer
                 ? ImVec4(gGRUTheme.unitBorder.x,gGRUTheme.unitBorder.y,gGRUTheme.unitBorder.z,0.95f)
@@ -3071,7 +3223,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         // A compact, readable stand-in for the complete hidden part of the
         // network. It keeps the data flow obvious without drawing hundreds of
         // overlapping neurons and labels.
-        ImVec2 hiddenHub(origin.x + canvasSize.x*0.5f, origin.y + canvasSize.y*0.54f);
+        ImVec2 hiddenHub(origin.x + canvasSize.x*0.5f, origin.y + canvasSize.y*0.5f);
         if(collapseHiddenLayers)
         {
             int hiddenLayerCount=0, hiddenNeuronCount=0;
@@ -3085,6 +3237,10 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             dl->AddCircleFilled(hiddenHub, 29.0f, ImGui::GetColorU32(ImVec4(.10f,.16f,.22f,1.0f)), 40);
             dl->AddCircle(hiddenHub, 29.0f, ImGui::GetColorU32(ImVec4(.25f,.95f,.85f,1.0f)), 40, 3.0f);
             dl->AddCircle(hiddenHub, 18.0f, ImGui::GetColorU32(ImVec4(.25f,.95f,.85f,.8f)), 6, 2.0f);
+            const char* blackboxLabel="[BLACKBOX]";
+            ImVec2 blackboxSize=ImGui::CalcTextSize(blackboxLabel);
+            dl->AddText(ImVec2(hiddenHub.x-blackboxSize.x*.5f, hiddenHub.y-54.0f),
+                        ImGui::GetColorU32(ImVec4(.92f,1.0f,.96f,1.0f)), blackboxLabel);
             char summary[96]; std::snprintf(summary, sizeof(summary), "%d deep/GRU layers / %d neurons", hiddenLayerCount, hiddenNeuronCount);
             ImVec2 ss=ImGui::CalcTextSize(summary);
             dl->AddText(ImVec2(hiddenHub.x-ss.x*.5f, hiddenHub.y+38.0f), ImGui::GetColorU32(ImVec4(.75f,.95f,.92f,1)), summary);
@@ -3815,17 +3971,14 @@ bool Engine::init(const AppConfig& cfgIn)
     loadTurbinConfDefaults("turbin.conf");
     cfg.rotate = true;
     turbine.params.rpm = 444.0f;
-    turbine.params.current_rpm = cfg.rotate ? turbine.params.rpm : 0.0f;
+    turbine.params.current_rpm = 0.0f;
     turbine.rebuild();
 
     srand((unsigned int)time(NULL));
     gWindStrengthPhase = (rand() / (float)RAND_MAX) * 2.f * 3.14159f;
     gWindSpeedPhase = (rand() / (float)RAND_MAX) * 2.f * 3.14159f;
     gWindJitterPhase = (rand() / (float)RAND_MAX) * 2.f * 3.14159f;
-    if (cfg.rotate) 
-    {
-        gWindInterpolant = 1.0f;
-    }
+    gWindInterpolant = 0.0f;
 
     timer.last = glfwGetTime();
     // Initial camera looking slightly from above at origin
@@ -3862,18 +4015,19 @@ void Engine::update()
 {
     double t = glfwGetTime(); timer.update(t);
 
-    // Smooth wind transition
-    const float kWIND_TRANSITION_SPEED = 1.5f; // seconds to go from 0 to 1
-    if (cfg.rotate) 
-    {
-        gWindInterpolant += (float)timer.dt / kWIND_TRANSITION_SPEED;
-        if (gWindInterpolant > 1.0f) gWindInterpolant = 1.0f;
-    } 
-    else 
-    {
-        gWindInterpolant -= (float)timer.dt / kWIND_TRANSITION_SPEED;
-        if (gWindInterpolant < 0.0f) gWindInterpolant = 0.0f;
-    }
+    const float targetRpm = cfg.rotate ? turbine.params.rpm : 0.0f;
+    const float transitionTime = cfg.rotate
+        ? std::max(0.1f, turbine.params.startupTime)
+        : std::max(0.1f, turbine.params.shutdownTime);
+    const float rpmReference = std::max({1.0f, turbine.params.rpm, turbine.params.current_rpm});
+    const float maxRpmStep = rpmReference * (float)timer.dt / transitionTime;
+    const float rpmDifference = targetRpm - turbine.params.current_rpm;
+    turbine.params.current_rpm += std::clamp(rpmDifference, -maxRpmStep, maxRpmStep);
+    if(std::fabs(rpmDifference) <= maxRpmStep) turbine.params.current_rpm = targetRpm;
+
+    gWindInterpolant = turbine.params.rpm > 0.001f
+        ? std::clamp(turbine.params.current_rpm / turbine.params.rpm, 0.0f, 1.0f)
+        : 0.0f;
 
     // Update wind parameter phases for oscillation
     gWindStrengthPhase += 0.5f * (float)timer.dt;
@@ -3895,9 +4049,9 @@ void Engine::update()
         gWind.jitter = 0.25f + 0.25f * sin(gWindJitterPhase);
     }
 
-    if(cfg.rotate)
+    if(turbine.params.current_rpm > 0.001f)
     {
-        float rps = turbine.params.rpm / 60.0f;
+        float rps = turbine.params.current_rpm / 60.0f;
         float radps = rps * 6.28318530718f;
         rotorAngle += (float)(radps * timer.dt);
     }
@@ -4007,29 +4161,36 @@ void Engine::render()
 
     renderer.drawGrid(VP);
 
+    // Fixed industrial materials: these deliberately do not follow UI themes.
+    const Vec3 shaftSteel{0.34f, 0.38f, 0.41f};
+    const Vec3 rotorBronze{0.58f, 0.34f, 0.14f};
+    const Vec3 pipeCopper{0.55f, 0.25f, 0.10f};
+    const Vec3 gearSteel{0.28f, 0.31f, 0.33f};
+    const Vec3 steamColor{0.72f, 0.84f, 0.88f};
+
     Mat4 Mshaft = Mat4::translate({0,0,0});
-    renderer.drawMesh(turbine.shaft, VP*Mshaft, Mshaft, renderer.theme.mesh, 0.05f);
+    renderer.drawMesh(turbine.shaft, VP*Mshaft, Mshaft, shaftSteel, 0.32f);
 
     // Draw full rotor as one rotating assembly around Y axis at origin
     Mat4 Mrotor = Mat4::rotateY(rotorAngle);
-    renderer.drawMesh(turbine.rotor, VP*Mrotor, Mrotor, renderer.theme.accent, 0.4f);
+    renderer.drawMesh(turbine.rotor, VP*Mrotor, Mrotor, rotorBronze, 0.52f);
 
     // Draw static pipes
     Mat4 Mpipes = Mat4::translate({0,0,0});
-    renderer.drawMesh(turbine.pipes, VP*Mpipes, Mpipes, renderer.theme.mesh, 0.2f);
+    renderer.drawMesh(turbine.pipes, VP*Mpipes, Mpipes, pipeCopper, 0.42f);
 
     // Steam lines (stylized) - always visible
-    renderer.drawLines(turbine.schematicLines, VP, renderer.theme.accent, 2.0f);
+    renderer.drawLines(turbine.schematicLines, VP, steamColor, 2.0f);
 
     // Draw meshing outer gears (counter-rotating), translated on X (left and right)
     float ratioL = (turbine.outerTeeth>0)? (turbine.rotorTeeth / (float)turbine.outerTeeth) : 1.0f;
     const float meshPhaseL = 3.1415926535f / std::max(1, turbine.outerTeeth);
     Mat4 MouterL = Mat4::translate({turbine.outerGearOffset, 0, 0}) * Mat4::rotateY(-rotorAngle*ratioL + meshPhaseL);
-    renderer.drawMesh(turbine.outerGear, VP*MouterL, MouterL, renderer.theme.mesh, 0.6f);
+    renderer.drawMesh(turbine.outerGear, VP*MouterL, MouterL, gearSteel, 0.58f);
     float ratioR = (turbine.outerTeethR>0)? (turbine.rotorTeeth / (float)turbine.outerTeethR) : 1.0f;
     const float meshPhaseR = 3.1415926535f / std::max(1, turbine.outerTeethR);
     Mat4 MouterR = Mat4::translate({turbine.outerGearOffsetR, 0, 0}) * Mat4::rotateY(-rotorAngle*ratioR + meshPhaseR);
-    renderer.drawMesh(turbine.outerGearR, VP*MouterR, MouterR, renderer.theme.mesh, 0.6f);
+    renderer.drawMesh(turbine.outerGearR, VP*MouterR, MouterR, gearSteel, 0.58f);
 
 #ifdef USE_IMGUI
     ImGui_ImplOpenGL3_NewFrame();
@@ -4063,6 +4224,9 @@ void Engine::render()
             ImGui::Checkbox("VSync (V)", &cfg.vsync);
             ImGui::SameLine(); ImGui::Checkbox("Rotate (R)", &cfg.rotate);
             ImGui::SliderFloat("RPM", &turbine.params.rpm, 0.0f, 15000.0f);
+            ImGui::SliderFloat("Startup Time", &turbine.params.startupTime, 0.1f, 60.0f, "%.1f s");
+            ImGui::SliderFloat("Shutdown Time", &turbine.params.shutdownTime, 0.1f, 60.0f, "%.1f s");
+            ImGui::Text("Current RPM: %.1f", turbine.params.current_rpm);
             int blades = turbine.params.blades;
             if(ImGui::SliderInt("Blades", &blades, 1, 10)){ turbine.params.blades = blades; turbine.rebuild(); }
             ImGui::Separator();
@@ -4145,10 +4309,9 @@ void Engine::render()
             ImGui::Text("Input Controls");
             
             // Random Live Feed toggle button
-            static bool randomLiveFeedActive = false;
-            if(ImGui::Button(randomLiveFeedActive ? "Disable Random Feed (Q)" : "Enable Random Feed (Q)"))
+            if(ImGui::Button(gRandomLiveFeedActive ? "Disable Random Feed (Q)" : "Enable Random Feed (Q)"))
             {
-                randomLiveFeedActive = !randomLiveFeedActive;
+                gRandomLiveFeedActive = !gRandomLiveFeedActive;
                 int inputCount = 0;
                 for(const auto& L : graph.layers)
                 {
@@ -4159,7 +4322,7 @@ void Engine::render()
                         auto& n = graph.nodes[idx];
                         if(!n.isInput) continue;
                         
-                        if(randomLiveFeedActive)
+                        if(gRandomLiveFeedActive)
                         {
                             // Set random amplitude (0.1 to 1.0)
                             n.amp = 0.1f + (rand() / (float)RAND_MAX) * 0.9f;
@@ -4182,7 +4345,7 @@ void Engine::render()
                         inputCount++;
                     }
                 }
-                if(randomLiveFeedActive)
+                if(gRandomLiveFeedActive)
                 {
                     Logf("Random live feed applied to %d input neurons", inputCount);
                 } 
@@ -4220,7 +4383,7 @@ void Engine::render()
 
                 // Disable wave effect
                 gLiveFeedWaveActive = false;
-                randomLiveFeedActive = false;
+                gRandomLiveFeedActive = false;
                 Logf("All %d input neurons set to zero and live feeds disabled", inputCount);
             }
 
@@ -4840,10 +5003,10 @@ void Engine::render()
         ImGui::BulletText("W                    - toggle live feed wave effect");
         ImGui::BulletText("Q                    - random live feed for all input neurons");
         ImGui::BulletText("TAB                  - toggle live feed on all inputs");
-        ImGui::BulletText("V / R                - VSync / rotate");
+        ImGui::BulletText("V / R                - VSync / smooth turbine start-stop");
         ImGui::BulletText("Shift+T              - change MLP theme");
-        ImGui::BulletText("Shift+G              - change GRU theme");
-        ImGui::BulletText("C                    - change paired MLP + GRU theme");
+        ImGui::BulletText("Shift+G              - change GRU theme (16 palettes)");
+        ImGui::BulletText("C                    - change paired MLP + GRU theme (16 pairs)");
         ImGui::Separator();
         ImGui::Text("Creating example networks");
         ImGui::BulletText("Use buttons like 'Rabbit Example' in Training parameters for presets");
@@ -5293,9 +5456,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     if(key==GLFW_KEY_DELETE){ NG_RemoveCurrentHiddenLayer(graph); return; }
     if(key==GLFW_KEY_TAB)
     {
-        static bool s_allInputsLive = true; // toggled by TAB
-        s_allInputsLive = !s_allInputsLive;
-        graph.liveInputs = s_allInputsLive;
+        graph.liveInputs = !graph.liveInputs;
         // Apply to all input neurons
         for(const auto& L : graph.layers)
         {
@@ -5304,8 +5465,8 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
             {
                 if(idx<0 || idx>=(int)graph.nodes.size()) continue;
                 auto& n = graph.nodes[idx];
-                n.live = s_allInputsLive;
-                if(s_allInputsLive && n.speed<=0.0f){ n.speed = 0.6f; n.phase = 0.0f; }
+                n.live = graph.liveInputs;
+                if(graph.liveInputs && n.speed<=0.0f){ n.speed = 0.6f; n.phase = 0.0f; }
             }
         }
         return;
@@ -5349,7 +5510,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     if(key==GLFW_KEY_R){ cfg.rotate = !cfg.rotate; }
     if(key==GLFW_KEY_C)
     {
-        const size_t nextPair = (size_t)((gPairedThemeIndex + 1) % 8);
+        const size_t nextPair = (size_t)((gPairedThemeIndex + 1) % 16);
         ApplyPairedTheme(renderer, nextPair);
         Logf("Paired theme selected: MLP=%s, GRU=%s",
              renderer.theme.name.c_str(), gGRUTheme.name.c_str());
@@ -5509,7 +5670,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
 
     if(key==GLFW_KEY_Q)
     {
-        // Random live feed for all input neurons
+        gRandomLiveFeedActive = !gRandomLiveFeedActive;
         int inputCount = 0;
         for(const auto& L : graph.layers)
         {
@@ -5520,21 +5681,23 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
                 auto& n = graph.nodes[idx];
                 if(!n.isInput) continue;
                 
-                // Set random amplitude (0.1 to 1.0)
-                n.amp = 0.1f + (rand() / (float)RAND_MAX) * 0.9f;
-
-                // Set random speed (0.1 to 1.0 Hz)
-                n.speed = 0.1f + (rand() / (float)RAND_MAX) * 0.9f;
-
-                // Enable live feed
-                n.live = true;
-
-                // Reset phase for immediate effect
-                n.phase = 0.0f;
+                if(gRandomLiveFeedActive)
+                {
+                    n.amp = 0.1f + (rand() / (float)RAND_MAX) * 0.9f;
+                    n.speed = 0.1f + (rand() / (float)RAND_MAX) * 0.9f;
+                    n.live = true;
+                    n.phase = 0.0f;
+                }
+                else
+                {
+                    n.live = false;
+                    n.speed = 0.0f;
+                }
                 inputCount++;
             }
         }
-        Logf("Random live feed applied to %d input neurons", inputCount);
+        Logf("Random live feed %s for %d input neurons",
+             gRandomLiveFeedActive ? "applied" : "disabled", inputCount);
         return;
     }
 
