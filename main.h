@@ -13,7 +13,7 @@
 // ─────────────────────────────────────────
 // Paths and version
 // ─────────────────────────────────────────
-inline constexpr const char* kAppVersion             = "v3.0";
+inline constexpr const char* kAppVersion             = "v4.0";
 inline constexpr const char* kEngineConfFile         = "engine.conf";
 inline constexpr const char* kLessonsFile            = "lessons.json";
 inline constexpr const char* kNetworkFile            = "network.json";
@@ -103,8 +103,10 @@ struct UITheme
 {
     std::string name;
     Vec3 bg, panel, accent, grid, text, mesh;
+
     // Neural editor colors
     Vec3 nInput, nHidden, nOutput, nRing, nHighlight;
+
     // Edge gradient (start -> end) and style
     Vec3 edgeStart, edgeEnd;
     float edgeAlpha=0.85f;
@@ -119,6 +121,18 @@ struct UITheme
     static UITheme Crimson();
     static UITheme Ruby();
     static UITheme Cyberpunk();
+};
+
+struct GRUTheme
+{
+    std::string name;
+    Vec3 columnBackground;
+    Vec3 unitFill;
+    Vec3 unitBorder;
+    Vec3 connectionStart;
+    Vec3 connectionEnd;
+    Vec3 particle;
+    Vec3 recurrentLoop;
 };
 
 // ─────────────────────────────────────────
@@ -248,11 +262,10 @@ struct InputState
 
 struct AppConfig
 {
-    std::string title = "NeuralX";
+    std::string title = "NeuralT";
     int width = 1280, height = 800;
     bool vsync = true;
     bool rotate = false;
-    bool showSchematic = false;
     bool showUI = true;
 };
 

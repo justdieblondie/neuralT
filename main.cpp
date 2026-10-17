@@ -1,5 +1,5 @@
 
-// main.cpp  - NeuralT - Neural Editor v3.0
+// main.cpp  - NeuralT - Neural Editor
 // Author: justdieblondie
 #include <cfloat>
 #include <cstdarg>
@@ -397,28 +397,77 @@ Mesh Procedural::makeCylinder(float R, float H, int seg, bool capped)
 
 Mesh Procedural::makeBlade(float rootW, float tipW, float L, float T, int slices)
 {
-    Mesh m; float halfT=T*0.5f;
-    for(int i=0;i<=slices;i++){
-        float t = (float)i/slices;
-        float w = rootW*(1.0f-t) + tipW*t;
-        float xL = -w*0.5f, xR =  w*0.5f;
-        float y  = 0.0f; float z  = t*L;
-        float twist = t * 0.6f; float c=std::cos(twist), s=std::sin(twist);
-        auto rot = [&](float x, float yv){ return Vec3{ x*c + 0*yv, yv, x*(-s) }; };
-        std::array<Vec3,4> corners = { rot(xL,-halfT), rot(xR,-halfT), rot(xR,halfT), rot(xL,halfT) };
-        Vec3 n{0,1,0};
-        m.vertices.push_back({{corners[0].x, y+corners[0].y, z+corners[0].z}, n, {0,0}});
-        m.vertices.push_back({{corners[1].x, y+corners[1].y, z+corners[1].z}, n, {1,0}});
-        m.vertices.push_back({{corners[2].x, y+corners[2].y, z+corners[2].z}, n, {1,1}});
-        m.vertices.push_back({{corners[3].x, y+corners[3].y, z+corners[3].z}, n, {0,1}});
-        uint32_t base = i*4;
-        if(i>0){
-            uint32_t b0 = base-4, b1 = base-3, b2 = base-2, b3 = base-1;
-            uint32_t c0 = base,   c1 = base+1, c2 = base+2, c3 = base+3;
-            m.indices.insert(m.indices.end(), { b0,b1,c1, b0,c1,c0, b1,b2,c2, b1,c2,c1, b2,b3,c3, b2,c3,c2, b3,b0,c0, b3,c0,c3 });
+    Mesh m;
+    slices = std::max(8, slices);
+    constexpr int chordSegments = 10;
+    const int rowWidth = chordSegments + 1;
+
+    for(int station = 0; station <= slices; ++station)
+    {
+        const float radial = (float)station / slices;
+        const float smooth = radial * radial * (3.0f - 2.0f * radial);
+        const float chord = rootW * (1.0f - smooth) + tipW * smooth;
+        const float sweep = L * 0.10f * radial * radial;
+        const float twist = 0.62f * (1.0f - radial) + 0.12f * radial;
+        const float ct = std::cos(twist), st = std::sin(twist);
+        for(int side = 0; side < 2; ++side)
+        {
+            const float sign = side == 0 ? 1.0f : -1.0f;
+            for(int chordIndex = 0; chordIndex <= chordSegments; ++chordIndex)
+            {
+                const float u = (float)chordIndex / chordSegments;
+                const float profile = std::sin(3.1415926535f * u);
+                const float thickness = T * (0.08f + 0.92f * profile) * (1.0f - 0.35f * radial);
+                const float camber = chord * 0.055f * std::sin(3.1415926535f * u) * (1.0f - 0.45f * radial);
+                const float localX = (u - 0.43f) * chord + sweep;
+                const float localY = camber + sign * thickness * 0.5f;
+                const float x = localX * ct - localY * st;
+                const float y = localX * st + localY * ct;
+                Vec3 normal{-sign * st, sign * ct, 0.0f};
+                m.vertices.push_back({{x,y,radial*L},normal,{u,radial}});
+            }
         }
     }
-    m.upload(); return m;
+
+    const int stationWidth = rowWidth * 2;
+    for(int station = 0; station < slices; ++station)
+    {
+        for(int side = 0; side < 2; ++side)
+        {
+            for(int chordIndex = 0; chordIndex < chordSegments; ++chordIndex)
+            {
+                const uint32_t a = station * stationWidth + side * rowWidth + chordIndex;
+                const uint32_t b = a + 1;
+                const uint32_t c = a + stationWidth;
+                const uint32_t d = c + 1;
+                if(side == 0) m.indices.insert(m.indices.end(), {a,c,b, b,c,d});
+                else m.indices.insert(m.indices.end(), {a,b,c, b,d,c});
+            }
+        }
+        for(int edge : {0, chordSegments})
+        {
+            const uint32_t topA = station * stationWidth + edge;
+            const uint32_t bottomA = station * stationWidth + rowWidth + edge;
+            const uint32_t topB = topA + stationWidth;
+            const uint32_t bottomB = bottomA + stationWidth;
+            m.indices.insert(m.indices.end(), {topA,bottomA,topB, bottomA,bottomB,topB});
+        }
+    }
+    for(int station : {0, slices})
+    {
+        const uint32_t base = station * stationWidth;
+        for(int chordIndex = 0; chordIndex < chordSegments; ++chordIndex)
+        {
+            const uint32_t topA = base + chordIndex;
+            const uint32_t topB = topA + 1;
+            const uint32_t bottomA = base + rowWidth + chordIndex;
+            const uint32_t bottomB = bottomA + 1;
+            if(station == 0) m.indices.insert(m.indices.end(), {topA,topB,bottomA, topB,bottomB,bottomA});
+            else m.indices.insert(m.indices.end(), {topA,bottomA,topB, topB,bottomA,bottomB});
+        }
+    }
+    m.upload();
+    return m;
 }
 
 Mesh Procedural::merge(const std::vector<Mesh>& meshes){ Mesh out; for(auto& m : meshes) appendMesh(out, m); out.upload(); return out; }
@@ -432,54 +481,43 @@ Mesh Procedural::makeLineList(const std::vector<Vec3>& pts, const std::vector<ui
 
 Mesh Procedural::makeGear(float innerR, float outerR, float toothDepth, int teeth, float width)
 {
-    (void)innerR; // inner hole not modeled in this simple gear; silence unused warning
-    // Simple radial gear: alternating outer radius to form teeth, centered around origin, axis = Y
     Mesh m;
-    int segPerTooth = 4; // base tooth shape resolution
-    int seg = std::max(8, teeth * segPerTooth);
-    float halfW = width*0.5f;
-    // Build two rings (bottom/top), then side quads
-    std::vector<Vec3> ringBottom, ringTop;
-    ringBottom.reserve(seg); ringTop.reserve(seg);
+    teeth = std::max(8, teeth);
+    constexpr int pointsPerTooth = 8;
+    const int segments = teeth * pointsPerTooth;
+    const float halfWidth = width * 0.5f;
+    const float rootRadius = outerR;
+    if(innerR <= 0.0f) innerR = rootRadius * 0.42f;
 
-    for(int i=0;i<seg;i++)
+    auto toothRadius = [&](int segment)
     {
-        float t = (float)i/(float)seg;
-        float ang = t * 2.f*3.1415926535f;
-        // tooth shaping: widen outer radius on tooth peaks
-        float toothPhase = t * teeth;
-        float frac = toothPhase - std::floor(toothPhase);
-        float tooth = (frac<0.5f)? 1.0f : 0.0f; // crude square tooth
-        float r = outerR + tooth * toothDepth;
-        float c=std::cos(ang), s=std::sin(ang);
-        ringBottom.push_back({r*c, -halfW, r*s});
-        ringTop.push_back({r*c,  halfW, r*s});
-    }
-
-    // inner cylinder (hole) not modeled for simplicity; approximate normals
-    auto addTri = [&](const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& n)
-    {
-        uint32_t base = (uint32_t)m.vertices.size();
-        m.vertices.push_back({a,n,{0,0}});
-        m.vertices.push_back({b,n,{0,0}});
-        m.vertices.push_back({c,n,{0,0}});
-        m.indices.insert(m.indices.end(), {base, base+1, base+2});
+        const int phase = segment % pointsPerTooth;
+        static const float shape[pointsPerTooth] = {0.0f,0.0f,0.42f,1.0f,1.0f,0.42f,0.0f,0.0f};
+        return rootRadius + toothDepth * shape[phase];
     };
-
-    // side quads between bottom/top rings
-    for(int i=0;i<seg;i++)
+    for(int i = 0; i < segments; ++i)
     {
-        int j = (i+1)%seg;
-        Vec3 a = ringBottom[i], b = ringBottom[j];
-        Vec3 c = ringTop[j],    d = ringTop[i];
-        // normal approx outward
-        Vec3 edge{b.x-a.x, b.y-a.y, b.z-a.z};
-        Vec3 up{0,1,0};
-        Vec3 n{ edge.z*up.y - edge.y*up.z, edge.x*up.z - edge.z*up.x, edge.y*up.x - edge.x*up.y };
-        float len = std::sqrt(n.x*n.x+n.y*n.y+n.z*n.z); if(len>1e-6f){ n.x/=len; n.y/=len; n.z/=len; }
-        addTri(a,b,c,n); addTri(a,c,d,n);
+        const float angle = 2.0f * 3.1415926535f * i / segments;
+        const float c = std::cos(angle), s = std::sin(angle);
+        const float radius = toothRadius(i);
+        m.vertices.push_back({{innerR*c,-halfWidth,innerR*s},{0,-1,0},{0,0}});
+        m.vertices.push_back({{radius*c,-halfWidth,radius*s},{0,-1,0},{1,0}});
+        m.vertices.push_back({{innerR*c, halfWidth,innerR*s},{0, 1,0},{0,1}});
+        m.vertices.push_back({{radius*c, halfWidth,radius*s},{0, 1,0},{1,1}});
     }
-    m.upload(); return m;
+    for(int i = 0; i < segments; ++i)
+    {
+        const int j = (i + 1) % segments;
+        const uint32_t a = i*4, b = j*4;
+        m.indices.insert(m.indices.end(), {
+            a,a+1,b, a+1,b+1,b,
+            a+2,b+2,a+3, a+3,b+2,b+3,
+            a+1,a+3,b+1, a+3,b+3,b+1,
+            a,b,a+2, a+2,b,b+2
+        });
+    }
+    m.upload();
+    return m;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -576,139 +614,312 @@ UITheme UITheme::Ruby()
     return t;
 }
 
+static Vec3 ColorHex(unsigned int value)
+{
+    return {
+        ((value >> 16) & 0xff) / 255.0f,
+        ((value >> 8) & 0xff) / 255.0f,
+        (value & 0xff) / 255.0f
+    };
+}
+
+static const std::array<GRUTheme, 8>& GRUThemes()
+{
+    // Compact two-colour harmonies adapted from combinations catalogued by
+    // Sanzo Wada. Dark column grounds are derived from the same hues so the
+    // palettes remain readable over every existing MLP theme.
+    static const std::array<GRUTheme, 8> themes = {{
+        {"English Red / Cerulean", ColorHex(0x24100d), ColorHex(0xd96629), ColorHex(0x0093a5),
+            ColorHex(0xd96629), ColorHex(0x0093a5), ColorHex(0xffefae), ColorHex(0x0093a5)},
+        {"Yellow Orange / Tyrian Blue", ColorHex(0x091724), ColorHex(0xf99d1b), ColorHex(0x12354e),
+            ColorHex(0xf99d1b), ColorHex(0x4e7891), ColorHex(0xffefae), ColorHex(0x12354e)},
+        {"Sienna / Pale Lemon", ColorHex(0x25190b), ColorHex(0xbb7125), ColorHex(0xffefae),
+            ColorHex(0xbb7125), ColorHex(0xffefae), ColorHex(0xfff8d5), ColorHex(0xd59a43)},
+        {"Isabella / Red Violet", ColorHex(0x1d1021), ColorHex(0xc5a56e), ColorHex(0x59256a),
+            ColorHex(0xc5a56e), ColorHex(0x8d4d92), ColorHex(0xffefae), ColorHex(0x59256a)},
+        {"Cossack Green / Vandar Blue", ColorHex(0x071b20), ColorHex(0x437742), ColorHex(0x8fc6d1),
+            ColorHex(0x437742), ColorHex(0x064f6e), ColorHex(0xb5decc), ColorHex(0x8fc6d1)},
+        {"Grenadine / Deep Indigo", ColorHex(0x090d21), ColorHex(0xf48067), ColorHex(0x7189c4),
+            ColorHex(0xf48067), ColorHex(0x051230), ColorHex(0xffc2a9), ColorHex(0x7189c4)},
+        {"Orange / Glaucous Green", ColorHex(0x12201b), ColorHex(0xf37420), ColorHex(0xb4cdc2),
+            ColorHex(0xf37420), ColorHex(0xb4cdc2), ColorHex(0xffefae), ColorHex(0x78aa98)},
+        {"Turquoise / Burnt Sienna", ColorHex(0x102322), ColorHex(0xb5decc), ColorHex(0xa34f2c),
+            ColorHex(0xb5decc), ColorHex(0xa34f2c), ColorHex(0xf5ecc2), ColorHex(0xd07045)}
+    }};
+    return themes;
+}
+
+static size_t gGRUThemeIndex = 0;
+static GRUTheme gGRUTheme = GRUThemes()[gGRUThemeIndex];
+static int gPairedThemeIndex = -1;
+
+static const std::array<size_t, 8>& GRUPairOrder()
+{
+    // Each existing MLP theme is paired with a contrasting Wada harmony.
+    static const std::array<size_t, 8> order = {4, 2, 5, 0, 7, 6, 1, 3};
+    return order;
+}
+
+static UITheme PairedMLPTheme(size_t index)
+{
+    switch(index % 8)
+    {
+        case 0: return UITheme::NeonNoir();
+        case 1: return UITheme::DeepSpace();
+        case 2: return UITheme::SolarFlare();
+        case 3: return UITheme::Sunset();
+        case 4: return UITheme::EmberForge();
+        case 5: return UITheme::Cyberpunk();
+        case 6: return UITheme::Crimson();
+        default: return UITheme::Ruby();
+    }
+}
+
+static void ApplyPairedTheme(Renderer& renderer, size_t pairIndex)
+{
+    pairIndex %= 8;
+    renderer.theme = PairedMLPTheme(pairIndex);
+    gGRUThemeIndex = GRUPairOrder()[pairIndex];
+    gGRUTheme = GRUThemes()[gGRUThemeIndex];
+    gPairedThemeIndex = (int)pairIndex;
+}
+
+static Mesh MakeTubePath(const std::vector<Vec3>& path, float radius, int radialSegments)
+{
+    Mesh mesh;
+    if(path.size() < 2) return mesh;
+    radialSegments = std::max(8, radialSegments);
+    auto normalize = [](Vec3 value)
+    {
+        const float length = std::sqrt(value.x*value.x + value.y*value.y + value.z*value.z);
+        return length > 1e-6f ? Vec3{value.x/length,value.y/length,value.z/length} : Vec3{0,1,0};
+    };
+    auto cross = [](Vec3 a, Vec3 b)
+    {
+        return Vec3{a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x};
+    };
+    for(size_t pointIndex = 0; pointIndex < path.size(); ++pointIndex)
+    {
+        const Vec3 before = path[pointIndex == 0 ? 0 : pointIndex - 1];
+        const Vec3 after = path[pointIndex + 1 < path.size() ? pointIndex + 1 : pointIndex];
+        const Vec3 tangent = normalize({after.x-before.x,after.y-before.y,after.z-before.z});
+        const Vec3 reference = std::fabs(tangent.y) < 0.88f ? Vec3{0,1,0} : Vec3{1,0,0};
+        const Vec3 side = normalize(cross(tangent, reference));
+        const Vec3 up = normalize(cross(side, tangent));
+        for(int segment = 0; segment < radialSegments; ++segment)
+        {
+            const float angle = 2.0f * 3.1415926535f * segment / radialSegments;
+            const float c = std::cos(angle), s = std::sin(angle);
+            const Vec3 normal{side.x*c+up.x*s,side.y*c+up.y*s,side.z*c+up.z*s};
+            const Vec3& center = path[pointIndex];
+            mesh.vertices.push_back({{center.x+normal.x*radius,center.y+normal.y*radius,center.z+normal.z*radius},
+                                     normal,{(float)segment/radialSegments,(float)pointIndex/(path.size()-1)}});
+        }
+    }
+    for(size_t pointIndex = 0; pointIndex + 1 < path.size(); ++pointIndex)
+    {
+        for(int segment = 0; segment < radialSegments; ++segment)
+        {
+            const int next = (segment + 1) % radialSegments;
+            const uint32_t a = (uint32_t)(pointIndex * radialSegments + segment);
+            const uint32_t b = (uint32_t)(pointIndex * radialSegments + next);
+            const uint32_t c = a + radialSegments;
+            const uint32_t d = b + radialSegments;
+            mesh.indices.insert(mesh.indices.end(), {a,c,b, b,c,d});
+        }
+    }
+    mesh.upload();
+    return mesh;
+}
+
+static std::vector<Vec3> CubicPipe(Vec3 p0, Vec3 p1, Vec3 p2, Vec3 p3, int segments)
+{
+    std::vector<Vec3> path;
+    path.reserve(segments + 1);
+    for(int i = 0; i <= segments; ++i)
+    {
+        const float t = (float)i / segments;
+        const float u = 1.0f - t;
+        path.push_back({
+            u*u*u*p0.x + 3*u*u*t*p1.x + 3*u*t*t*p2.x + t*t*t*p3.x,
+            u*u*u*p0.y + 3*u*u*t*p1.y + 3*u*t*t*p2.y + t*t*t*p3.y,
+            u*u*u*p0.z + 3*u*u*t*p1.z + 3*u*t*t*p2.z + t*t*t*p3.z
+        });
+    }
+    return path;
+}
+
+static void AddGearHubAndSpokes(Mesh& gear, float innerRadius, float width, int spokeCount)
+{
+    Mesh hub = Procedural::makeCylinder(innerRadius*0.34f, width*1.18f, 48, true);
+    appendMesh(gear, hub);
+    hub.destroy();
+    for(int spoke = 0; spoke < spokeCount; ++spoke)
+    {
+        const float angle = 2.0f * 3.1415926535f * spoke / spokeCount;
+        const float c = std::cos(angle), s = std::sin(angle);
+        Mesh bar = MakeTubePath({{c*innerRadius*0.28f,0,s*innerRadius*0.28f},
+                                 {c*innerRadius*0.94f,0,s*innerRadius*0.94f}}, width*0.16f, 12);
+        appendMesh(gear, bar);
+        bar.destroy();
+    }
+    gear.upload();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Turbine
 // ─────────────────────────────────────────────────────────────────────────────
 void TurbineModel::rebuild()
 {
     destroy();
-    // Scale up for a larger steampunk assembly
-    float bodyR = params.hubRadius * 2.4f;
-    float bodyH = params.hubRadius * 2.0f;
-    float shaftR = params.shaftRadius * 1.4f;
-    float shaftH = params.shaftLength * 1.2f;
+    const float bodyR = params.hubRadius * 2.4f;
+    const float bodyH = params.hubRadius * 2.0f;
+    const float shaftR = params.shaftRadius * 1.35f;
+    const float shaftH = params.shaftLength * 1.2f;
+    shaft = Procedural::makeCylinder(shaftR, shaftH, 72, true);
 
-    // Static vertical shaft
-    shaft = Procedural::makeCylinder(shaftR, shaftH, 64, true);
-
-    // Main turbine body (bigger)
-    Mesh body = Procedural::makeCylinder(bodyR, bodyH, 72, true);
-
-    // Gears: central ring gear (co-rotates)
-    rotorTeeth = 40;
-    // Solid-center gear disks (inner radius = 0)
-    float gInner = 0.0f;
-    float gOuter = bodyR * 1.15f;
-    Mesh ringGear = Procedural::makeGear(gInner, gOuter, (gOuter-gInner)*0.35f, rotorTeeth, bodyH*0.35f);
-
-    // Top rotor (propeller) at the top of the vertical shaft
-    Mesh topRotor; 
-    topRotor.vertices.clear(); 
-    topRotor.indices.clear(); 
-    topRotor.vao=topRotor.vbo=topRotor.ebo=0;
-
-    Mesh blade = Procedural::makeBlade(params.bladeRootWidth*1.2f, params.bladeTipWidth*1.2f,
-                                       std::max(params.bladeLength, bodyR*1.0f), params.bladeThickness*1.2f, 16);
-
-    int topBlades = std::clamp(params.blades, 1, 10);
-    // Center rotor exactly on the vertical shaft axis (no lateral offset)
-    float rOffset = 0.0f;
-    float yTop = shaftH*0.5f + bodyR*0.10f;
-
-    for(int i=0;i<topBlades;i++)
+    rotor.vertices.clear(); rotor.indices.clear(); rotor.vao=rotor.vbo=rotor.ebo=0;
+    auto appendTemporary = [&](Mesh& destination, Mesh temporary)
     {
-        float ang = (2.f*3.1415926535f * i)/std::max(1, topBlades);
-        float c=std::cos(ang), s=std::sin(ang);
-        Mesh b = blade;
-        for(auto& v : b.vertices)
-        {
-            float x=v.pos.x, y=v.pos.y, z=v.pos.z;
-            float nx =  c*x + s*z;
-            float nz = -s*x + c*z;
-            if(rOffset != 0.0f) nx += rOffset;
-            v.pos = {nx, y + yTop, nz};
-        }
-        appendMesh(topRotor, b);
-    }
-    topRotor.upload();
-
-    // Compose rotating assembly: body + ring + side gears (horizontal & vertical appear coupled)
-    rotor.destroy(); 
-    rotor.vertices.clear(); 
-    rotor.indices.clear(); 
-    rotor.vao=rotor.vbo=rotor.ebo=0;
-    appendMesh(rotor, body);
-    appendMesh(rotor, ringGear);
-    appendMesh(rotor, topRotor);
-    rotor.upload();
-
-    // Outer static gear train on the left to visually mesh with ring
-    outerTeeth = 52; 
-    outerTeethR = 52;
-    float oInner = 0.0f; // solid center
-    float oOuter = oInner*1.12f;
-
-    // Ensure reasonable outer radius when inner is 0
-    oOuter = std::max(oOuter, gOuter*1.25f);
-    outerGear = Procedural::makeGear(oInner, oOuter, (oOuter-oInner)*0.35f, outerTeeth, bodyH*0.30f);
-    outerGearOffset = -(gOuter + oOuter*0.9f); // left
-
-    // Right gear (mirror)
-    outerGearR = Procedural::makeGear(oInner, oOuter, (oOuter-oInner)*0.35f, outerTeethR, bodyH*0.30f);
-    outerGearOffsetR = +(gOuter + oOuter*0.9f); // right
-
-    // Steampunk pipes: multiple verticals + elbows + valves
-    pipes.destroy(); pipes.vertices.clear(); pipes.indices.clear(); pipes.vao=pipes.vbo=pipes.ebo=0;
-    auto addPipe = [&](float R, float H, float ox, float oy, float oz)
-    {
-        Mesh p = Procedural::makeCylinder(R, H, 24, true);
-        for(auto& v: p.vertices){ v.pos.x += ox; v.pos.y += oy; v.pos.z += oz; }
-        appendMesh(pipes, p);
+        appendMesh(destination, temporary);
+        temporary.destroy();
     };
 
-    // Four main risers around body
-    float pr = bodyR * 1.8f;
-    for(int i=0;i<4;i++)
-    {
-        float ang = i * (3.1415926535f*0.5f);
-        float c=std::cos(ang), s=std::sin(ang);
-        addPipe(bodyR*0.08f, bodyH*2.0f, pr*c, -bodyH*0.5f, pr*s);
-        // Elbow (horizontal segment)
-        addPipe(bodyR*0.08f, bodyH*0.8f, pr*c + (c>0? bodyH*0.4f : -bodyH*0.4f), 0.0f, pr*s);
-    }
+    // Layered casing, bearing collars and a raised central housing.
+    appendTemporary(rotor, Procedural::makeCylinder(bodyR, bodyH, 96, true));
+    Mesh lowerFlange = Procedural::makeCylinder(bodyR*1.13f, bodyH*0.13f, 96, true);
+    for(Vertex& vertex : lowerFlange.vertices) vertex.pos.y -= bodyH*0.50f;
+    appendTemporary(rotor, std::move(lowerFlange));
+    Mesh upperFlange = Procedural::makeCylinder(bodyR*1.13f, bodyH*0.13f, 96, true);
+    for(Vertex& vertex : upperFlange.vertices) vertex.pos.y += bodyH*0.50f;
+    appendTemporary(rotor, std::move(upperFlange));
+    appendTemporary(rotor, Procedural::makeCylinder(bodyR*0.42f, bodyH*1.35f, 64, true));
 
-    // Valves near the body
-    for(int i=0;i<6;i++)
+    // Matched pitch circles make the three gears meet at their working radii.
+    rotorTeeth = 40; outerTeeth = 52; outerTeethR = 52;
+    const float module = bodyR * 2.15f / rotorTeeth;
+    const float rotorPitchR = module * rotorTeeth * 0.5f;
+    const float outerPitchR = module * outerTeeth * 0.5f;
+    const float rotorRootR = rotorPitchR - module * 1.05f;
+    const float outerRootR = outerPitchR - module * 1.05f;
+    const float toothDepth = module * 2.05f;
+    Mesh ringGear = Procedural::makeGear(rotorPitchR*0.48f, rotorRootR, toothDepth,
+                                         rotorTeeth, bodyH*0.30f);
+    AddGearHubAndSpokes(ringGear, rotorPitchR*0.48f, bodyH*0.30f, 8);
+    appendMesh(rotor, ringGear);
+    ringGear.destroy();
+    outerGear = Procedural::makeGear(outerPitchR*0.43f, outerRootR, toothDepth,
+                                     outerTeeth, bodyH*0.28f);
+    outerGearR = Procedural::makeGear(outerPitchR*0.43f, outerRootR, toothDepth,
+                                      outerTeethR, bodyH*0.28f);
+    AddGearHubAndSpokes(outerGear, outerPitchR*0.43f, bodyH*0.28f, 8);
+    AddGearHubAndSpokes(outerGearR, outerPitchR*0.43f, bodyH*0.28f, 8);
+    outerGearOffset = -(rotorPitchR + outerPitchR);
+    outerGearOffsetR = rotorPitchR + outerPitchR;
+
+    // Cambered, tapered and twisted propeller blades with a reinforced hub.
+    Mesh blade = Procedural::makeBlade(params.bladeRootWidth*1.35f, params.bladeTipWidth*0.72f,
+                                       std::max(params.bladeLength, bodyR*1.35f),
+                                       std::max(params.bladeThickness*2.4f, bodyR*0.055f), 24);
+    const int bladeCount = std::clamp(params.blades, 2, 10);
+    const float bladeHeight = shaftH*0.5f + bodyR*0.16f;
+    for(int bladeIndex = 0; bladeIndex < bladeCount; ++bladeIndex)
     {
-        float t = (2.f*3.1415926535f*i)/6.f; float c=std::cos(t), s=std::sin(t);
-        Mesh v = Procedural::makeCylinder(bodyR*0.10f, bodyR*0.15f, 20, true);
-        for(auto& vx : v.vertices){ vx.pos.x += (bodyR*1.25f)*c; vx.pos.z += (bodyR*1.25f)*s; }
-        appendMesh(pipes, v);
+        const float angle = 2.0f*3.1415926535f*bladeIndex/bladeCount;
+        const float c = std::cos(angle), s = std::sin(angle);
+        Mesh transformed = blade;
+        for(Vertex& vertex : transformed.vertices)
+        {
+            const float x = vertex.pos.x, z = vertex.pos.z;
+            const float nx = vertex.normal.x, nz = vertex.normal.z;
+            vertex.pos = {c*x+s*z,vertex.pos.y+bladeHeight,-s*x+c*z};
+            vertex.normal = {c*nx+s*nz,vertex.normal.y,-s*nx+c*nz};
+        }
+        appendMesh(rotor, transformed);
+    }
+    blade.destroy();
+    Mesh propellerHub = Procedural::makeCylinder(bodyR*0.34f, bodyH*0.48f, 72, true);
+    for(Vertex& vertex : propellerHub.vertices) vertex.pos.y += bladeHeight;
+    appendTemporary(rotor, std::move(propellerHub));
+    Mesh spinner = Procedural::makeCylinder(bodyR*0.19f, bodyH*0.62f, 72, true);
+    for(Vertex& vertex : spinner.vertices) vertex.pos.y += bladeHeight + bodyH*0.34f;
+    appendTemporary(rotor, std::move(spinner));
+    rotor.upload();
+
+    // Connected feed system: two manifolds, curved branches, return lines,
+    // flanges and valve wheels all terminate at casing ports.
+    pipes.vertices.clear(); pipes.indices.clear(); pipes.vao=pipes.vbo=pipes.ebo=0;
+    const float pipeRadius = bodyR * 0.075f;
+    const float manifoldX = bodyR * 2.65f;
+    const float manifoldZ = bodyR * 1.75f;
+    auto addTube = [&](const std::vector<Vec3>& path, float radius)
+    {
+        Mesh tube = MakeTubePath(path, radius, 20);
+        appendMesh(pipes, tube);
+        tube.destroy();
+    };
+    addTube({{-manifoldX,-bodyH*1.75f,-manifoldZ},{-manifoldX,bodyH*1.70f,-manifoldZ}},pipeRadius*1.25f);
+    addTube({{ manifoldX,-bodyH*1.75f,-manifoldZ},{ manifoldX,bodyH*1.70f,-manifoldZ}},pipeRadius*1.25f);
+    addTube({{-manifoldX,-bodyH*1.75f,-manifoldZ},{manifoldX,-bodyH*1.75f,-manifoldZ}},pipeRadius*1.10f);
+    addTube({{-manifoldX, bodyH*1.70f,-manifoldZ},{manifoldX, bodyH*1.70f,-manifoldZ}},pipeRadius*1.10f);
+    for(int side : {-1,1})
+    {
+        for(int level = 0; level < 3; ++level)
+        {
+            const float y = bodyH * (-0.75f + 0.75f*level);
+            const Vec3 start{side*manifoldX,y,-manifoldZ};
+            const Vec3 end{side*bodyR*0.88f,y*0.45f,-bodyR*0.34f};
+            addTube(CubicPipe(start,{side*manifoldX,y,0},{side*bodyR*1.45f,end.y,-bodyR*0.65f},end,18),pipeRadius);
+        }
+        const Vec3 returnStart{side*manifoldX,-bodyH*1.15f,-manifoldZ};
+        const Vec3 returnEnd{side*bodyR*0.62f,-bodyH*0.34f,bodyR*0.72f};
+        addTube(CubicPipe(returnStart,{side*bodyR*2.7f,-bodyH*1.35f,bodyR*1.1f},
+                               {side*bodyR*1.2f,-bodyH*0.55f,bodyR*1.25f},returnEnd,22),pipeRadius*0.82f);
+    }
+    addTube(CubicPipe({-manifoldX,bodyH*1.30f,-manifoldZ},{-bodyR*1.8f,bodyH*2.15f,-bodyR*0.4f},
+                       {bodyR*1.8f,bodyH*2.15f,-bodyR*0.4f},{manifoldX,bodyH*1.30f,-manifoldZ},26),pipeRadius*0.90f);
+
+    for(int side : {-1,1})
+    {
+        for(int level = 0; level < 3; ++level)
+        {
+            Mesh flange = Procedural::makeCylinder(pipeRadius*1.75f, pipeRadius*0.55f, 32, true);
+            const float y = bodyH * (-0.75f + 0.75f*level);
+            for(Vertex& vertex : flange.vertices)
+            {
+                vertex.pos.x += side*bodyR*0.94f;
+                vertex.pos.y += y*0.45f;
+                vertex.pos.z -= bodyR*0.34f;
+            }
+            appendTemporary(pipes, std::move(flange));
+            Mesh valve = Procedural::makeGear(pipeRadius*0.35f,pipeRadius*1.35f,pipeRadius*0.38f,12,pipeRadius*0.30f);
+            for(Vertex& vertex : valve.vertices)
+            {
+                vertex.pos.x += side*manifoldX;
+                vertex.pos.y += y;
+                vertex.pos.z -= manifoldZ;
+            }
+            appendTemporary(pipes, std::move(valve));
+        }
     }
     pipes.upload();
 
-    // Steam lines (stylized) near pipe elbows and valves
-    std::vector<Vec3> pts; 
-    std::vector<uint32_t> inds; 
-    pts.reserve(128); 
-    inds.reserve(256);
-
-    auto addSteam = [&](Vec3 p, Vec3 dir, float len, int seg)
+    // Permanent fine steam traces remain decorative; the old technical-mode
+    // duplicate rendering has been removed.
+    std::vector<Vec3> steamPoints;
+    std::vector<uint32_t> steamIndices;
+    for(int side : {-1,1})
     {
-        uint32_t b = (uint32_t)pts.size();
-        for(int i=0;i<=seg;i++)
+        const uint32_t base = (uint32_t)steamPoints.size();
+        for(int i=0;i<=18;++i)
         {
-            float t=(float)i/seg; float w = std::sin(t*3.14159f);
-            pts.push_back({ p.x + dir.x*len*t, p.y + dir.y*len*t + 0.05f*w, p.z + dir.z*len*t });
-            if(i>0){ inds.push_back(b+i-1); inds.push_back(b+i); }
+            const float t=(float)i/18.0f;
+            steamPoints.push_back({side*(manifoldX+pipeRadius*1.4f),bodyH*(0.4f+1.4f*t),
+                                   -manifoldZ+0.06f*std::sin(t*12.0f)});
+            if(i>0){ steamIndices.push_back(base+i-1); steamIndices.push_back(base+i); }
         }
-    };
-
-    addSteam({pr,0,0}, {0,1,0}, bodyH*0.8f, 12);
-    addSteam({-pr,0,0}, {0,1,0}, bodyH*0.7f, 12);
-    addSteam({0,0,pr}, {0,1,0}, bodyH*0.6f, 12);
-    addSteam({0,0,-pr}, {0,1,0}, bodyH*0.9f, 12);
-    schematicLines = Procedural::makeLineList(pts, inds);
+    }
+    schematicLines = Procedural::makeLineList(steamPoints, steamIndices);
 }
 
 void TurbineModel::destroy()
@@ -993,9 +1204,10 @@ static bool NG_RemoveCurrentHiddenLayer(NeuralGraph& g)
 {
     const int layerIdx=g.currentLayer;
     if(layerIdx<0 || layerIdx>=(int)g.layers.size()) return false;
-    if(g.layers[layerIdx].kind!=LayerKind::Hidden)
+    const LayerKind layerKind = g.layers[layerIdx].kind;
+    if(layerKind != LayerKind::Hidden && layerKind != LayerKind::GRU)
     {
-        Logf("Only hidden layers can be deleted.");
+        Logf("Only hidden or GRU layers can be deleted.");
         return false;
     }
 
@@ -1020,7 +1232,8 @@ static bool NG_RemoveCurrentHiddenLayer(NeuralGraph& g)
     NG_RebuildEdges(g);
     g.layoutLayers(g.lastCanvasW>0?g.lastCanvasW:800.0f,
                    g.lastCanvasH>0?g.lastCanvasH:500.0f);
-    Logf("Hidden layer deleted; neighbouring layers reconnected.");
+    Logf("%s layer deleted; neighbouring layers reconnected.",
+         layerKind == LayerKind::GRU ? "GRU" : "Hidden");
     return true;
 }
 
@@ -1285,6 +1498,7 @@ static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
     out << "  \"l2\": " << TrainGetL2() << ",\n";
     out << "  \"epochs\": " << TrainGetEpochs() << ",\n";
     out << "  \"target_mse\": " << TrainGetTargetMSE() << ",\n";
+    out << "  \"paired_theme\": " << gPairedThemeIndex << ",\n";
 
     // Theme information
     const UITheme& theme = (gEngine && gEngine->window ? gEngine->renderer.theme : UITheme::Cyberpunk());
@@ -1306,6 +1520,22 @@ static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
     out << "    \"edgeAlpha\": " << theme.edgeAlpha << ",\n";
     out << "    \"edgeBase\": " << theme.edgeBase << ",\n";
     out << "    \"edgeScale\": " << theme.edgeScale << "\n";
+    out << "  },\n";
+    auto writeGRUColor = [&](const char* name, const Vec3& color, bool trailingComma)
+    {
+        out << "    \"" << name << "\": [" << color.x << "," << color.y << "," << color.z << "]";
+        if(trailingComma) out << ",";
+        out << "\n";
+    };
+    out << "  \"gru_theme\": {\n";
+    out << "    \"name\": \"" << gGRUTheme.name << "\",\n";
+    writeGRUColor("column_background", gGRUTheme.columnBackground, true);
+    writeGRUColor("unit_fill", gGRUTheme.unitFill, true);
+    writeGRUColor("unit_border", gGRUTheme.unitBorder, true);
+    writeGRUColor("connection_start", gGRUTheme.connectionStart, true);
+    writeGRUColor("connection_end", gGRUTheme.connectionEnd, true);
+    writeGRUColor("particle", gGRUTheme.particle, true);
+    writeGRUColor("recurrent_loop", gGRUTheme.recurrentLoop, false);
     out << "  },\n";
     out << "  \"nodes\": [\n";
     for(size_t i=0;i<g.nodes.size();++i)
@@ -1472,6 +1702,8 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
         float _tm = parseFloatC("target_mse", TrainGetTargetMSE());
         int   _ep = parseIntC("epochs", TrainGetEpochs());
         TrainApplyParams(_lr, _l1, _l2, _ep, _tm);
+        gPairedThemeIndex = parseIntC("paired_theme", -1);
+        if(gPairedThemeIndex < -1 || gPairedThemeIndex > 7) gPairedThemeIndex = -1;
     }catch(...){}
 
     auto find_section = [&](const char* key)->std::string
@@ -1732,6 +1964,41 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
     {
         // If theme loading fails, continue with default theme
         Logf("Theme loading failed, using default theme");
+    }
+
+    try
+    {
+        std::regex gruThemeExpression(R"(\"gru_theme\"\s*:\s*\{([^{}]*)\})");
+        std::smatch gruThemeMatch;
+        if(std::regex_search(s, gruThemeMatch, gruThemeExpression))
+        {
+            const std::string section = gruThemeMatch[1].str();
+            auto parseColor = [&](const char* key, const Vec3& fallback)
+            {
+                std::regex expression(std::string("\\\"") + key +
+                    "\\\"\\s*:\\s*\\[\\s*([-+eE0-9\\.]+)\\s*,\\s*([-+eE0-9\\.]+)\\s*,\\s*([-+eE0-9\\.]+)\\s*\\]");
+                std::smatch match;
+                if(!std::regex_search(section, match, expression)) return fallback;
+                return Vec3{std::stof(match[1].str()), std::stof(match[2].str()), std::stof(match[3].str())};
+            };
+            std::regex nameExpression(R"(\"name\"\s*:\s*\"([^\"]*)\")");
+            std::smatch nameMatch;
+            if(std::regex_search(section, nameMatch, nameExpression)) gGRUTheme.name = nameMatch[1].str();
+            gGRUTheme.columnBackground = parseColor("column_background", gGRUTheme.columnBackground);
+            gGRUTheme.unitFill = parseColor("unit_fill", gGRUTheme.unitFill);
+            gGRUTheme.unitBorder = parseColor("unit_border", gGRUTheme.unitBorder);
+            gGRUTheme.connectionStart = parseColor("connection_start", gGRUTheme.connectionStart);
+            gGRUTheme.connectionEnd = parseColor("connection_end", gGRUTheme.connectionEnd);
+            gGRUTheme.particle = parseColor("particle", gGRUTheme.particle);
+            gGRUTheme.recurrentLoop = parseColor("recurrent_loop", gGRUTheme.recurrentLoop);
+            for(size_t i = 0; i < GRUThemes().size(); ++i)
+                if(GRUThemes()[i].name == gGRUTheme.name) { gGRUThemeIndex = i; break; }
+            Logf("GRU theme loaded: %s", gGRUTheme.name.c_str());
+        }
+    }
+    catch(...)
+    {
+        Logf("GRU theme loading failed, using default theme");
     }
 
     // After loading, compute a fresh layout to scale to current canvas
@@ -2694,13 +2961,17 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             const bool isGRULayer = L.kind == LayerKind::GRU;
             ImU32 colBg = isGRULayer
                 ? ImGui::GetColorU32((int(li)==currentLayer
-                    ? ImVec4(0.24f,0.12f,0.31f,0.97f) : ImVec4(0.16f,0.08f,0.23f,0.88f)))
+                    ? ImVec4(gGRUTheme.columnBackground.x*1.35f, gGRUTheme.columnBackground.y*1.35f,
+                             gGRUTheme.columnBackground.z*1.35f, 0.97f)
+                    : ImVec4(gGRUTheme.columnBackground.x, gGRUTheme.columnBackground.y,
+                             gGRUTheme.columnBackground.z, 0.90f)))
                 : ((int(li)==currentLayer
                     ? ImGui::GetColorU32(ImVec4(0.18f,0.20f,0.28f,0.95f))
                     : ImGui::GetColorU32(ImVec4(0.12f,0.12f,0.15f,0.75f))));
             dl->AddRectFilled(a, b, colBg, 8.0f);
             dl->AddRect(a, b, ImGui::GetColorU32(isGRULayer
-                ? ImVec4(0.92f,0.32f,1.0f,0.95f) : ImVec4(0.35f,0.35f,0.40f,0.9f)), 8.0f, 0, isGRULayer ? 3.0f : 2.0f);
+                ? ImVec4(gGRUTheme.unitBorder.x,gGRUTheme.unitBorder.y,gGRUTheme.unitBorder.z,0.95f)
+                : ImVec4(0.35f,0.35f,0.40f,0.9f)), 8.0f, 0, isGRULayer ? 3.0f : 2.0f);
 
             // --- 3 header lines:
             float lh = ImGui::GetTextLineHeightWithSpacing();
@@ -2900,9 +3171,9 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                                      (layerB && layerB->kind == LayerKind::GRU);
                 if(gruFlow)
                 {
-                    r = 0.80f + 0.18f * t;
-                    g = 0.20f + 0.38f * (1.0f - t);
-                    b = 0.95f;
+                    r = mixf(gGRUTheme.connectionStart.x, gGRUTheme.connectionEnd.x, t);
+                    g = mixf(gGRUTheme.connectionStart.y, gGRUTheme.connectionEnd.y, t);
+                    b = mixf(gGRUTheme.connectionStart.z, gGRUTheme.connectionEnd.z, t);
                 }
                 float a = _theme.edgeAlpha;
                 float thick = std::clamp(
@@ -2984,7 +3255,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                     ImVec2 particle(
                         inv*inv*inv*p1.x + 3*inv*inv*flow*c1.x + 3*inv*flow*flow*c2.x + flow*flow*flow*p2.x,
                         inv*inv*inv*p1.y + 3*inv*inv*flow*c1.y + 3*inv*flow*flow*c2.y + flow*flow*flow*p2.y);
-                    dl->AddCircleFilled(particle, 2.8f, ImGui::GetColorU32(ImVec4(1.0f,0.72f,1.0f,0.95f)), 10);
+                    dl->AddCircleFilled(particle, 2.8f, ImGui::GetColorU32(ImVec4(
+                        gGRUTheme.particle.x,gGRUTheme.particle.y,gGRUTheme.particle.z,0.95f)), 10);
                 }
             }
         }
@@ -2997,7 +3269,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 if(layer.kind != LayerKind::GRU) continue;
                 ImVec2 top(origin.x + layer.x0 + 10.0f, origin.y + layer.y0 + 82.0f);
                 ImVec2 bottom(origin.x + layer.x0 + 10.0f, origin.y + layer.y1 - 12.0f);
-                ImU32 recurrentColor = ImGui::GetColorU32(ImVec4(0.95f,0.35f,1.0f,0.82f));
+                ImU32 recurrentColor = ImGui::GetColorU32(ImVec4(
+                    gGRUTheme.recurrentLoop.x,gGRUTheme.recurrentLoop.y,gGRUTheme.recurrentLoop.z,0.82f));
                 dl->AddBezierCubic(top, ImVec2(top.x-38.0f,top.y), ImVec2(bottom.x-38.0f,bottom.y), bottom,
                                    recurrentColor, 2.2f);
                 dl->AddTriangleFilled(bottom, ImVec2(bottom.x-7.0f,bottom.y-10.0f),
@@ -3091,11 +3364,13 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             }
 
             auto colU = [&](const Vec3& v){ return ImGui::GetColorU32(ImVec4(v.x,v.y,v.z,1.0f)); };
-            ImU32 baseFill = isGRU ? ImGui::GetColorU32(ImVec4(0.52f,0.12f,0.68f,1.0f))
+            ImU32 baseFill = isGRU ? ImGui::GetColorU32(ImVec4(
+                    gGRUTheme.unitFill.x,gGRUTheme.unitFill.y,gGRUTheme.unitFill.z,1.0f))
                 : (n.isInput ? colU(_theme.nInput) : (isOutput ? colU(_theme.nOutput) : colU(_theme.nHidden)));
             ImU32 fill = isSel ? ImGui::GetColorU32(ImVec4(0.2f,0.5f,1.0f,1.0f)) : baseFill;
             ImU32 ring = isSel ? colU(_theme.nRing)
-                               : ImGui::GetColorU32(isGRU ? ImVec4(1.0f,0.48f,0.95f,1.0f)
+                               : ImGui::GetColorU32(isGRU ? ImVec4(gGRUTheme.unitBorder.x,
+                                                         gGRUTheme.unitBorder.y,gGRUTheme.unitBorder.z,1.0f)
                                                          : ImVec4(0.9f,0.9f,0.95f,0.9f));
 
             // highlight top output: theme highlight
@@ -3112,7 +3387,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 };
                 dl->AddConvexPolyFilled(diamond, 4, fill);
                 dl->AddPolyline(diamond, 4, ring, ImDrawFlags_Closed, 2.5f);
-                dl->AddCircle(p, n.radius*0.43f, ImGui::GetColorU32(ImVec4(1.0f,0.72f,1.0f,0.9f)), 16, 1.4f);
+                dl->AddCircle(p, n.radius*0.43f, ImGui::GetColorU32(ImVec4(
+                    gGRUTheme.particle.x,gGRUTheme.particle.y,gGRUTheme.particle.z,0.9f)), 16, 1.4f);
             }
             else
             {
@@ -3747,16 +4023,13 @@ void Engine::render()
 
     // Draw meshing outer gears (counter-rotating), translated on X (left and right)
     float ratioL = (turbine.outerTeeth>0)? (turbine.rotorTeeth / (float)turbine.outerTeeth) : 1.0f;
-    Mat4 MouterL = Mat4::translate({turbine.outerGearOffset, 0, 0}) * Mat4::rotateY(-rotorAngle*ratioL);
+    const float meshPhaseL = 3.1415926535f / std::max(1, turbine.outerTeeth);
+    Mat4 MouterL = Mat4::translate({turbine.outerGearOffset, 0, 0}) * Mat4::rotateY(-rotorAngle*ratioL + meshPhaseL);
     renderer.drawMesh(turbine.outerGear, VP*MouterL, MouterL, renderer.theme.mesh, 0.6f);
     float ratioR = (turbine.outerTeethR>0)? (turbine.rotorTeeth / (float)turbine.outerTeethR) : 1.0f;
-    Mat4 MouterR = Mat4::translate({turbine.outerGearOffsetR, 0, 0}) * Mat4::rotateY(rotorAngle*ratioR);
+    const float meshPhaseR = 3.1415926535f / std::max(1, turbine.outerTeethR);
+    Mat4 MouterR = Mat4::translate({turbine.outerGearOffsetR, 0, 0}) * Mat4::rotateY(-rotorAngle*ratioR + meshPhaseR);
     renderer.drawMesh(turbine.outerGearR, VP*MouterR, MouterR, renderer.theme.mesh, 0.6f);
-
-    if(cfg.showSchematic)
-    {
-        renderer.drawLines(turbine.schematicLines, VP, renderer.theme.grid, 1.0f);
-    }
 
 #ifdef USE_IMGUI
     ImGui_ImplOpenGL3_NewFrame();
@@ -3789,7 +4062,6 @@ void Engine::render()
             ImGui::Text("Total Neurons: %zu", graph.nodes.size());
             ImGui::Checkbox("VSync (V)", &cfg.vsync);
             ImGui::SameLine(); ImGui::Checkbox("Rotate (R)", &cfg.rotate);
-            ImGui::Checkbox("Schematic (G)", &cfg.showSchematic);
             ImGui::SliderFloat("RPM", &turbine.params.rpm, 0.0f, 15000.0f);
             int blades = turbine.params.blades;
             if(ImGui::SliderInt("Blades", &blades, 1, 10)){ turbine.params.blades = blades; turbine.rebuild(); }
@@ -4568,14 +4840,17 @@ void Engine::render()
         ImGui::BulletText("W                    - toggle live feed wave effect");
         ImGui::BulletText("Q                    - random live feed for all input neurons");
         ImGui::BulletText("TAB                  - toggle live feed on all inputs");
-        ImGui::BulletText("V / R / G / Shift+T  - VSync / rotate / schematic / theme");
-ImGui::Separator();
-ImGui::Text("Creating example networks");
-ImGui::BulletText("Use buttons like 'Rabbit Example' in Training parameters for presets");
-ImGui::BulletText("Build manually: add layers (A), neurons (N), edit in Neural Editor");
-ImGui::BulletText("Set labels and descriptions in neuron editor (select neuron)");
-ImGui::BulletText("Add lessons (M) with current IN/OUT values");
-ImGui::BulletText("Train (B or T) after setting parameters");
+        ImGui::BulletText("V / R                - VSync / rotate");
+        ImGui::BulletText("Shift+T              - change MLP theme");
+        ImGui::BulletText("Shift+G              - change GRU theme");
+        ImGui::BulletText("C                    - change paired MLP + GRU theme");
+        ImGui::Separator();
+        ImGui::Text("Creating example networks");
+        ImGui::BulletText("Use buttons like 'Rabbit Example' in Training parameters for presets");
+        ImGui::BulletText("Build manually: add layers (A), neurons (N), edit in Neural Editor");
+        ImGui::BulletText("Set labels and descriptions in neuron editor (select neuron)");
+        ImGui::BulletText("Add lessons (M) with current IN/OUT values");
+        ImGui::BulletText("Train (B or T) after setting parameters");
         ImGui::BulletText("Mouse                - LMB orbit, MMB or Shift+LMB pan, wheel zoom");
         ImGui::Separator();
         ImGui::Text("Training parameters");
@@ -5072,7 +5347,21 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     }
 #endif
     if(key==GLFW_KEY_R){ cfg.rotate = !cfg.rotate; }
-    if(key==GLFW_KEY_G){ cfg.showSchematic = !cfg.showSchematic; }
+    if(key==GLFW_KEY_C)
+    {
+        const size_t nextPair = (size_t)((gPairedThemeIndex + 1) % 8);
+        ApplyPairedTheme(renderer, nextPair);
+        Logf("Paired theme selected: MLP=%s, GRU=%s",
+             renderer.theme.name.c_str(), gGRUTheme.name.c_str());
+        return;
+    }
+    if(key==GLFW_KEY_G && (mods & GLFW_MOD_SHIFT) != 0)
+    {
+        gGRUThemeIndex = (gGRUThemeIndex + 1) % GRUThemes().size();
+        gGRUTheme = GRUThemes()[gGRUThemeIndex];
+        Logf("GRU theme selected: %s", gGRUTheme.name.c_str());
+        return;
+    }
     if(key==GLFW_KEY_V){ cfg.vsync = !cfg.vsync; }
     if(key==GLFW_KEY_T){
         if((mods & GLFW_MOD_SHIFT) != 0)
@@ -5271,7 +5560,7 @@ int main()
     setlocale(LC_ALL, "C");
     AppConfig cfg;
     char main_title[128];
-    std::snprintf(main_title, sizeof(main_title), "NeuralT %s (C++/OpenGL - Neural Network Editor MB)", kAppVersion);
+    std::snprintf(main_title, sizeof(main_title), "NeuralT %s ( tiktok: @justdieblondie )", kAppVersion);
     cfg.title = main_title;
     Engine e;
     if(!e.init(cfg)) return 1;
