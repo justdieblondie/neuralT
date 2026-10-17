@@ -61,6 +61,13 @@ static bool gForceRelayoutWindows = false;  // 'Home' key re-arrangement
 static bool gShowSaveMenu     = false;      // 'S' key or button
 static char gSaveName[256]    = "saved/network.json";
 
+// Graph view: zoom (=/-/0, Ctrl/Cmd+wheel) and cinematic camera drift (C)
+static constexpr float kDefaultGraphZoom = 1.0f;   // whole network fits the screen
+static float gGraphZoom  = kDefaultGraphZoom;
+static bool  gAutoPan    = false;
+// Presentation mode (P): full-screen borderless graph with only the title on top
+static bool  gPresentation = true;
+
 // New: Log window
 static std::vector<std::string> gLogLines;
 static bool gLogAutoScroll = true;
@@ -526,6 +533,16 @@ UITheme UITheme::Ruby()
     t.bg={0.08f, 0.02f, 0.02f}; t.panel={0.15f, 0.05f, 0.05f}; t.accent={0.9f, 0.1f, 0.3f}; t.grid={0.4f, 0.15f, 0.15f}; t.text={1.0f, 0.9f, 0.9f}; t.mesh={0.85f, 0.3f, 0.3f};
     t.nInput={1.0f, 0.3f, 0.4f}; t.nHidden={0.7f, 0.2f, 0.3f}; t.nOutput={1.0f, 0.5f, 0.6f}; t.nRing={1.0f, 0.8f, 0.2f}; t.nHighlight={1.0f, 0.2f, 0.4f};
     t.edgeStart={0.8f, 0.1f, 0.2f}; t.edgeEnd={1.0f, 0.4f, 0.6f}; t.edgeAlpha=0.9f; t.edgeBase=0.7f; t.edgeScale=1.0f;
+    return t;
+}
+
+UITheme UITheme::Ignition()
+{
+    UITheme t{}; t.name="Ignition";
+    // Navy -> violet canvas, molten orange feed-forward edges, pale lime endpoints
+    t.bg={0.04f,0.05f,0.13f}; t.panel={0.07f,0.07f,0.17f}; t.accent={1.0f,0.62f,0.22f}; t.grid={0.25f,0.30f,0.55f}; t.text={0.95f,0.95f,1.0f}; t.mesh={1.0f,0.55f,0.20f};
+    t.nInput={0.93f,1.0f,0.70f}; t.nHidden={1.0f,0.70f,0.40f}; t.nOutput={1.0f,0.74f,0.32f}; t.nRing={1.0f,1.0f,0.60f}; t.nHighlight={0.90f,1.0f,0.50f};
+    t.edgeStart={1.0f,0.42f,0.12f}; t.edgeEnd={1.0f,0.86f,0.48f}; t.edgeAlpha=0.85f; t.edgeBase=0.45f; t.edgeScale=0.55f;
     return t;
 }
 
@@ -1026,6 +1043,7 @@ const char* ActName(Act a)
         case Act::ReLU:    return "ReLU";
         case Act::Sigmoid: return "Sigmoid";
         case Act::Tanh:    return "Tanh";
+        case Act::GRU:     return "GRU";
     }
     return "Linear";
 }
@@ -1037,7 +1055,8 @@ Act NextAct(Act a)
         case Act::Linear:  return Act::ReLU;
         case Act::ReLU:    return Act::Sigmoid;
         case Act::Sigmoid: return Act::Tanh;
-        case Act::Tanh:    return Act::Linear;
+        case Act::Tanh:    return Act::GRU;
+        case Act::GRU:     return Act::Linear;
     }
     return Act::Linear;
 }
@@ -1053,6 +1072,7 @@ static float TrainGetL2();
 static int   TrainGetEpochs();
 static float TrainGetTargetMSE();
 static void  TrainApplyParams(float lr, float l1, float l2, int epochs, float targetMSE);
+static void  GRU_EnsureShape(Layer& L, int nIn);
 
 static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
 {
@@ -1175,7 +1195,30 @@ static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
         if(i+1<gDataset.size()) out << ",";
         out << "\n";
     }
-    out << "  ]\n";
+    out << "  ],\n";
+    // GRU gate parameters (candidate weights are stored as ordinary edges)
+    out << "  \"recurrent\": [\n";
+    bool firstRec = true;
+    for(size_t li=0; li<g.layers.size(); ++li)
+    {
+        const Layer& L = g.layers[li];
+        if(L.act != Act::GRU || L.bz.empty()) continue;
+        auto arr = [&](const char* key, const std::vector<float>& v, bool last)
+        {
+            out << "      \"" << key << "\": [";
+            for(size_t j=0;j<v.size();++j){ out << v[j]; if(j+1<v.size()) out << ","; }
+            out << "]" << (last ? "\n" : ",\n");
+        };
+        if(!firstRec) out << ",\n";
+        firstRec = false;
+        out << "    {\n";
+        out << "      \"layer\": " << li << ",\n";
+        arr("wz", L.Wz, false); arr("wr", L.Wr, false);
+        arr("uz", L.Uz, false); arr("ur", L.Ur, false); arr("uh", L.Uh, false);
+        arr("bz", L.bz, false); arr("br", L.br, true);
+        out << "    }";
+    }
+    out << "\n  ]\n";
     out << "}\n";
 }
 
@@ -1268,6 +1311,11 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
             n.bias = std::atof(m[7].str().c_str());
             n.x = std::atof(m[8].str().c_str());
             n.y = std::atof(m[9].str().c_str());
+            {
+                const std::string blk = m.str();
+                const size_t ka = blk.find("\"amp\"");
+                if(ka != std::string::npos){ size_t c = blk.find(':', ka); if(c != std::string::npos) n.amp = (float)std::atof(blk.c_str()+c+1); }
+            }
             g.nodes.push_back(n);
             id2idx[n.id] = idx++;
         }
@@ -1297,6 +1345,7 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
         if(s=="ReLU") return Act::ReLU;
         if(s=="Tanh") return Act::Tanh;
         if(s=="Sigmoid") return Act::Sigmoid;
+        if(s=="GRU") return Act::GRU;
         return Act::Linear;
     };
 
@@ -1437,6 +1486,54 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
     {
         // If theme loading fails, continue with default theme
         Logf("Theme loading failed, using default theme");
+    }
+
+    // GRU gate parameters. Parsed by hand: the arrays are long enough to make
+    // std::regex recurse very deeply.
+    {
+        const size_t rs = s.find("\"recurrent\"");
+        size_t pos = rs;
+        while(pos != std::string::npos)
+        {
+            pos = s.find("\"layer\"", pos);
+            if(pos == std::string::npos) break;
+            const size_t colon = s.find(':', pos);
+            if(colon == std::string::npos) break;
+            const int li = std::atoi(s.c_str() + colon + 1);
+            const size_t blockEnd = s.find('}', colon);
+            auto readArr = [&](const char* key)->std::vector<float>
+            {
+                std::vector<float> v;
+                const size_t k = s.find(std::string("\"")+key+"\"", colon);
+                if(k == std::string::npos || k > blockEnd) return v;
+                size_t lb = s.find('[', k), rb = s.find(']', k);
+                if(lb == std::string::npos || rb == std::string::npos) return v;
+                const char* c = s.c_str() + lb + 1;
+                const char* end = s.c_str() + rb;
+                while(c < end)
+                {
+                    char* next = nullptr;
+                    float f = std::strtof(c, &next);
+                    if(next == c){ ++c; continue; }
+                    v.push_back(f); c = next;
+                }
+                return v;
+            };
+            if(li > 0 && li < (int)g.layers.size() && g.layers[li].act == Act::GRU)
+            {
+                Layer& L = g.layers[li];
+                L.Wz = readArr("wz"); L.Wr = readArr("wr");
+                L.Uz = readArr("uz"); L.Ur = readArr("ur"); L.Uh = readArr("uh");
+                L.bz = readArr("bz"); L.br = readArr("br");
+                GRU_EnsureShape(L, (int)g.layers[li-1].nodeIdx.size()); // re-init if inconsistent
+            }
+            pos = (blockEnd == std::string::npos) ? blockEnd : blockEnd + 1;
+        }
+    }
+    for(auto& n : g.nodes)
+    {
+        n.h = 0.0f;
+        if(n.isInput) n.phase = ng_frand(0.0f, 6.2831853f); // de-synchronise live sensor waves
     }
 
     // After loading, compute a fresh layout to scale to current canvas
@@ -1605,7 +1702,8 @@ static float ActApply(Act a, float x)
         case Act::Linear: return x;
         case Act::ReLU:   return x>0.f?x:0.f;
         case Act::Sigmoid: return 1.0f/(1.0f+std::exp(-x));
-        case Act::Tanh:    return std::tanh(x);
+        case Act::Tanh:
+        case Act::GRU:     return std::tanh(x); // GRU candidate
     }
 }
 
@@ -1617,7 +1715,8 @@ static float ActDeriv(Act a, float y)
         case Act::Linear: return 1.0f;
         case Act::ReLU:   return y>0.f?1.f:0.f;
         case Act::Sigmoid: return y*(1.0f-y);
-        case Act::Tanh:    return 1.0f - y*y;
+        case Act::Tanh:
+        case Act::GRU:     return 1.0f - y*y;
     }
 }
 
@@ -1642,12 +1741,103 @@ static GraphCache BuildCache(const NeuralGraph& g)
     return c;
 }
 
-static void ForwardPass(NeuralGraph& g)
+static bool IsGRULayer(const NeuralGraph& g, size_t li)
 {
-    GraphCache cache = BuildCache(g);
-    for(const auto& L : g.layers)
+    return li > 0 && li < g.layers.size() && g.layers[li].kind == LayerKind::Hidden && g.layers[li].act == Act::GRU;
+}
+
+// (Re)initialise the gate matrices whenever the layer or its predecessor changed size.
+static void GRU_EnsureShape(Layer& L, int nIn)
+{
+    const int n = (int)L.nodeIdx.size();
+    if((int)L.bz.size() == n && (int)L.br.size() == n &&
+       (int)L.Wz.size() == n*nIn && (int)L.Wr.size() == n*nIn &&
+       (int)L.Uz.size() == n*n && (int)L.Ur.size() == n*n && (int)L.Uh.size() == n*n) return;
+    const float aIn  = std::sqrt(1.0f / (float)std::max(1, nIn));
+    const float aRec = std::sqrt(1.0f / (float)std::max(1, n));
+    auto fill = [](std::vector<float>& v, int count, float a){ v.resize(count); for(float& w : v) w = ng_frand(-a, a); };
+    fill(L.Wz, n*nIn, aIn); fill(L.Wr, n*nIn, aIn);
+    fill(L.Uz, n*n, aRec);  fill(L.Ur, n*n, aRec); fill(L.Uh, n*n, aRec);
+    // Negative update-gate bias: the memory starts out "sticky" and smooths its input.
+    L.bz.assign(n, -1.0f);
+    L.br.assign(n, 0.0f);
+}
+
+static float Sigm(float x){ return 1.0f/(1.0f+std::exp(-x)); }
+
+static float CandidateInput(const NeuralGraph& g, const GraphCache& cache, const Neuron& n)
+{
+    float sum = ng_get_bias(n);
+    auto it = cache.inEdges.find(n.id);
+    if(it != cache.inEdges.end())
     {
+        for(int ei : it->second)
+        {
+            const auto& e = g.edges[ei];
+            auto ita = cache.id2idx.find(e.a);
+            if(ita!=cache.id2idx.end()) sum += e.w * g.nodes[ita->second].value;
+        }
+    }
+    return sum;
+}
+
+// GRU step for one layer:
+//   z = sigm(Wz x + Uz h + bz)          update gate
+//   r = sigm(Wr x + Ur h + br)          reset gate
+//   c = tanh(Wedges x + b + Uh (r*h))   candidate (input weights are the drawn edges)
+//   h' = (1-z) h + z c
+// The new state is written to n.value; it is committed to n.h only when advance=true,
+// so repeated redraw passes do not run the memory forward.
+static void GRU_Forward(NeuralGraph& g, const GraphCache& cache, size_t li, bool advance)
+{
+    Layer& L = g.layers[li];
+    const Layer& P = g.layers[li-1];
+    const int n = (int)L.nodeIdx.size(), nIn = (int)P.nodeIdx.size();
+    GRU_EnsureShape(L, nIn);
+    std::vector<float> x(nIn), hp(n), rh(n);
+    for(int k=0;k<nIn;++k) x[k] = g.nodes[P.nodeIdx[k]].value;
+    for(int i=0;i<n;++i) hp[i] = g.nodes[L.nodeIdx[i]].h;
+    for(int i=0;i<n;++i)
+    {
+        float az = L.bz[i], ar = L.br[i];
+        for(int k=0;k<nIn;++k){ az += L.Wz[i*nIn+k]*x[k]; ar += L.Wr[i*nIn+k]*x[k]; }
+        for(int j=0;j<n;++j){ az += L.Uz[i*n+j]*hp[j]; ar += L.Ur[i*n+j]*hp[j]; }
+        Neuron& nn = g.nodes[L.nodeIdx[i]];
+        nn.gz = Sigm(az); nn.gr = Sigm(ar);
+        rh[i] = nn.gr * hp[i];
+    }
+    for(int i=0;i<n;++i)
+    {
+        Neuron& nn = g.nodes[L.nodeIdx[i]];
+        float a = CandidateInput(g, cache, nn);
+        for(int j=0;j<n;++j) a += L.Uh[i*n+j]*rh[j];
+        nn.gc = std::tanh(a);
+        nn.hPrev = hp[i];
+        nn.value = (1.0f-nn.gz)*hp[i] + nn.gz*nn.gc;
+        if(advance) nn.h = nn.value;
+    }
+}
+
+static void GRU_ResetState(NeuralGraph& g)
+{
+    for(size_t li=0; li<g.layers.size(); ++li)
+        if(IsGRULayer(g, li))
+            for(int idx : g.layers[li].nodeIdx){ g.nodes[idx].h = 0.0f; g.nodes[idx].value = 0.0f; }
+}
+
+static bool HasGRU(const NeuralGraph& g)
+{
+    for(size_t li=0; li<g.layers.size(); ++li) if(IsGRULayer(g, li)) return true;
+    return false;
+}
+
+static void ForwardPassCached(NeuralGraph& g, const GraphCache& cache, bool advance)
+{
+    for(size_t li=0; li<g.layers.size(); ++li)
+    {
+        const Layer& L = g.layers[li];
         if(L.kind == LayerKind::Input) continue;
+        if(IsGRULayer(g, li)){ GRU_Forward(g, cache, li, advance); continue; }
         for(int idx : L.nodeIdx)
         {
             Neuron& n = g.nodes[idx];
@@ -1661,28 +1851,25 @@ static void ForwardPass(NeuralGraph& g)
                 }
             }
 
-            if(!usedOverride)
-            {
-                float sum = ng_get_bias(n);
-                auto it = cache.inEdges.find(n.id);
-                if(it != cache.inEdges.end())
-                {
-                    for(int ei : it->second)
-                    {
-                        const auto& e = g.edges[ei];
-                        auto ita = cache.id2idx.find(e.a);
-                        if(ita!=cache.id2idx.end()) sum += e.w * g.nodes[ita->second].value;
-                    }
-                }
-                v_ = ActApply(L.act, sum);
-            }
+            if(!usedOverride) v_ = ActApply(L.act, CandidateInput(g, cache, n));
             if(L.kind == LayerKind::Output){ if(v_ < 0.0f) v_ = 0.0f; else if(v_ > 1.0f) v_ = 1.0f; }
             n.value = v_;
         }
     }
 }
 
+static void ForwardPass(NeuralGraph& g, bool advance=false)
+{
+    GraphCache cache = BuildCache(g);
+    ForwardPassCached(g, cache, advance);
+}
+
 static float sgn(float x){ return (x>0)-(x<0); }
+
+// Each lesson is a snapshot, so GRU memories start from zero for every lesson and
+// are run for kGRUSettleSteps on the same input; the last step is backpropagated
+// (one-step truncated BPTT, treating the previous state as constant).
+static constexpr int kGRUSettleSteps = 3;
 
 static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
 {
@@ -1690,6 +1877,7 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
     float mse = 0.0f;
 
     GraphCache cache = BuildCache(g);
+    const bool hasGRU = HasGRU(g);
 
     for(const auto& s : gDataset)
     {
@@ -1702,7 +1890,12 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
                 g.nodes[idx].value = (pi < s.in.size() ? s.in[pi++] : 0.0f);
             }
         }
-        ForwardPass(g);
+        if(hasGRU)
+        {
+            GRU_ResetState(g);
+            for(int step=0; step<kGRUSettleSteps-1; ++step) ForwardPassCached(g, cache, true);
+        }
+        ForwardPassCached(g, cache, false);
 
         std::vector<int> outNodeIdx;
         Act outAct = Act::Linear;
@@ -1727,16 +1920,18 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
             delta[n.id] = d;
         }
 
+        // dLoss/dValue reaching a node through GRU gate weights (not via drawn edges)
+        std::unordered_map<int,float> gateGrad;
+
         // Hidden layers backprop (right-to-left; skip last layer already handled)
         for(int Li=(int)g.layers.size()-2; Li>=0; --Li)
         {
-            const auto& L = g.layers[Li];
+            auto& L = g.layers[Li];
             if(L.kind == LayerKind::Input) continue;
-            Act act = L.act;
-            for(int idx : L.nodeIdx)
+
+            auto downstream = [&](const Neuron& n)
             {
-                Neuron& n = g.nodes[idx];
-                float sum=0.0f;
+                float sum = 0.0f;
                 auto it = cache.outEdges.find(n.id);
                 if(it != cache.outEdges.end())
                 {
@@ -1747,7 +1942,65 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
                         if(it2 != delta.end()) sum += e.w * it2->second;
                     }
                 }
-                float d = ActDeriv(act, n.value) * sum;
+                auto ig = gateGrad.find(n.id);
+                if(ig != gateGrad.end()) sum += ig->second;
+                return sum;
+            };
+
+            if(IsGRULayer(g, (size_t)Li))
+            {
+                const Layer& P = g.layers[Li-1];
+                const int n = (int)L.nodeIdx.size(), nIn = (int)P.nodeIdx.size();
+                std::vector<float> x(nIn), ah(n), az(n), ar(n);
+                for(int k=0;k<nIn;++k) x[k] = g.nodes[P.nodeIdx[k]].value;
+                for(int i=0;i<n;++i)
+                {
+                    const Neuron& nn = g.nodes[L.nodeIdx[i]];
+                    const float dh = downstream(nn);
+                    ah[i] = dh * nn.gz * (1.0f - nn.gc*nn.gc);
+                    az[i] = dh * (nn.gc - nn.hPrev) * nn.gz * (1.0f - nn.gz);
+                }
+                for(int j=0;j<n;++j)
+                {
+                    const Neuron& nj = g.nodes[L.nodeIdx[j]];
+                    float drh = 0.0f;
+                    for(int i=0;i<n;++i) drh += L.Uh[i*n+j]*ah[i];
+                    ar[j] = drh * nj.hPrev * nj.gr * (1.0f - nj.gr);
+                }
+                // gradient into the previous layer through the gates
+                for(int k=0;k<nIn;++k)
+                {
+                    float gsum = 0.0f;
+                    for(int i=0;i<n;++i) gsum += L.Wz[i*nIn+k]*az[i] + L.Wr[i*nIn+k]*ar[i];
+                    gateGrad[g.nodes[P.nodeIdx[k]].id] += gsum;
+                }
+                // gate parameter updates
+                for(int i=0;i<n;++i)
+                {
+                    for(int j=0;j<n;++j)
+                    {
+                        const Neuron& nj = g.nodes[L.nodeIdx[j]];
+                        float& uh = L.Uh[i*n+j]; uh -= lr * (ah[i]*nj.gr*nj.hPrev + l2*uh + l1*sgn(uh));
+                        float& uz = L.Uz[i*n+j]; uz -= lr * (az[i]*nj.hPrev + l2*uz + l1*sgn(uz));
+                        float& ur = L.Ur[i*n+j]; ur -= lr * (ar[i]*nj.hPrev + l2*ur + l1*sgn(ur));
+                    }
+                    for(int k=0;k<nIn;++k)
+                    {
+                        float& wz = L.Wz[i*nIn+k]; wz -= lr * (az[i]*x[k] + l2*wz + l1*sgn(wz));
+                        float& wr = L.Wr[i*nIn+k]; wr -= lr * (ar[i]*x[k] + l2*wr + l1*sgn(wr));
+                    }
+                    L.bz[i] -= lr * az[i];
+                    L.br[i] -= lr * ar[i];
+                    delta[g.nodes[L.nodeIdx[i]].id] = ah[i]; // drives edge + bias updates below
+                }
+                continue;
+            }
+
+            Act act = L.act;
+            for(int idx : L.nodeIdx)
+            {
+                Neuron& n = g.nodes[idx];
+                float d = ActDeriv(act, n.value) * downstream(n);
                 delta[n.id] = d;
             }
         }
@@ -1777,6 +2030,7 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
         }
     }
     mse /= (float)std::max<size_t>(1, gDataset.size());
+    if(hasGRU) GRU_ResetState(g); // training leaves per-lesson states behind
     return mse;
 }
 
@@ -1863,9 +2117,8 @@ static float CompactInputSlotY(int slot, int count, float y0, float y1, float ra
 static float CompactNeuronSlotY(int slot, int count, float y0, float y1, float radius, LayerKind kind)
 {
     if(count<=1) return (y0+y1)*0.5f;
-    // Hidden labels sit below their circles, while output labels sit beside them.
-    // Reserve only the space each presentation actually needs.
-    const float labelSpace=kind==LayerKind::Hidden ? ImGui::GetTextLineHeight()+4.0f : 4.0f;
+    (void)kind; // hidden labels sit to the left of their neuron, outputs to the right
+    const float labelSpace=4.0f;
     const float safeGap=std::max(16.0f,radius*2.0f+labelSpace);
     const float blockSpan=std::min(y1-y0,safeGap*(float)(count-1));
     const float blockTop=(y0+y1-blockSpan)*0.5f;
@@ -1955,13 +2208,13 @@ void NeuralGraph::layoutLayers(float W, float H)
     }
 
     if(minSpacingY == 1e9f) minSpacingY = (y1g - y0g); // single-node layers
-    float rVert = std::max(6.0f, 0.5f*minSpacingY - 6.0f);
+    float rVert = std::max(6.0f, 0.5f*minSpacingY - 3.0f);
 
     // Horizontal limit: ensure circle fits within column; leave padding
     float rHorizGeneric = std::max(6.0f, 0.5f*colW - 12.0f);
 
     // Inputs have a mini plot on the left: ensure it stays within canvas
-    const float kMiniPlotW = 48.0f;
+    const float kMiniPlotW = ImGui::GetFontSize()*3.6f;
 
     float rHorizInput = std::max(6.0f, 0.5f*colW - (10.0f + kMiniPlotW + 6.0f));
     float rHoriz = std::min(rHorizGeneric, rHorizInput);
@@ -1969,7 +2222,7 @@ void NeuralGraph::layoutLayers(float W, float H)
 
     // Inputs and outputs are the equally important endpoints of the graph.
     // Do not let dense hidden layers shrink either endpoint to tiny dots.
-    const float endpointR=std::clamp(ImGui::GetFontSize()*0.75f,12.0f,18.0f);
+    const float endpointR=std::clamp(ImGui::GetFontSize()*0.95f,12.0f,26.0f);
 
     float x = marginX;
     size_t displayColumn = 0;
@@ -2083,8 +2336,9 @@ void NeuralGraph::stepLayout(float dt, float W, float H)
 {
     tickLiveInputs(dt);
     
-    // Recompute forward pass whenever inputs may have changed
-    ForwardPass(*this);
+    // Recompute forward pass whenever inputs may have changed; this is the one
+    // place per frame where GRU memories advance in time.
+    ForwardPass(*this, true);
 
     const float headerH=3.0f*ImGui::GetTextLineHeightWithSpacing()+6.0f;
     const float y0=40.0f+headerH;
@@ -2132,12 +2386,29 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 
     extern bool gForceRelayoutWindows;
     ImGuiCond cond = gForceRelayoutWindows ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
-    ImGui::SetNextWindowSize(ImVec2(width, height), cond);
-    ImGui::SetNextWindowPos(ImVec2(10,10), cond);
+    ImGuiWindowFlags winFlags = ImGuiWindowFlags_NoCollapse;
+    if(gPresentation)
+    {
+        const ImVec2 disp = ImGui::GetIO().DisplaySize;
+        ImGui::SetNextWindowPos(ImVec2(0,0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(disp, ImGuiCond_Always);
+        winFlags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0,0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    }
+    else
+    {
+        ImGui::SetNextWindowSize(ImVec2(width, height), cond);
+        ImGui::SetNextWindowPos(ImVec2(10,10), cond);
+    }
 
     char editorTitle[128];
     std::snprintf(editorTitle, sizeof(editorTitle), "Neural Network (Neurons: %zu)###Neural Editor", nodes.size());
-    if(ImGui::Begin(editorTitle, &open, ImGuiWindowFlags_NoCollapse))
+    const bool editorVisible = ImGui::Begin(editorTitle, &open, winFlags);
+    if(gPresentation) ImGui::PopStyleVar(3);
+    if(editorVisible)
     {
         // Block shortcuts while editing labels; reset per frame and set when inputs are focused
         gEditingLabel = false;
@@ -2158,6 +2429,22 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             layoutLayers(lastCanvasW > 0 ? lastCanvasW : 800.0f, lastCanvasH > 0 ? lastCanvasH : 500.0f);
         }
 
+        if(gPresentation)
+        {
+            // Title strip, like the window caption in the original v4.0 build
+            char ttl[128];
+            std::snprintf(ttl, sizeof(ttl), "NeuralT %s ( tiktok: @justdieblondie )", kAppVersion);
+            const float th = ImGui::GetFrameHeightWithSpacing() + 6.0f;
+            const ImVec2 ts = ImGui::CalcTextSize(ttl);
+            const ImVec2 wp = ImGui::GetCursorScreenPos();
+            ImDrawList* tdl = ImGui::GetWindowDrawList();
+            tdl->AddRectFilled(wp, ImVec2(wp.x + avail.x, wp.y + th), ImGui::GetColorU32(ImVec4(0.11f,0.12f,0.16f,1.0f)));
+            tdl->AddText(ImVec2(wp.x + (avail.x - ts.x)*0.5f, wp.y + (th - ts.y)*0.5f),
+                         ImGui::GetColorU32(ImVec4(0.92f,0.94f,1.0f,1.0f)), ttl);
+            ImGui::Dummy(ImVec2(avail.x, th));
+        }
+        else
+        {
         ImGui::Checkbox("Live Feed", &showLiveFeed);
         ImGui::SameLine();
         if(ImGui::Button(collapseHiddenLayers ? "Show hidden layers" : "Hide hidden layers"))
@@ -2165,30 +2452,100 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             collapseHiddenLayers = !collapseHiddenLayers;
             layoutLayers(lastCanvasW > 0 ? lastCanvasW : 800.0f, lastCanvasH > 0 ? lastCanvasH : 500.0f);
         }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SliderFloat("Zoom (=/-)", &gGraphZoom, 1.0f, 4.0f, "%.1fx");
+        ImGui::SameLine();
+        ImGui::Checkbox("Camera drift (C)", &gAutoPan);
+        }
 
         // The small control row is the only space retained when the feed is
         // collapsed, allowing the graph to fill all remaining editor space.
         const float controlsH = ImGui::GetFrameHeightWithSpacing();
         const float maxFeedH = std::max(80.0f, avail.y - 120.0f);
         const float feedH = showLiveFeed ? std::clamp(preferredLiveFeedH, 80.0f, maxFeedH) : 0.0f;
-        float canvasH = avail.y - controlsH - feedH - (showLiveFeed ? 8.0f : 0.0f);
+        // top control row + bottom actions row (separator + buttons)
+        float canvasH = gPresentation
+            ? avail.y - (ImGui::GetFrameHeightWithSpacing() + 6.0f)
+            : avail.y - controlsH - (controlsH + 6.0f) - feedH - (showLiveFeed ? 8.0f : 0.0f);
         if(canvasH < 80.0f) canvasH = 80.0f;
-        ImVec2 canvasSize = ImVec2(avail.x, canvasH);
+        const ImVec2 viewSize = ImVec2(avail.x, canvasH);
 
-        // Auto relayout when size changes
-        if(std::abs(canvasSize.x - lastCanvasW) > 1.0f || std::abs(canvasSize.y - lastCanvasH) > 1.0f)
+        // The graph lives in a larger virtual canvas inside a scrolling view.
+        // Width grows with zoom; height grows more gently so tall columns stay readable.
+        gGraphZoom = std::clamp(gGraphZoom, 1.0f, 4.0f);
+        const float zoomY = 1.0f + (gGraphZoom - 1.0f) * 0.35f;
+        ImVec2 canvasSize = ImVec2(viewSize.x * gGraphZoom, viewSize.y * zoomY);
+        ImGuiWindowFlags viewFlags = ImGuiWindowFlags_NoScrollWithMouse;
+        if(gGraphZoom > 1.001f) viewFlags |= ImGuiWindowFlags_HorizontalScrollbar;
+        else viewFlags |= ImGuiWindowFlags_NoScrollbar;
+        ImGui::BeginChild("graph_view", viewSize, ImGuiChildFlags_None, viewFlags);
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * (1.0f + (gGraphZoom - 1.0f) * 0.30f));
         {
-            layoutLayers(canvasSize.x, canvasSize.y);
-            lastCanvasW = canvasSize.x; lastCanvasH = canvasSize.y;
+            // Navigation: wheel scrolls, Shift+wheel pans sideways, Ctrl/Cmd+wheel zooms
+            // around the cursor; right/middle drag pans. Any of these stops the drift.
+            ImGuiIO& io = ImGui::GetIO();
+            const bool viewHovered = ImGui::IsWindowHovered();
+            const float sx = ImGui::GetScrollX(), sy = ImGui::GetScrollY();
+            if(viewHovered && io.MouseWheel != 0.0f)
+            {
+                if(io.KeyCtrl || io.KeySuper)
+                {
+                    const float oldZ = gGraphZoom;
+                    gGraphZoom = std::clamp(gGraphZoom * (io.MouseWheel > 0 ? 1.1f : 1.0f/1.1f), 1.0f, 4.0f);
+                    const ImVec2 local(io.MousePos.x - ImGui::GetWindowPos().x, io.MousePos.y - ImGui::GetWindowPos().y);
+                    const float rx = gGraphZoom / oldZ;
+                    const float ry = (1.0f + (gGraphZoom-1.0f)*0.35f) / zoomY;
+                    ImGui::SetScrollX((sx + local.x) * rx - local.x);
+                    ImGui::SetScrollY((sy + local.y) * ry - local.y);
+                }
+                else if(io.KeyShift) ImGui::SetScrollX(sx - io.MouseWheel * 60.0f);
+                else ImGui::SetScrollY(sy - io.MouseWheel * 60.0f);
+                gAutoPan = false;
+            }
+            if(viewHovered && (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 2.0f) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 2.0f)))
+            {
+                ImGui::SetScrollX(sx - io.MouseDelta.x);
+                ImGui::SetScrollY(sy - io.MouseDelta.y);
+                gAutoPan = false;
+            }
+            if(gAutoPan)
+            {
+                // Slow handheld-style glide across the layers, with a gentle vertical sway
+                const float t = (float)ImGui::GetTime();
+                const float maxX = std::max(0.0f, canvasSize.x - viewSize.x);
+                const float maxY = std::max(0.0f, canvasSize.y - viewSize.y + ImGui::GetStyle().ScrollbarSize);
+                ImGui::SetScrollX(maxX * (0.5f - 0.5f*std::cos(t * 0.11f)));
+                ImGui::SetScrollY(maxY * (0.5f - 0.5f*std::cos(t * 0.23f + 1.3f)));
+            }
         }
+
+        // Relayout every frame: the zoomed font changes header and label metrics.
+        layoutLayers(canvasSize.x, canvasSize.y);
+        lastCanvasW = canvasSize.x; lastCanvasH = canvasSize.y;
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 origin = ImGui::GetCursorScreenPos();
         ImVec2 canvasMax = ImVec2(origin.x + canvasSize.x, origin.y + canvasSize.y);
 
-        // CANVAS background
-        dl->AddRectFilled(origin, canvasMax, ImGui::GetColorU32(ImVec4(0.08f,0.08f,0.095f,1.0f)), 6.0f);
-        dl->AddRect(origin, canvasMax, ImGui::GetColorU32(ImVec4(0.25f,0.25f,0.3f,1.0f)), 6.0f);
+        const UITheme& _theme = (gEngine ? gEngine->renderer.theme : UITheme::Cyberpunk());
+
+        // CANVAS background: theme bg drifting toward violet in the lower right
+        {
+            const Vec3& bg = _theme.bg;
+            ImU32 cTL = ImGui::GetColorU32(ImVec4(bg.x, bg.y, bg.z, 1.0f));
+            ImU32 cTR = ImGui::GetColorU32(ImVec4(bg.x+0.04f, bg.y+0.02f, bg.z+0.10f, 1.0f));
+            ImU32 cBR = ImGui::GetColorU32(ImVec4(bg.x+0.14f, bg.y+0.03f, bg.z+0.16f, 1.0f));
+            ImU32 cBL = ImGui::GetColorU32(ImVec4(bg.x+0.03f, bg.y+0.04f, bg.z+0.12f, 1.0f));
+            dl->AddRectFilledMultiColor(origin, canvasMax, cTL, cTR, cBR, cBL);
+            dl->AddRect(origin, canvasMax, ImGui::GetColorU32(ImVec4(0.25f,0.25f,0.3f,1.0f)), 6.0f);
+        }
+
+        // layer index of every node (for GRU styling)
+        std::vector<int> nodeLayer(nodes.size(), -1);
+        for(size_t li=0; li<layers.size(); ++li)
+            for(int idx : layers[li].nodeIdx) if(idx>=0 && idx<(int)nodes.size()) nodeLayer[idx]=(int)li;
+        auto isGRUNode = [&](int idx){ return idx>=0 && idx<(int)nodes.size() && nodeLayer[idx]>=0 && IsGRULayer(*this, (size_t)nodeLayer[idx]); };
 
         ImVec2 _csize = ImVec2(std::max(1.0f, canvasSize.x), std::max(1.0f, canvasSize.y));
         ImGui::InvisibleButton("canvas", _csize);
@@ -2207,11 +2564,23 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             if(collapseHiddenLayers && L.kind == LayerKind::Hidden) continue;
             ImVec2 a(origin.x + L.x0, origin.y + L.y0);
             ImVec2 b(origin.x + L.x1, origin.y + L.y1);
+            const bool gru = IsGRULayer(*this, li);
+            const Vec3& pc = _theme.panel;
             ImU32 colBg = (int(li)==currentLayer) ?
-                ImGui::GetColorU32(ImVec4(0.18f,0.20f,0.28f,0.95f)) :
-                ImGui::GetColorU32(ImVec4(0.12f,0.12f,0.15f,0.75f));
+                ImGui::GetColorU32(ImVec4(pc.x+0.08f,pc.y+0.10f,pc.z+0.14f,0.80f)) :
+                ImGui::GetColorU32(ImVec4(pc.x,pc.y,pc.z,0.55f));
             dl->AddRectFilled(a, b, colBg, 8.0f);
-            dl->AddRect(a, b, ImGui::GetColorU32(ImVec4(0.35f,0.35f,0.40f,0.9f)), 8.0f, 0, 2.0f);
+            if(gru)
+            {
+                // Recurrent memory: glowing blue frame + a small "state flows down" marker
+                dl->AddRect(a, b, ImGui::GetColorU32(ImVec4(0.25f,0.55f,1.0f,0.25f)), 8.0f, 0, 6.0f);
+                dl->AddRect(a, b, ImGui::GetColorU32(ImVec4(0.35f,0.68f,1.0f,1.0f)), 8.0f, 0, 2.5f);
+                ImVec2 m(a.x + 12.0f, b.y - 12.0f);
+                dl->AddTriangleFilled(ImVec2(m.x-5,m.y-4), ImVec2(m.x+5,m.y-4), ImVec2(m.x,m.y+4),
+                                      ImGui::GetColorU32(ImVec4(0.35f,0.68f,1.0f,1.0f)));
+            }
+            else
+                dl->AddRect(a, b, ImGui::GetColorU32(ImVec4(0.35f,0.37f,0.48f,0.85f)), 8.0f, 0, 1.5f);
 
             // --- 3 header lines:
             float lh = ImGui::GetTextLineHeightWithSpacing();
@@ -2228,7 +2597,9 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 
             // 3) activation - clickable
             const char* actName = ActName(L.act);
-            char la[96]; std::snprintf(la, sizeof(la), "Activation: %s  (click)", actName);
+            char la[96];
+            if(gru) std::snprintf(la, sizeof(la), "Gates: update / reset / candidate");
+            else std::snprintf(la, sizeof(la), "Activation: %s  (click)", actName);
             ImVec2 actPos(hp.x, hp.y + lh*2.0f);
             dl->AddText(actPos, ImGui::GetColorU32(ImVec4(0.9f,0.8f,1,1)), la);
 
@@ -2238,6 +2609,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                ImGui::IsMouseClicked(ImGuiMouseButton_Left))
             {
                 L.act = NextAct(L.act);
+                if(L.act == Act::GRU && L.kind != LayerKind::Hidden) L.act = NextAct(L.act);
             }
 
             // click entire column = select layer (LPM/PPM)
@@ -2367,13 +2739,18 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             return nullptr;
         };
 
-        const UITheme& _theme = (gEngine ? gEngine->renderer.theme : UITheme::Cyberpunk());
-        for(auto& e: edges)
+        const float timeNow = (float)ImGui::GetTime();
+        const bool denseGraph = edges.size() > 2500; // fewer glow passes keep big graphs fluid
+        struct Spark { ImVec2 p0, c1, c2, p3; float phase; float act; };
+        std::vector<Spark> sparks;
+        for(size_t ei=0; ei<edges.size(); ++ei)
         {
+            auto& e = edges[ei];
             Neuron* A = findById(e.a);
             Neuron* B = findById(e.b);
             if(!A||!B) continue;
             const int ai = int(A - nodes.data()), bi = int(B - nodes.data());
+            const bool recurrentEdge = isGRUNode(ai) || isGRUNode(bi);
             if(!IsVisibleInput(*this, ai) || !IsVisibleInput(*this, bi)) continue;
             if(collapseHiddenLayers) continue;
             ImVec2 p1(origin.x+A->x, origin.y+A->y), p2(origin.x+B->x, origin.y+B->y);
@@ -2386,60 +2763,90 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 float g = mixf(_theme.edgeStart.y, _theme.edgeEnd.y, t);
                 float b = mixf(_theme.edgeStart.z, _theme.edgeEnd.z, t);
                 float a = _theme.edgeAlpha;
-                float thick = _theme.edgeBase + _theme.edgeScale * std::fabs(e.w);
+                if(recurrentEdge)
+                {
+                    // Edges touching a GRU memory: lavender -> magenta, pinker leaving the memory
+                    float tr = std::clamp(t*0.6f + (isGRUNode(ai) ? 0.4f : 0.0f), 0.0f, 1.0f);
+                    r = mixf(0.66f, 1.0f, tr); g = mixf(0.42f, 0.40f, tr); b = mixf(1.0f, 0.88f, tr);
+                    a *= 0.42f; // individual strands stay visible in the lattice
+                }
+                float thick = (_theme.edgeBase + _theme.edgeScale * std::fabs(e.w)) * zoomY;
+                if(denseGraph) thick = recurrentEdge ? std::clamp(thick, 1.0f, 1.6f) : std::clamp(thick, 1.3f, 2.4f);
 
                 // Pulsing glow
-                float time = (float)ImGui::GetTime();
+                float time = timeNow;
                 float pulse = 0.5f + 0.5f*std::sin(time*2.0f + 0.15f*(float)(A->id + B->id));
-                ImU32 glowCol = ImGui::GetColorU32(ImVec4(r,g,b, 0.18f * pulse));
+                ImU32 glowCol = ImGui::GetColorU32(ImVec4(r,g,b, (recurrentEdge ? 0.05f : (denseGraph ? 0.10f : 0.18f)) * (0.6f + 0.4f*pulse)));
                 float w1 = thick * (2.5f + 2.0f*pulse);
                 float w2 = thick * (1.8f + 1.2f*pulse);
                 float w3 = thick * (1.2f + 0.6f*pulse);
 
-                // Use actual panel values or oscillating values based on sine wave settings
-                float currentStrength = gStrengthSineEnabled ? 
-                    (150.0f + 150.0f * std::sin(gWindStrengthPhase)) : 
-                    gWind.strength;
-                float currentSpeed = gSpeedSineEnabled ? 
-                    (2.5f + 2.5f * std::sin(gWindSpeedPhase)) : 
-                    gWind.speed;
-                float currentJitter = gJitterSineEnabled ? 
-                    (0.25f + 0.25f * std::sin(gWindJitterPhase)) : 
-                    gWind.jitter;
+                // Moving strands: each edge bows perpendicular to itself (the whole bundle
+                // breathes together) plus its own travelling wave, so long lines sway like
+                // fibres. Wind panel strength scales it; R (rotate) fades it in/out.
+                float currentStrength = gStrengthSineEnabled ?
+                    (150.0f + 150.0f * std::sin(gWindStrengthPhase)) : gWind.strength;
+                float currentSpeed = gSpeedSineEnabled ?
+                    (2.5f + 2.5f * std::sin(gWindSpeedPhase)) : gWind.speed;
+                const float windGain = (currentStrength / 150.0f) * (0.25f + 0.75f*gWindInterpolant);
 
-                // Wind sway: stronger turbine => more bend, same direction for all (with slight jitter)
-                float rpm = 0.0f;
-                if(gEngine)
+                ImVec2 d = ImVec2(p2.x - p1.x, p2.y - p1.y);
+                const float len = std::sqrt(d.x*d.x + d.y*d.y) + 1e-3f;
+                const ImVec2 nrm(-d.y/len, d.x/len);
+                const float seed = 0.37f*(float)A->id + 0.11f*(float)B->id;
+                const float bow  = 0.06f*len * std::sin(time*0.45f*currentSpeed);
+                const float wave = 0.09f*len * std::sin(time*1.1f*currentSpeed + seed);
+                const float wave2= 0.07f*len * std::sin(time*0.8f*currentSpeed + seed*1.7f + 1.0f);
+                const float k1 = (bow + wave)  * windGain;
+                const float k2 = (bow - wave2) * windGain;
+                // Curves leave and enter neurons horizontally, which makes each layer-to-layer
+                // bundle pinch into an hourglass fan; the sway rides on top of that.
+                // Only the endpoint fans (inputs / outputs) get the pinched hourglass; the
+                // lattice between hidden and memory layers stays near-straight.
+                const bool endpointFan = A->isInput || (nodeLayer[bi] >= 0 && layers[nodeLayer[bi]].kind == LayerKind::Output);
+                ImVec2 c1, c2;
+                if(endpointFan)
                 {
-                    rpm = gEngine->turbine.params.rpm;
+                    const float hx = d.x * 0.5f;
+                    c1 = ImVec2(p1.x + hx + nrm.x*k1*0.6f, p1.y + nrm.y*k1);
+                    c2 = ImVec2(p2.x - hx + nrm.x*k2*0.6f, p2.y + nrm.y*k2);
+                }
+                else
+                {
+                    const float ks = recurrentEdge ? 0.45f : 0.7f;
+                    c1 = ImVec2(p1.x + d.x*0.33f + nrm.x*k1*ks, p1.y + d.y*0.33f + nrm.y*k1*ks);
+                    c2 = ImVec2(p1.x + d.x*0.66f + nrm.x*k2*ks, p1.y + d.y*0.66f + nrm.y*k2*ks);
                 }
 
-                // Normalize RPM to [0,1] using a soft scale; tweakable mapping
-                float windK = std::fmin(rpm / 2000.0f, 1.0f);
+                const int segs = denseGraph ? 12 : 0;
+                if(!denseGraph) dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w1);
+                dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w2, segs);
+                dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w3, segs);
+                dl->AddBezierCubic(p1, c1, c2, p2, ImGui::GetColorU32(ImVec4(r,g,b,a)), thick, segs);
 
-                // Base amplitude in pixels, smoothly interpolated
-                float baseAmp = (currentStrength * windK) * gWindInterpolant;
+                // Signal particles travel along a subset of the memory edges
+                if((recurrentEdge && (ei % 3) == 0) || (!recurrentEdge && (ei % 9) == 0))
+                {
+                    const float h = std::fmod((float)(e.a*7919 + e.b*104729) * 0.000137f, 1.0f);
+                    sparks.push_back({p1, c1, c2, p2, h, std::fabs(A->value)});
+                }
+            }
+        }
 
-                // Global wind direction (mostly to the right, slightly up). Add tiny rotation jitter.
-                float baseDirX = 1.0f, baseDirY = -0.15f;
-                float jitter = currentJitter * std::sin(time*0.8f + 0.07f*(A->id*13 + B->id*17));
-                float ca = std::cos(jitter), sa = std::sin(jitter);
-                ImVec2 windDir = ImVec2(baseDirX*ca - baseDirY*sa, baseDirX*sa + baseDirY*ca);
-
-                // Mild oscillation so they sway a bit over time (same sense for all)
-                float osc = 0.75f + 0.25f*std::sin(time * currentSpeed + 0.05f*(A->id + B->id));
-                float amp = baseAmp * osc;
-                ImVec2 wind = ImVec2(windDir.x * amp, windDir.y * amp);
-
-                // Bézier control points pushed along wind to create a smooth bend
-                ImVec2 d = ImVec2(p2.x - p1.x, p2.y - p1.y);
-                ImVec2 c1 = ImVec2(p1.x + d.x*0.33f + wind.x, p1.y + d.y*0.33f + wind.y);
-                ImVec2 c2 = ImVec2(p1.x + d.x*0.66f + wind.x, p1.y + d.y*0.66f + wind.y);
-
-                dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w1);
-                dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w2);
-                dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w3);
-                dl->AddBezierCubic(p1, c1, c2, p2, ImGui::GetColorU32(ImVec4(r,g,b,a)), thick);
+        // Particle streams: short dotted trails gliding along memory edges
+        for(const Spark& sp : sparks)
+        {
+            const float speed = 0.18f + 0.22f*std::min(1.0f, sp.act);
+            const float head = std::fmod(timeNow*speed + sp.phase, 1.0f);
+            for(int k=0;k<4;++k)
+            {
+                const float t = head - 0.018f*(float)k;
+                if(t < 0.0f) continue;
+                const float u = 1.0f - t;
+                ImVec2 q(u*u*u*sp.p0.x + 3*u*u*t*sp.c1.x + 3*u*t*t*sp.c2.x + t*t*t*sp.p3.x,
+                         u*u*u*sp.p0.y + 3*u*u*t*sp.c1.y + 3*u*t*t*sp.c2.y + t*t*t*sp.p3.y);
+                const float alpha = (0.85f - 0.2f*(float)k) * (0.55f + 0.45f*std::min(1.0f, sp.act));
+                dl->AddCircleFilled(q, 1.9f - 0.3f*(float)k, ImGui::GetColorU32(ImVec4(1.0f,0.88f,1.0f,alpha)), 6);
             }
         }
 
@@ -2531,8 +2938,21 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 fill = colU(_theme.nHighlight);
             }
 
-            dl->AddCircleFilled(p, n.radius, fill, 32);
-            dl->AddCircle(p, n.radius, ring, 32, 2.0f);
+            if(isGRUNode(visibleIdx))
+            {
+                // GRU memory cell: diamond, brightness follows |h|
+                const float r = n.radius + 1.5f;
+                const float lv = std::min(1.0f, std::fabs(n.value));
+                ImU32 dfill = isSel ? fill : ImGui::GetColorU32(ImVec4(0.55f+0.40f*lv, 0.62f+0.34f*lv, 0.85f+0.15f*lv, 1.0f));
+                ImVec2 q0(p.x, p.y-r), q1(p.x+r, p.y), q2(p.x, p.y+r), q3(p.x-r, p.y);
+                dl->AddQuadFilled(q0, q1, q2, q3, dfill);
+                dl->AddQuad(q0, q1, q2, q3, ImGui::GetColorU32(ImVec4(0.92f,0.96f,1.0f,0.95f)), 1.5f);
+            }
+            else
+            {
+                dl->AddCircleFilled(p, n.radius, fill, 32);
+                dl->AddCircle(p, n.radius, ring, 32, 2.0f);
+            }
 
             // Determine if this neuron is in a hidden layer
             bool isHidden = false;
@@ -2551,7 +2971,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             ImVec2 tl;
             if(isHidden)
             {
-                tl = ImVec2(p.x - ts.x*0.5f, p.y + n.radius + 4.0f);
+                tl = ImVec2(p.x - n.radius - 4.0f - ts.x, p.y - ts.y*0.5f);
             } 
             else if(isOutput)
             {
@@ -2559,7 +2979,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             } 
             else 
             {
-                tl = ImVec2(p.x - n.radius - 8.0f - ts.x - 56.0f, p.y - ts.y*0.5f); // input - space for mini-plot on the left
+                tl = ImVec2(p.x - n.radius - 18.0f - ts.x - ImGui::GetFontSize()*3.6f, p.y - ts.y*0.5f); // input - space for mini-plot on the left
             }
 
             // Yellow label background for top input/output by value
@@ -2630,7 +3050,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                             ImGui::GetColorU32(ImVec4(0.05f,0.05f,0.08f,1.0f)), buf);
 
                 // Mini live-feed plot moved to LEFT of neuron
-                const float PW=48.f, PH=22.f;
+                const float PW=ImGui::GetFontSize()*3.6f, PH=ImGui::GetFontSize()*1.6f;
                 ImVec2 pp0(p.x - n.radius - 10.f - PW, p.y - PH*0.5f);
                 ImVec2 pp1(pp0.x + PW, pp0.y + PH);
                 ImU32 plotBg = ImGui::GetColorU32(ImVec4(0.1f,0.12f,0.14f,1.0f));
@@ -2650,7 +3070,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                     float t=(float)i/(float)S;
                     float val = 0.5f + 0.5f*std::sin(n.phase + t*2.0f*3.14159265f);
                     ImVec2 cur = { pp0.x + t*PW, pp0.y + PH*(1.0f - val) };
-                    dl->AddLine(prev, cur, plotFg, 1.5f);
+                    dl->AddLine(prev, cur, plotFg, std::max(1.5f, ImGui::GetFontSize()*0.12f));
                     prev = cur;
                 }
                 // mini plot is not clickable
@@ -2671,10 +3091,12 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             }
         }
 
+        ImGui::PopFont();
+        ImGui::EndChild();
+
         // ====== LIVE FEED (under the graph) ======
-        if(showLiveFeed)
+        if(showLiveFeed && !gPresentation)
         {
-            ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + canvasSize.y + 8.0f));
             ImGui::BeginChild("live_feed", ImVec2(avail.x, feedH), true, ImGuiWindowFlags_HorizontalScrollbar);
             {
             const Layer& L = layers[std::clamp(currentLayer, 0, (int)layers.size()-1)];
@@ -2857,6 +3279,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         }
 
         // Local actions panel
+        if(!gPresentation)
+        {
         ImGui::Separator();
         ImGui::Checkbox("Live inputs (sin)", &liveInputs);
         ImGui::SameLine();
@@ -2865,6 +3289,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         if(ImGui::Button("Add neuron (N)")){ NG_AddNeuron(*this, currentLayer); }
         ImGui::SameLine();
         if(ImGui::Button("Remove last (D)")){ NG_RemoveLastNeuron(*this, currentLayer); }
+        }
     }
     ImGui::End();
 }
@@ -2919,6 +3344,9 @@ bool Engine::init(const AppConfig& cfgIn)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE); // required for a 3.3 core context on macOS
+#endif
 
     // Start maximized for better UX
     glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
@@ -2990,6 +3418,17 @@ bool Engine::init(const AppConfig& cfgIn)
           SaveEngineConf("engine.conf");
       }
     }
+#ifdef USE_IMGUI
+    {
+        std::string msg;
+        if(std::ifstream(kStartupNetworkFile).good() && NG_LoadJson(graph, kStartupNetworkFile, &msg))
+        {
+            gLiveFeedWaveActive = false; // all sensors stream at once
+            graph.liveInputs = true;
+            Logf("Loaded %s", kStartupNetworkFile);
+        }
+    }
+#endif
     Logf("Engine %s initialized.", kAppVersion);
     return true;
 }
@@ -3180,8 +3619,8 @@ void Engine::render()
         ImVec2 disp = io.DisplaySize;
 
         // Left top: Neural Editor (big)
-        float neW = std::max(400.0f, disp.x * 0.62f);
-        float neH = std::max(300.0f, disp.y * 0.62f);
+        float neW = std::max(400.0f, disp.x);
+        float neH = std::max(300.0f, disp.y);
         if(gShowEditorWindow)
         {
             bool openNe = true;
@@ -3201,7 +3640,7 @@ void Engine::render()
             ImGui::Text("Total Neurons: %zu", graph.nodes.size());
             ImGui::Checkbox("VSync (V)", &cfg.vsync);
             ImGui::SameLine(); ImGui::Checkbox("Rotate (R)", &cfg.rotate);
-            ImGui::Checkbox("Schematic (G)", &cfg.showSchematic);
+            ImGui::Checkbox("Schematic", &cfg.showSchematic);
             ImGui::SliderFloat("RPM", &turbine.params.rpm, 0.0f, 15000.0f);
             int blades = turbine.params.blades;
             if(ImGui::SliderInt("Blades", &blades, 1, 10)){ turbine.params.blades = blades; turbine.rebuild(); }
@@ -3920,6 +4359,11 @@ void Engine::render()
         ImGui::BulletText("M                    - add a lesson from current IN/OUT values");
         ImGui::BulletText("B                    - start training on collected lessons");
         ImGui::BulletText("T                    - train to target (fine-tune until Target MSE)");
+        ImGui::BulletText("G                    - toggle GRU memory on the current hidden layer");
+        ImGui::BulletText("P                    - presentation mode (full-screen graph) / editor mode");
+        ImGui::BulletText("= / - / 0            - zoom in / out / fit whole network");
+        ImGui::BulletText("C                    - cinematic camera drift on/off");
+        ImGui::BulletText("Ctrl/Cmd+wheel       - zoom at cursor; right-drag or wheel to pan");
         ImGui::BulletText("W                    - toggle live feed wave effect");
         ImGui::BulletText("Q                    - random live feed for all input neurons");
         ImGui::BulletText("TAB                  - toggle live feed on all inputs");
@@ -4237,6 +4681,26 @@ ImGui::BulletText("Train (B or T) after setting parameters");
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 #endif
 
+    // Dev aid: NEURALT_SNAPSHOT=out.ppm writes one frame (after ~3 s) and quits.
+    if(const char* snap = std::getenv("NEURALT_SNAPSHOT"))
+    {
+        static int frame = 0;
+        const char* atEnv = std::getenv("NEURALT_SNAPSHOT_FRAME");
+        if(++frame == (atEnv ? std::atoi(atEnv) : 180))
+        {
+            std::vector<unsigned char> px((size_t)w*h*3);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+            if(FILE* f = std::fopen(snap, "wb"))
+            {
+                std::fprintf(f, "P6\n%d %d\n255\n", w, h);
+                for(int y=h-1; y>=0; --y) std::fwrite(px.data() + (size_t)y*w*3, 1, (size_t)w*3, f);
+                std::fclose(f);
+            }
+            glfwSetWindowShouldClose((GLFWwindow*)window, GLFW_TRUE);
+        }
+    }
+
     if(cfg.vsync) glfwSwapInterval(1); else glfwSwapInterval(0);
     glfwSwapBuffers((GLFWwindow*)window);
     glfwPollEvents();
@@ -4415,7 +4879,23 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     }
 #endif
     if(key==GLFW_KEY_R){ cfg.rotate = !cfg.rotate; }
-    if(key==GLFW_KEY_G){ cfg.showSchematic = !cfg.showSchematic; }
+    if(key==GLFW_KEY_C){ gAutoPan = !gAutoPan; Logf("Camera drift %s", gAutoPan ? "on" : "off"); }
+    if(key==GLFW_KEY_EQUAL || key==GLFW_KEY_KP_ADD){ gGraphZoom = std::min(4.0f, gGraphZoom*1.15f); }
+    if(key==GLFW_KEY_MINUS || key==GLFW_KEY_KP_SUBTRACT){ gGraphZoom = std::max(1.0f, gGraphZoom/1.15f); }
+    if(key==GLFW_KEY_0){ gGraphZoom = 1.0f; }
+    if(key==GLFW_KEY_P){ gPresentation = !gPresentation; gForceRelayoutWindows = true; }
+    if(key==GLFW_KEY_G)
+    {
+        if(graph.currentLayer >= 0 && graph.currentLayer < (int)graph.layers.size() &&
+           graph.layers[graph.currentLayer].kind == LayerKind::Hidden)
+        {
+            Layer& L = graph.layers[graph.currentLayer];
+            L.act = (L.act == Act::GRU) ? Act::ReLU : Act::GRU;
+            for(int idx : L.nodeIdx) graph.nodes[idx].h = 0.0f;
+            Logf("Layer '%s' -> %s", L.name.c_str(), ActName(L.act));
+        }
+        else Logf("Select a hidden layer to toggle GRU memory (G).");
+    }
     if(key==GLFW_KEY_V){ cfg.vsync = !cfg.vsync; }
     if(key==GLFW_KEY_T){
         if((mods & GLFW_MOD_SHIFT) != 0)
@@ -4434,7 +4914,9 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
             else 
             if(renderer.theme.name=="Crimson") renderer.theme = UITheme::Ruby();
             else 
-            /* Ruby or other */ 
+            if(renderer.theme.name=="Ruby") renderer.theme = UITheme::Ignition();
+            else 
+            /* Ignition or other */ 
             renderer.theme = UITheme::NeonNoir();
             Logf("Theme selected: %s", renderer.theme.name.c_str());
             return;
@@ -4608,16 +5090,44 @@ void Engine::processCamera(){}
 // main
 // ─────────────────────────────────────────────────────────────────────────────
 #include <locale.h>
-int main()
+int main(int argc, char** argv)
 {
     // Use C locale for consistent parsing and formatting
     setlocale(LC_ALL, "C");
     AppConfig cfg;
     char main_title[128];
-    std::snprintf(main_title, sizeof(main_title), "NeuralT %s (C++/OpenGL - Neural Network Editor MB)", kAppVersion);
+    std::snprintf(main_title, sizeof(main_title), "NeuralT %s ( tiktok: @justdieblondie )", kAppVersion);
     cfg.title = main_title;
     Engine e;
     if(!e.init(cfg)) return 1;
+
+#ifdef USE_IMGUI
+    // neuralT --pretrain <network.json> [maxEpochs]
+    // Trains the file's lessons until its target MSE (or maxEpochs) and saves it back.
+    if(argc >= 3 && std::string(argv[1]) == "--pretrain")
+    {
+        std::string path = argv[2], msg;
+        if(!NG_LoadJson(e.graph, path, &msg)){ std::fprintf(stderr, "load failed: %s\n", msg.c_str()); return 1; }
+        const int maxEpochs = (argc >= 4) ? std::atoi(argv[3]) : gTrain.totalEpochs;
+        gUseManualOverrides = false;
+        gTrain.active = true;
+        float mse = 0.0f;
+        int ep = 0;
+        for(; ep < maxEpochs; ++ep)
+        {
+            mse = TrainOneEpoch(e.graph, gTrain.lr, gTrain.l1, gTrain.l2);
+            if(ep % 50 == 0){ std::printf("epoch %d  mse %.6f\n", ep, mse); std::fflush(stdout); glfwPollEvents(); }
+            if(gTrain.targetMSE > 0.0f && mse <= gTrain.targetMSE) break;
+        }
+        gTrain.active = false;
+        std::printf("done: epoch %d  mse %.6f\n", ep, mse);
+        NG_SaveJson(e.graph, path);
+        e.shutdown();
+        return 0;
+    }
+#else
+    (void)argc; (void)argv;
+#endif
 
     while(!glfwWindowShouldClose((GLFWwindow*)e.window))
     {

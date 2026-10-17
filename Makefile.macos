@@ -1,0 +1,56 @@
+# macOS build for NeuralT: compiles GLFW, GLEW and Dear ImGui from source,
+# so no Homebrew packages are required.
+#   make -f Makefile.macos        -> ./neuralT
+CXX      ?= clang++
+CC       ?= clang
+OBJDIR   := build-macos
+
+GLFW     := third_party/glfw
+GLEW     := third_party/glew-2.2.0
+IMGUI    := imgui
+
+CPPFLAGS := -I$(IMGUI) -I$(IMGUI)/backends -I$(GLEW)/include -I$(GLFW)/include \
+            -DUSE_IMGUI -DIMGUI_IMPL_OPENGL_LOADER_GLEW -DGLEW_STATIC -DGL_SILENCE_DEPRECATION
+CXXFLAGS := -std=c++17 -O2 -Wall -Wextra
+CFLAGS   := -O2 -D_GLFW_COCOA
+LDFLAGS  := -framework Cocoa -framework IOKit -framework CoreFoundation \
+            -framework QuartzCore -framework OpenGL
+
+GLFW_C   := context init input monitor platform vulkan window egl_context osmesa_context \
+            null_init null_monitor null_window null_joystick cocoa_time posix_module posix_thread
+GLFW_M   := cocoa_init cocoa_joystick cocoa_monitor cocoa_window nsgl_context
+IMGUI_CPP := $(IMGUI)/imgui.cpp $(IMGUI)/imgui_draw.cpp $(IMGUI)/imgui_tables.cpp \
+             $(IMGUI)/imgui_widgets.cpp $(IMGUI)/backends/imgui_impl_glfw.cpp \
+             $(IMGUI)/backends/imgui_impl_opengl3.cpp
+
+OBJS := $(OBJDIR)/main.o \
+        $(patsubst %,$(OBJDIR)/glfw_%.o,$(GLFW_C) $(GLFW_M)) \
+        $(OBJDIR)/glew.o \
+        $(patsubst $(IMGUI)/%.cpp,$(OBJDIR)/imgui_%.o,$(subst backends/,,$(IMGUI_CPP)))
+
+neuralT: $(OBJS)
+	$(CXX) $^ $(LDFLAGS) -o $@
+
+$(OBJDIR)/main.o: main.cpp main.h | $(OBJDIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(OBJDIR)/glfw_%.o: $(GLFW)/src/%.c | $(OBJDIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(OBJDIR)/glfw_%.o: $(GLFW)/src/%.m | $(OBJDIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/glew.o: $(GLEW)/src/glew.c | $(OBJDIR)
+	$(CC) -O2 -DGLEW_STATIC -I$(GLEW)/include -c $< -o $@
+
+$(OBJDIR)/imgui_%.o: $(IMGUI)/%.cpp | $(OBJDIR)
+	$(CXX) $(CPPFLAGS) -std=c++17 -O2 -c $< -o $@
+$(OBJDIR)/imgui_%.o: $(IMGUI)/backends/%.cpp | $(OBJDIR)
+	$(CXX) $(CPPFLAGS) -std=c++17 -O2 -c $< -o $@
+
+$(OBJDIR):
+	mkdir -p $@
+
+clean:
+	rm -rf $(OBJDIR) neuralT
+
+.PHONY: clean

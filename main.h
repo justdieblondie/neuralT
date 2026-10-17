@@ -13,11 +13,12 @@
 // ─────────────────────────────────────────
 // Paths and version
 // ─────────────────────────────────────────
-inline constexpr const char* kAppVersion             = "v3.0";
+inline constexpr const char* kAppVersion             = "v4.0";
 inline constexpr const char* kEngineConfFile         = "engine.conf";
 inline constexpr const char* kLessonsFile            = "lessons.json";
 inline constexpr const char* kNetworkFile            = "network.json";
 inline constexpr const char* kNetworkTrainedFile     = "network_trained.json";
+inline constexpr const char* kStartupNetworkFile     = "saved/engine_sensor_gru.json";
 
 // ─────────────────────────────────────────
 // Minimal math
@@ -119,6 +120,7 @@ struct UITheme
     static UITheme Crimson();
     static UITheme Ruby();
     static UITheme Cyberpunk();
+    static UITheme Ignition();
 };
 
 // ─────────────────────────────────────────
@@ -147,13 +149,14 @@ struct TurbineModel
 // Neural network — data and graph
 // ─────────────────────────────────────────
 enum class LayerKind { Input, Hidden, Output };
-enum class Act { Linear, ReLU, Sigmoid, Tanh };
+enum class Act { Linear, ReLU, Sigmoid, Tanh, GRU };
 namespace Activation
 {
     static constexpr Act Linear  = Act::Linear;
     static constexpr Act ReLU    = Act::ReLU;
     static constexpr Act Sigmoid = Act::Sigmoid;
     static constexpr Act Tanh    = Act::Tanh;
+    static constexpr Act GRU     = Act::GRU;
 }
 
 const char* ActName(Act a);
@@ -166,6 +169,11 @@ struct Layer
     Act act = Act::Linear;
     std::vector<int> nodeIdx;
     float x0=0,y0=0,x1=0,y1=0;
+
+    // GRU (act == Act::GRU) gate parameters. The candidate input weights are
+    // the ordinary incoming edges; these hold the rest, row-major per neuron:
+    // W* are [n x nIn] (previous layer -> gate), U* are [n x n] (recurrent).
+    std::vector<float> Wz, Wr, Uz, Ur, Uh, bz, br;
 };
 
 struct Neuron
@@ -180,6 +188,10 @@ struct Neuron
     float x=0, y=0;
     float vx=0, vy=0;
     float phase=0;
+
+    // GRU state: h is the committed hidden state; gz/gr/gc/hPrev are the
+    // update gate, reset gate, candidate and previous state from the last pass.
+    float h=0, gz=0, gr=0, gc=0, hPrev=0;
 };
 
 struct Edge{ int a=0, b=0; float w=0; };

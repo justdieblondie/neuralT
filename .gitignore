@@ -3,3 +3,5 @@ imgui.ini
 AGENTS.md
 neuralT
 compile_linux.txt
+build-macos/
+third_party/
