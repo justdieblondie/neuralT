@@ -1,5 +1,5 @@
 {
-  "version": "turbinos-graph-1",
+  "version": "neuro-graph-1",
   "learning_rate": 0.003,
   "l1": 0.0003,
   "l2": 0.0005,

@@ -110,6 +110,41 @@ static void RandomizeLayerWind(Layer& layer)
     layer.windJitterScale = RandomRange(0.60f, 1.40f);
 }
 
+static void InitializeGRU(Layer& layer, int inputSize)
+{
+    const int hiddenSize = (int)layer.nodeIdx.size();
+    layer.gruInputSize = inputSize;
+    const float inputScale = std::sqrt(6.0f / std::max(1, inputSize + hiddenSize));
+    const float recurrentScale = std::sqrt(3.0f / std::max(1, hiddenSize));
+    auto randomVector = [](size_t count, float scale)
+    {
+        std::vector<float> values(count);
+        for(float& value : values) value = RandomRange(-scale, scale);
+        return values;
+    };
+    layer.gruWz = randomVector((size_t)hiddenSize * inputSize, inputScale);
+    layer.gruWr = randomVector((size_t)hiddenSize * inputSize, inputScale);
+    layer.gruWh = randomVector((size_t)hiddenSize * inputSize, inputScale);
+    layer.gruUz = randomVector((size_t)hiddenSize * hiddenSize, recurrentScale);
+    layer.gruUr = randomVector((size_t)hiddenSize * hiddenSize, recurrentScale);
+    layer.gruUh = randomVector((size_t)hiddenSize * hiddenSize, recurrentScale);
+    layer.gruBz.assign(hiddenSize, 0.0f);
+    layer.gruBr.assign(hiddenSize, 0.0f);
+    layer.gruBh.assign(hiddenSize, 0.0f);
+    layer.gruState.assign(hiddenSize, 0.0f);
+}
+
+static void ResetGRUState(NeuralGraph& graph)
+{
+    for(Layer& layer : graph.layers)
+    {
+        if(layer.kind == LayerKind::GRU)
+        {
+            layer.gruState.assign(layer.nodeIdx.size(), 0.0f);
+        }
+    }
+}
+
 static float gWindInterpolant = 0.0f;
 static float gWindStrengthPhase = 0.0f;
 static float gWindSpeedPhase = 0.0f;
@@ -854,6 +889,11 @@ static void NG_AddNeuron(NeuralGraph& g, int layerIdx)
                L.kind==LayerKind::Output? "Out" : "H") + std::to_string((int)L.nodeIdx.size()+1);
     g.nodes.push_back(n);
     g.layers[layerIdx].nodeIdx.push_back((int)g.nodes.size()-1);
+    if(L.kind == LayerKind::GRU)
+    {
+        const int inputSize = layerIdx > 0 ? (int)g.layers[layerIdx - 1].nodeIdx.size() : 0;
+        InitializeGRU(L, inputSize);
+    }
     g.layoutLayers(g.lastCanvasW>0?g.lastCanvasW:800.0f, g.lastCanvasH>0?g.lastCanvasH:500.0f);
     NG_RebuildEdges(g);
 }
@@ -879,6 +919,12 @@ static void NG_RemoveLastNeuron(NeuralGraph& g, int layerIdx)
 
     // Clear selection if we removed selected
     if(g.selected == removedId) g.selected = -1;
+
+    if(L.kind == LayerKind::GRU)
+    {
+        const int inputSize = layerIdx > 0 ? (int)g.layers[layerIdx - 1].nodeIdx.size() : 0;
+        InitializeGRU(L, inputSize);
+    }
 
     // Rebuild full connections
     NG_RebuildEdges(g);
@@ -912,6 +958,35 @@ static void NG_InsertHiddenAfterCurrent(NeuralGraph& g)
     g.currentLayer = insertPos;
     // Add a single neuron to keep connectivity meaningful and rebuild edges/layout
     NG_AddNeuron(g, g.currentLayer);
+}
+
+static void NG_InsertGRUAfterCurrent(NeuralGraph& graph)
+{
+    const int current = graph.currentLayer;
+    if(current < 0 || current >= (int)graph.layers.size()) return;
+    if(graph.layers[current].kind == LayerKind::Output) return;
+    const int insertPosition = current + 1;
+    Layer layer;
+    layer.kind = LayerKind::GRU;
+    layer.act = Act::Tanh;
+    layer.name = "GRU " + std::to_string(insertPosition);
+    RandomizeLayerWind(layer);
+    int nextId = NG_NextId(graph);
+    for(int unit = 0; unit < 8; ++unit)
+    {
+        Neuron neuron;
+        neuron.id = nextId++;
+        neuron.label = "Memory" + std::to_string(unit + 1);
+        graph.nodes.push_back(std::move(neuron));
+        layer.nodeIdx.push_back((int)graph.nodes.size() - 1);
+    }
+    const int inputSize = (int)graph.layers[current].nodeIdx.size();
+    InitializeGRU(layer, inputSize);
+    graph.layers.insert(graph.layers.begin() + insertPosition, std::move(layer));
+    graph.currentLayer = insertPosition;
+    NG_RebuildEdges(graph);
+    graph.layoutLayers(graph.lastCanvasW > 0 ? graph.lastCanvasW : 800.0f,
+                       graph.lastCanvasH > 0 ? graph.lastCanvasH : 500.0f);
 }
 
 static bool NG_RemoveCurrentHiddenLayer(NeuralGraph& g)
@@ -1000,6 +1075,57 @@ static void NG_BuildDinosaur(NeuralGraph& g)
         g.nodes[g.layers[3].nodeIdx[2]].label = "Roar";
     }
 }
+
+static void NG_BuildDeepGRUTopology(NeuralGraph& graph)
+{
+    graph.nodes.clear();
+    graph.edges.clear();
+    graph.layers.clear();
+    graph.selected = -1;
+    graph.currentLayer = 0;
+    int nextId = 0;
+
+    auto addLayer = [&](LayerKind kind, int count, const std::string& name, Act activation)
+    {
+        Layer layer;
+        layer.kind = kind;
+        layer.name = name;
+        layer.act = activation;
+        RandomizeLayerWind(layer);
+        const int layerNumber = (int)graph.layers.size();
+        for(int i = 0; i < count; ++i)
+        {
+            Neuron neuron;
+            neuron.id = nextId++;
+            neuron.isInput = kind == LayerKind::Input;
+            const char* prefix = kind == LayerKind::Input ? "Sensor" :
+                (kind == LayerKind::GRU ? "Memory" : (kind == LayerKind::Output ? "State" : "Deep"));
+            neuron.label = std::string(prefix) + std::to_string(layerNumber) + "." + std::to_string(i + 1);
+            graph.nodes.push_back(std::move(neuron));
+            layer.nodeIdx.push_back((int)graph.nodes.size() - 1);
+        }
+        graph.layers.push_back(std::move(layer));
+    };
+
+    // 12 + 48 + 40 + 32 + 48 + 8 = 188 neurons.
+    addLayer(LayerKind::Input, 12, "Factory sensors", Act::Linear);
+    addLayer(LayerKind::Hidden, 48, "Deep features", Act::ReLU);
+    addLayer(LayerKind::GRU, 40, "Temporal memory A (GRU)", Act::Tanh);
+    InitializeGRU(graph.layers.back(), 48);
+    addLayer(LayerKind::GRU, 32, "Temporal memory B (GRU)", Act::Tanh);
+    InitializeGRU(graph.layers.back(), 40);
+    addLayer(LayerKind::Hidden, 48, "Decision features", Act::ReLU);
+    addLayer(LayerKind::Output, 8, "Machine state", Act::Sigmoid);
+    NG_RebuildEdges(graph);
+    for(Edge& edge : graph.edges) edge.w = RandomRange(-0.35f, 0.35f);
+    for(Layer& layer : graph.layers)
+    {
+        if(layer.kind == LayerKind::Hidden || layer.kind == LayerKind::Output)
+            for(int index : layer.nodeIdx) graph.nodes[index].bias = RandomRange(-0.12f, 0.12f);
+    }
+    graph.layoutLayers(graph.lastCanvasW > 0 ? graph.lastCanvasW : 1200.0f,
+                       graph.lastCanvasH > 0 ? graph.lastCanvasH : 700.0f);
+}
 // Extra helpers: save to JSON + randomize hidden (weights & biases)
 
 
@@ -1060,9 +1186,85 @@ Act NextAct(Act a)
 
 // Training params accessors (declared here, defined later)
 // Also define dataset model earlier for save/load embedding
-struct TrainSample{ std::vector<float> in; std::vector<float> out; std::string desc = "Default"; };
+struct TrainSample
+{
+    std::vector<float> in;
+    std::vector<float> out;
+    std::string desc = "Default";
+    std::vector<std::vector<float>> sequence;
+};
 static std::vector<TrainSample> gDataset;
 static int gLessonsCount = 0;
+
+static void BuildFactorySequenceLessons(NeuralGraph& graph)
+{
+    static const char* sensorNames[12] = {
+        "Vibration", "Temperature", "Pressure", "MotorCurrent", "RPM", "Acoustic",
+        "OilQuality", "Flow", "Torque", "Humidity", "Voltage", "Load"
+    };
+    static const char* stateNames[8] = {
+        "Normal", "BearingWear", "Overheat", "PressureLeak",
+        "RotorImbalance", "LubricationFault", "ElectricalFault", "EmergencyStop"
+    };
+    for(size_t i = 0; i < graph.layers.front().nodeIdx.size() && i < 12; ++i)
+    {
+        Neuron& neuron = graph.nodes[graph.layers.front().nodeIdx[i]];
+        neuron.label = sensorNames[i];
+        neuron.desc = "Normalized time-series sensor value (0..1)";
+    }
+    for(size_t i = 0; i < graph.layers.back().nodeIdx.size() && i < 8; ++i)
+    {
+        Neuron& neuron = graph.nodes[graph.layers.back().nodeIdx[i]];
+        neuron.label = stateNames[i];
+        neuron.desc = "Predicted machine condition after the observed sequence";
+    }
+
+    gDataset.clear();
+    auto lesson = [&](int target, const char* description, int variant)
+    {
+        TrainSample sample;
+        sample.out.assign(8, 0.0f);
+        sample.out[target] = 1.0f;
+        sample.desc = description;
+        for(int timeStep = 0; timeStep < 6; ++timeStep)
+        {
+            const float progress = timeStep / 5.0f;
+            std::vector<float> frame(12, 0.12f + 0.015f * variant);
+            frame[4] = 0.45f;
+            frame[6] = 0.85f;
+            frame[10] = 0.62f;
+            frame[11] = 0.40f;
+            switch(target)
+            {
+                case 0: frame[0] += 0.02f * progress; frame[1] += 0.03f * progress; break;
+                case 1: frame[0] += 0.70f * progress; frame[5] += 0.52f * progress; break;
+                case 2: frame[1] += 0.78f * progress; frame[3] += 0.35f * progress; break;
+                case 3: frame[2] += 0.68f * progress; frame[7] -= 0.10f * timeStep; break;
+                case 4: frame[0] += 0.62f * progress; frame[4] += 0.30f * progress; frame[8] += 0.40f * progress; break;
+                case 5: frame[6] -= 0.13f * timeStep; frame[1] += 0.36f * progress; break;
+                case 6: frame[3] += 0.62f * progress; frame[10] += (timeStep % 2 ? 0.24f : -0.18f); break;
+                case 7: frame[0] += 0.75f * progress; frame[1] += 0.75f * progress; frame[2] += 0.65f * progress; break;
+            }
+            for(float& value : frame) value = std::clamp(value, 0.0f, 1.0f);
+            sample.sequence.push_back(frame);
+        }
+        sample.in = sample.sequence.back();
+        gDataset.push_back(std::move(sample));
+    };
+
+    for(int variant = 0; variant < 4; ++variant)
+    {
+        lesson(0, "Stable operation over six observations", variant);
+        lesson(1, "Vibration and acoustic energy rise: bearing wear", variant);
+        lesson(2, "Temperature and current trend upward: overheating", variant);
+        lesson(3, "Pressure rises while flow collapses: leak/blockage", variant);
+        lesson(4, "Vibration, RPM and torque diverge: rotor imbalance", variant);
+        lesson(5, "Oil quality degrades before heat rises", variant);
+        lesson(6, "Current and voltage become unstable: electrical fault", variant);
+        lesson(7, "Multiple critical trends require emergency stop", variant);
+    }
+    gLessonsCount = (int)gDataset.size();
+}
 static float TrainGetLR();
 static float TrainGetL1();
 static float TrainGetL2();
@@ -1075,7 +1277,7 @@ static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
     std::ofstream out(path);
     if(!out) return;
     out << "{\n";
-    out << "  \"version\": \"turbinos-graph-1\",\n";
+    out << "  \"version\": \"neuro-graph-2\",\n";
 
     // Training parameters snapshot
     out << "  \"learning_rate\": " << TrainGetLR() << ",\n";
@@ -1131,7 +1333,8 @@ static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
     for(size_t li=0; li<g.layers.size(); ++li)
     {
         const auto& L = g.layers[li];
-        const char* kind = (L.kind==LayerKind::Input? "Input" : (L.kind==LayerKind::Output? "Output" : "Hidden"));
+        const char* kind = L.kind==LayerKind::Input ? "Input" :
+            (L.kind==LayerKind::Output ? "Output" : (L.kind==LayerKind::GRU ? "GRU" : "Hidden"));
         out << "    {\n";
         out << "      \"kind\": \"" << kind << "\",\n";
         out << "      \"name\": \"" << L.name << "\",\n";
@@ -1144,7 +1347,25 @@ static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
             int id = (idxN>=0 && idxN < (int)g.nodes.size()) ? g.nodes[idxN].id : -1;
             out << id; if(j+1<L.nodeIdx.size()) out << ", ";
         }
-        out << "]\n";
+        out << "]";
+        if(L.kind == LayerKind::GRU)
+        {
+            auto writeVector = [&](const char* name, const std::vector<float>& values)
+            {
+                out << ",\n      \"" << name << "\": [";
+                for(size_t i = 0; i < values.size(); ++i)
+                {
+                    out << values[i];
+                    if(i + 1 < values.size()) out << ", ";
+                }
+                out << "]";
+            };
+            out << ",\n      \"gru_input_size\": " << L.gruInputSize;
+            writeVector("gru_wz", L.gruWz); writeVector("gru_wr", L.gruWr); writeVector("gru_wh", L.gruWh);
+            writeVector("gru_uz", L.gruUz); writeVector("gru_ur", L.gruUr); writeVector("gru_uh", L.gruUh);
+            writeVector("gru_bz", L.gruBz); writeVector("gru_br", L.gruBr); writeVector("gru_bh", L.gruBh);
+        }
+        out << "\n";
         out << "    }";
         if(li+1<g.layers.size()) out << ",";
         out << "\n";
@@ -1184,6 +1405,19 @@ static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
         { 
             out << s.out[j]; 
             if(j+1<s.out.size()) out << ", "; 
+        }
+        out << "],\n";
+        out << "      \"sequence_steps\": " << s.sequence.size() << ",\n";
+        out << "      \"sequence_flat\": [";
+        bool firstSequenceValue = true;
+        for(const auto& frame : s.sequence)
+        {
+            for(float value : frame)
+            {
+                if(!firstSequenceValue) out << ", ";
+                out << value;
+                firstSequenceValue = false;
+            }
         }
         out << "],\n";
         out << "      \"desc\": \"" << s.desc << "\"\n";
@@ -1316,14 +1550,15 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
         return Act::Linear;
     };
 
-    std::regex rxLayer(R"(\{\s*\"kind\"\s*:\s*\"(Input|Hidden|Output)\"\s*,\s*\"name\"\s*:\s*\"([^\"]*)\"\s*,\s*\"activation\"\s*:\s*\"([^\"]*)\"\s*,\s*\"node_ids\"\s*:\s*\[([^\]]*)\]\s*\})");
+    std::regex rxLayer(R"(\{\s*\"kind\"\s*:\s*\"(Input|Hidden|GRU|Output)\"\s*,\s*\"name\"\s*:\s*\"([^\"]*)\"\s*,\s*\"activation\"\s*:\s*\"([^\"]*)\"\s*,\s*\"node_ids\"\s*:\s*\[([^\]]*)\]([^{}]*)\})");
     auto itL = std::sregex_iterator(layersSec.begin(), layersSec.end(), rxLayer);
     for(; itL!=std::sregex_iterator(); ++itL)
     {
         auto m=*itL;
         Layer L;
         std::string k = m[1].str();
-        L.kind = (k=="Input")? LayerKind::Input : (k=="Output")? LayerKind::Output : LayerKind::Hidden;
+        L.kind = (k=="Input") ? LayerKind::Input : (k=="Output") ? LayerKind::Output :
+            (k=="GRU" ? LayerKind::GRU : LayerKind::Hidden);
         L.name = m[2].str();
         L.act = strToAct(m[3].str());
         RandomizeLayerWind(L);
@@ -1336,6 +1571,34 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
             int id = std::atoi(tok.c_str());
             auto itid = id2idx.find(id);
             if(itid!=id2idx.end()) L.nodeIdx.push_back(itid->second);
+        }
+        if(L.kind == LayerKind::GRU)
+        {
+            const std::string extras = m[5].str();
+            auto parseNamedVector = [&](const char* name)
+            {
+                std::vector<float> values;
+                std::regex expression(std::string("\\\"") + name + "\\\"\\s*:\\s*\\[([^\\]]*)\\]");
+                std::smatch match;
+                if(std::regex_search(extras, match, expression))
+                {
+                    std::stringstream valuesStream(match[1].str());
+                    std::string value;
+                    while(std::getline(valuesStream, value, ','))
+                    {
+                        try { values.push_back(std::stof(value)); } catch(...) {}
+                    }
+                }
+                return values;
+            };
+            std::regex inputSizeExpression(R"(\"gru_input_size\"\s*:\s*(\d+))");
+            std::smatch inputSizeMatch;
+            if(std::regex_search(extras, inputSizeMatch, inputSizeExpression))
+                L.gruInputSize = std::atoi(inputSizeMatch[1].str().c_str());
+            L.gruWz=parseNamedVector("gru_wz"); L.gruWr=parseNamedVector("gru_wr"); L.gruWh=parseNamedVector("gru_wh");
+            L.gruUz=parseNamedVector("gru_uz"); L.gruUr=parseNamedVector("gru_ur"); L.gruUh=parseNamedVector("gru_uh");
+            L.gruBz=parseNamedVector("gru_bz"); L.gruBr=parseNamedVector("gru_br"); L.gruBh=parseNamedVector("gru_bh");
+            L.gruState.assign(L.nodeIdx.size(), 0.0f);
         }
         g.layers.push_back(std::move(L));
     }
@@ -1368,6 +1631,21 @@ static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* ms
             auto m=*itL; TrainSample s; s.in = parseVec(m[1].str()); s.out = parseVec(m[2].str());
             std::regex rxDesc(R"(\"desc\"\s*:\s*\"([^\"]*)\")"); std::smatch md; std::string block = m.str();
             if(std::regex_search(block, md, rxDesc)) s.desc = md[1].str(); else s.desc = "Default";
+            std::regex rxSequence(R"(\"sequence_steps\"\s*:\s*(\d+)[^{}]*\"sequence_flat\"\s*:\s*\[([^\]]*)\])");
+            std::smatch sequenceMatch;
+            if(std::regex_search(block, sequenceMatch, rxSequence))
+            {
+                const int steps = std::atoi(sequenceMatch[1].str().c_str());
+                const std::vector<float> flat = parseVec(sequenceMatch[2].str());
+                const int width = steps > 0 ? (int)flat.size() / steps : 0;
+                if(steps > 0 && width > 0)
+                {
+                    for(int step = 0; step < steps; ++step)
+                    {
+                        s.sequence.emplace_back(flat.begin() + step * width, flat.begin() + (step + 1) * width);
+                    }
+                }
+            }
             gDataset.push_back(std::move(s));
         }
         gLessonsCount = (int)gDataset.size();
@@ -1659,12 +1937,85 @@ static GraphCache BuildCache(const NeuralGraph& g)
     return c;
 }
 
+static float Sigmoid(float value)
+{
+    return 1.0f / (1.0f + std::exp(-std::clamp(value, -30.0f, 30.0f)));
+}
+
+static void ForwardGRULayer(NeuralGraph& graph, size_t layerIndex)
+{
+    Layer& layer = graph.layers[layerIndex];
+    if(layerIndex == 0 || layer.nodeIdx.empty()) return;
+    const Layer& previousLayer = graph.layers[layerIndex - 1];
+    const int inputSize = (int)previousLayer.nodeIdx.size();
+    const int hiddenSize = (int)layer.nodeIdx.size();
+    if(layer.gruInputSize != inputSize || layer.gruWz.size() != (size_t)inputSize * hiddenSize)
+    {
+        InitializeGRU(layer, inputSize);
+    }
+
+    std::vector<float> input(inputSize, 0.0f);
+    for(int j = 0; j < inputSize; ++j) input[j] = graph.nodes[previousLayer.nodeIdx[j]].value;
+    if(layer.gruState.size() != (size_t)hiddenSize) layer.gruState.assign(hiddenSize, 0.0f);
+
+    layer.gruLastInput = input;
+    layer.gruLastPrevious = layer.gruState;
+    layer.gruLastUpdate.assign(hiddenSize, 0.0f);
+    layer.gruLastReset.assign(hiddenSize, 0.0f);
+    layer.gruLastCandidate.assign(hiddenSize, 0.0f);
+
+    for(int i = 0; i < hiddenSize; ++i)
+    {
+        float updateSum = layer.gruBz[i];
+        float resetSum = layer.gruBr[i];
+        for(int j = 0; j < inputSize; ++j)
+        {
+            updateSum += layer.gruWz[(size_t)i * inputSize + j] * input[j];
+            resetSum += layer.gruWr[(size_t)i * inputSize + j] * input[j];
+        }
+        for(int j = 0; j < hiddenSize; ++j)
+        {
+            updateSum += layer.gruUz[(size_t)i * hiddenSize + j] * layer.gruLastPrevious[j];
+            resetSum += layer.gruUr[(size_t)i * hiddenSize + j] * layer.gruLastPrevious[j];
+        }
+        layer.gruLastUpdate[i] = Sigmoid(updateSum);
+        layer.gruLastReset[i] = Sigmoid(resetSum);
+    }
+
+    std::vector<float> nextState(hiddenSize, 0.0f);
+    for(int i = 0; i < hiddenSize; ++i)
+    {
+        float candidateSum = layer.gruBh[i];
+        for(int j = 0; j < inputSize; ++j)
+        {
+            candidateSum += layer.gruWh[(size_t)i * inputSize + j] * input[j];
+        }
+        for(int j = 0; j < hiddenSize; ++j)
+        {
+            candidateSum += layer.gruUh[(size_t)i * hiddenSize + j]
+                * layer.gruLastReset[j] * layer.gruLastPrevious[j];
+        }
+        const float candidate = std::tanh(candidateSum);
+        layer.gruLastCandidate[i] = candidate;
+        const float update = layer.gruLastUpdate[i];
+        nextState[i] = (1.0f - update) * layer.gruLastPrevious[i] + update * candidate;
+        graph.nodes[layer.nodeIdx[i]].value = nextState[i];
+    }
+    layer.gruState = std::move(nextState);
+}
+
 static void ForwardPass(NeuralGraph& g)
 {
     GraphCache cache = BuildCache(g);
-    for(const auto& L : g.layers)
+    for(size_t layerIndex = 0; layerIndex < g.layers.size(); ++layerIndex)
     {
+        auto& L = g.layers[layerIndex];
         if(L.kind == LayerKind::Input) continue;
+        if(L.kind == LayerKind::GRU)
+        {
+            ForwardGRULayer(g, layerIndex);
+            continue;
+        }
         for(int idx : L.nodeIdx)
         {
             Neuron& n = g.nodes[idx];
@@ -1701,6 +2052,79 @@ static void ForwardPass(NeuralGraph& g)
 
 static float sgn(float x){ return (x>0)-(x<0); }
 
+static std::vector<float> TrainLastGRUStep(Layer& layer, const std::vector<float>& hiddenDelta,
+                                           float learningRate, float l1, float l2)
+{
+    const int hiddenSize = (int)layer.nodeIdx.size();
+    const int inputSize = layer.gruInputSize;
+    if((int)hiddenDelta.size() != hiddenSize ||
+       (int)layer.gruLastInput.size() != inputSize ||
+       (int)layer.gruLastPrevious.size() != hiddenSize) return {};
+
+    std::vector<float> candidateDelta(hiddenSize, 0.0f);
+    std::vector<float> updateDelta(hiddenSize, 0.0f);
+    std::vector<float> resetDelta(hiddenSize, 0.0f);
+    for(int i = 0; i < hiddenSize; ++i)
+    {
+        const float update = layer.gruLastUpdate[i];
+        const float candidate = layer.gruLastCandidate[i];
+        candidateDelta[i] = hiddenDelta[i] * update * (1.0f - candidate * candidate);
+        const float dz = hiddenDelta[i] * (candidate - layer.gruLastPrevious[i]);
+        updateDelta[i] = dz * update * (1.0f - update);
+    }
+    for(int j = 0; j < hiddenSize; ++j)
+    {
+        float resetGradient = 0.0f;
+        for(int i = 0; i < hiddenSize; ++i)
+        {
+            resetGradient += candidateDelta[i] * layer.gruUh[(size_t)i * hiddenSize + j]
+                * layer.gruLastPrevious[j];
+        }
+        const float reset = layer.gruLastReset[j];
+        resetDelta[j] = resetGradient * reset * (1.0f - reset);
+    }
+
+    std::vector<float> inputDelta(inputSize, 0.0f);
+    for(int j = 0; j < inputSize; ++j)
+    {
+        for(int i = 0; i < hiddenSize; ++i)
+        {
+            const size_t index = (size_t)i * inputSize + j;
+            inputDelta[j] += layer.gruWz[index] * updateDelta[i]
+                + layer.gruWr[index] * resetDelta[i]
+                + layer.gruWh[index] * candidateDelta[i];
+        }
+    }
+
+    auto applyGradient = [&](float& parameter, float gradient)
+    {
+        gradient += l2 * parameter + l1 * sgn(parameter);
+        parameter -= learningRate * std::clamp(gradient, -1.0f, 1.0f);
+    };
+    for(int i = 0; i < hiddenSize; ++i)
+    {
+        for(int j = 0; j < inputSize; ++j)
+        {
+            const size_t index = (size_t)i * inputSize + j;
+            applyGradient(layer.gruWz[index], updateDelta[i] * layer.gruLastInput[j]);
+            applyGradient(layer.gruWr[index], resetDelta[i] * layer.gruLastInput[j]);
+            applyGradient(layer.gruWh[index], candidateDelta[i] * layer.gruLastInput[j]);
+        }
+        for(int j = 0; j < hiddenSize; ++j)
+        {
+            const size_t index = (size_t)i * hiddenSize + j;
+            applyGradient(layer.gruUz[index], updateDelta[i] * layer.gruLastPrevious[j]);
+            applyGradient(layer.gruUr[index], resetDelta[i] * layer.gruLastPrevious[j]);
+            applyGradient(layer.gruUh[index], candidateDelta[i] * layer.gruLastReset[j]
+                * layer.gruLastPrevious[j]);
+        }
+        layer.gruBz[i] -= learningRate * std::clamp(updateDelta[i], -1.0f, 1.0f);
+        layer.gruBr[i] -= learningRate * std::clamp(resetDelta[i], -1.0f, 1.0f);
+        layer.gruBh[i] -= learningRate * std::clamp(candidateDelta[i], -1.0f, 1.0f);
+    }
+    return inputDelta;
+}
+
 static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
 {
     if(gDataset.empty()) return 0.0f;
@@ -1710,16 +2134,22 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
 
     for(const auto& s : gDataset)
     {
-        size_t pi=0;
-        for(const auto& L : g.layers)
+        ResetGRUState(g);
+        const std::vector<std::vector<float>> fallbackSequence = { s.in };
+        const auto& sequence = s.sequence.empty() ? fallbackSequence : s.sequence;
+        for(const auto& frame : sequence)
         {
-            if(L.kind != LayerKind::Input) continue;
-            for(int idx : L.nodeIdx)
+            size_t pi=0;
+            for(const auto& L : g.layers)
             {
-                g.nodes[idx].value = (pi < s.in.size() ? s.in[pi++] : 0.0f);
+                if(L.kind != LayerKind::Input) continue;
+                for(int idx : L.nodeIdx)
+                {
+                    g.nodes[idx].value = (pi < frame.size() ? frame[pi++] : 0.0f);
+                }
             }
+            ForwardPass(g);
         }
-        ForwardPass(g);
 
         std::vector<int> outNodeIdx;
         Act outAct = Act::Linear;
@@ -1764,14 +2194,47 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
                         if(it2 != delta.end()) sum += e.w * it2->second;
                     }
                 }
-                float d = ActDeriv(act, n.value) * sum;
+                float d = L.kind == LayerKind::GRU ? sum : ActDeriv(act, n.value) * sum;
                 delta[n.id] = d;
+            }
+        }
+
+        // Train gated parameters and pass their input gradient into the dense
+        // feature extractor immediately before the GRU.
+        for(int layerIndex = (int)g.layers.size() - 1; layerIndex >= 0; --layerIndex)
+        {
+            Layer& layer = g.layers[layerIndex];
+            if(layer.kind != LayerKind::GRU) continue;
+            std::vector<float> hiddenDelta;
+            hiddenDelta.reserve(layer.nodeIdx.size());
+            for(int idx : layer.nodeIdx) hiddenDelta.push_back(delta[g.nodes[idx].id]);
+            const std::vector<float> inputDelta = TrainLastGRUStep(layer, hiddenDelta, lr, l1, l2);
+            if(layerIndex > 0)
+            {
+                const Layer& previous = g.layers[layerIndex - 1];
+                for(size_t i = 0; i < previous.nodeIdx.size() && i < inputDelta.size(); ++i)
+                {
+                    Neuron& neuron = g.nodes[previous.nodeIdx[i]];
+                    delta[neuron.id] = previous.kind == LayerKind::GRU ? inputDelta[i]
+                        : inputDelta[i] * ActDeriv(previous.act, neuron.value);
+                }
             }
         }
 
         // Weights update
         for(auto& e : g.edges)
         {
+            bool entersGRU = false;
+            for(const Layer& layer : g.layers)
+            {
+                if(layer.kind != LayerKind::GRU) continue;
+                for(int idx : layer.nodeIdx)
+                {
+                    if(g.nodes[idx].id == e.b) { entersGRU = true; break; }
+                }
+                if(entersGRU) break;
+            }
+            if(entersGRU) continue;
             float srcv = 0.0f;
             auto ita = cache.id2idx.find(e.a);
             if(ita!=cache.id2idx.end()) srcv = g.nodes[ita->second].value;
@@ -1783,7 +2246,7 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
         // Bias update
         for(const auto& L : g.layers)
         {
-            if(L.kind == LayerKind::Input) continue;
+            if(L.kind == LayerKind::Input || L.kind == LayerKind::GRU) continue;
             for(int idx : L.nodeIdx)
             {
                 Neuron& n = g.nodes[idx];
@@ -1882,7 +2345,8 @@ static float CompactNeuronSlotY(int slot, int count, float y0, float y1, float r
     if(count<=1) return (y0+y1)*0.5f;
     // Hidden labels sit below their circles, while output labels sit beside them.
     // Reserve only the space each presentation actually needs.
-    const float labelSpace=kind==LayerKind::Hidden ? ImGui::GetTextLineHeight()+4.0f : 4.0f;
+    const float labelSpace=(kind==LayerKind::Hidden || kind==LayerKind::GRU)
+        ? ImGui::GetTextLineHeight()+4.0f : 4.0f;
     const float safeGap=std::max(16.0f,radius*2.0f+labelSpace);
     const float blockSpan=std::min(y1-y0,safeGap*(float)(count-1));
     const float blockTop=(y0+y1-blockSpan)*0.5f;
@@ -1996,7 +2460,7 @@ void NeuralGraph::layoutLayers(float W, float H)
     for(size_t li=0; li<layers.size(); ++li)
     {
         Layer& L = layers[li];
-        if(collapseHiddenLayers && L.kind == LayerKind::Hidden)
+        if(collapseHiddenLayers && (L.kind == LayerKind::Hidden || L.kind == LayerKind::GRU))
         {
             L.x0 = marginX + colW + 6.f; L.x1 = marginX + colW*2.f - 6.f;
             L.y0 = marginY * 0.5f; L.y1 = H - marginY * 0.3f;
@@ -2224,14 +2688,19 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         for(size_t li=0; li<layers.size(); ++li)
         {
             Layer& L = layers[li];
-            if(collapseHiddenLayers && L.kind == LayerKind::Hidden) continue;
+            if(collapseHiddenLayers && (L.kind == LayerKind::Hidden || L.kind == LayerKind::GRU)) continue;
             ImVec2 a(origin.x + L.x0, origin.y + L.y0);
             ImVec2 b(origin.x + L.x1, origin.y + L.y1);
-            ImU32 colBg = (int(li)==currentLayer) ?
-                ImGui::GetColorU32(ImVec4(0.18f,0.20f,0.28f,0.95f)) :
-                ImGui::GetColorU32(ImVec4(0.12f,0.12f,0.15f,0.75f));
+            const bool isGRULayer = L.kind == LayerKind::GRU;
+            ImU32 colBg = isGRULayer
+                ? ImGui::GetColorU32((int(li)==currentLayer
+                    ? ImVec4(0.24f,0.12f,0.31f,0.97f) : ImVec4(0.16f,0.08f,0.23f,0.88f)))
+                : ((int(li)==currentLayer
+                    ? ImGui::GetColorU32(ImVec4(0.18f,0.20f,0.28f,0.95f))
+                    : ImGui::GetColorU32(ImVec4(0.12f,0.12f,0.15f,0.75f))));
             dl->AddRectFilled(a, b, colBg, 8.0f);
-            dl->AddRect(a, b, ImGui::GetColorU32(ImVec4(0.35f,0.35f,0.40f,0.9f)), 8.0f, 0, 2.0f);
+            dl->AddRect(a, b, ImGui::GetColorU32(isGRULayer
+                ? ImVec4(0.92f,0.32f,1.0f,0.95f) : ImVec4(0.35f,0.35f,0.40f,0.9f)), 8.0f, 0, isGRULayer ? 3.0f : 2.0f);
 
             // --- 3 header lines:
             float lh = ImGui::GetTextLineHeightWithSpacing();
@@ -2248,13 +2717,15 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 
             // 3) activation - clickable
             const char* actName = ActName(L.act);
-            char la[96]; std::snprintf(la, sizeof(la), "Activation: %s  (click)", actName);
+            char la[96];
+            if(isGRULayer) std::snprintf(la, sizeof(la), "Gates: update / reset / candidate");
+            else std::snprintf(la, sizeof(la), "Activation: %s  (click)", actName);
             ImVec2 actPos(hp.x, hp.y + lh*2.0f);
             dl->AddText(actPos, ImGui::GetColorU32(ImVec4(0.9f,0.8f,1,1)), la);
 
             ImVec2 actMin = actPos;
             ImVec2 actMax = ImVec2(b.x - 8.0f, actPos.y + lh);
-            if(ImGui::IsMouseHoveringRect(actMin, actMax) &&
+            if(!isGRULayer && ImGui::IsMouseHoveringRect(actMin, actMax) &&
                ImGui::IsMouseClicked(ImGuiMouseButton_Left))
             {
                 L.act = NextAct(L.act);
@@ -2333,7 +2804,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         if(collapseHiddenLayers)
         {
             int hiddenLayerCount=0, hiddenNeuronCount=0;
-            for(const Layer& layer : layers) if(layer.kind == LayerKind::Hidden)
+            for(const Layer& layer : layers) if(layer.kind == LayerKind::Hidden || layer.kind == LayerKind::GRU)
             {
                 ++hiddenLayerCount; hiddenNeuronCount += (int)layer.nodeIdx.size();
             }
@@ -2343,7 +2814,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             dl->AddCircleFilled(hiddenHub, 29.0f, ImGui::GetColorU32(ImVec4(.10f,.16f,.22f,1.0f)), 40);
             dl->AddCircle(hiddenHub, 29.0f, ImGui::GetColorU32(ImVec4(.25f,.95f,.85f,1.0f)), 40, 3.0f);
             dl->AddCircle(hiddenHub, 18.0f, ImGui::GetColorU32(ImVec4(.25f,.95f,.85f,.8f)), 6, 2.0f);
-            char summary[96]; std::snprintf(summary, sizeof(summary), "%d hidden layers / %d neurons", hiddenLayerCount, hiddenNeuronCount);
+            char summary[96]; std::snprintf(summary, sizeof(summary), "%d deep/GRU layers / %d neurons", hiddenLayerCount, hiddenNeuronCount);
             ImVec2 ss=ImGui::CalcTextSize(summary);
             dl->AddText(ImVec2(hiddenHub.x-ss.x*.5f, hiddenHub.y+38.0f), ImGui::GetColorU32(ImVec4(.75f,.95f,.92f,1)), summary);
         }
@@ -2409,6 +2880,13 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             if(collapseHiddenLayers) continue;
             const Layer* layerA = findLayerForNode(ai);
             const Layer* layerB = findLayerForNode(bi);
+            if(layerA && layerB)
+            {
+                const size_t connectionCount = layerA->nodeIdx.size() * layerB->nodeIdx.size();
+                const size_t visualStride = std::max<size_t>(1, connectionCount / 600);
+                const size_t visualHash = (size_t)A->id * 131u + (size_t)B->id * 17u;
+                if(visualHash % visualStride != 0) continue;
+            }
             ImVec2 p1(origin.x+A->x, origin.y+A->y), p2(origin.x+B->x, origin.y+B->y);
             // (thickness computed below)
             // Map weight [-1,1] -> theme gradient and style
@@ -2418,16 +2896,27 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 float r = mixf(_theme.edgeStart.x, _theme.edgeEnd.x, t);
                 float g = mixf(_theme.edgeStart.y, _theme.edgeEnd.y, t);
                 float b = mixf(_theme.edgeStart.z, _theme.edgeEnd.z, t);
+                const bool gruFlow = (layerA && layerA->kind == LayerKind::GRU) ||
+                                     (layerB && layerB->kind == LayerKind::GRU);
+                if(gruFlow)
+                {
+                    r = 0.80f + 0.18f * t;
+                    g = 0.20f + 0.38f * (1.0f - t);
+                    b = 0.95f;
+                }
                 float a = _theme.edgeAlpha;
-                float thick = _theme.edgeBase + _theme.edgeScale * std::fabs(e.w);
+                float thick = std::clamp(
+                    _theme.edgeBase + _theme.edgeScale * std::fabs(e.w),
+                    0.35f,
+                    1.60f);
 
                 // Pulsing glow
                 float time = (float)ImGui::GetTime();
                 float pulse = 0.5f + 0.5f*std::sin(time*2.0f + 0.15f*(float)(A->id + B->id));
                 ImU32 glowCol = ImGui::GetColorU32(ImVec4(r,g,b, 0.18f * pulse));
-                float w1 = thick * (2.5f + 2.0f*pulse);
-                float w2 = thick * (1.8f + 1.2f*pulse);
-                float w3 = thick * (1.2f + 0.6f*pulse);
+                float w1 = std::min(thick * (2.5f + 2.0f*pulse), 3.00f);
+                float w2 = std::min(thick * (1.8f + 1.2f*pulse), 2.40f);
+                float w3 = std::min(thick * (1.2f + 0.6f*pulse), 1.90f);
 
                 // Use actual panel values or oscillating values based on sine wave settings
                 float currentStrength = gStrengthSineEnabled ? 
@@ -2488,6 +2977,31 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w2);
                 dl->AddBezierCubic(p1, c1, c2, p2, glowCol, w3);
                 dl->AddBezierCubic(p1, c1, c2, p2, ImGui::GetColorU32(ImVec4(r,g,b,a)), thick);
+                if(gruFlow)
+                {
+                    const float flow = std::fmod(time * 0.42f + 0.013f * (A->id + B->id), 1.0f);
+                    const float inv = 1.0f - flow;
+                    ImVec2 particle(
+                        inv*inv*inv*p1.x + 3*inv*inv*flow*c1.x + 3*inv*flow*flow*c2.x + flow*flow*flow*p2.x,
+                        inv*inv*inv*p1.y + 3*inv*inv*flow*c1.y + 3*inv*flow*flow*c2.y + flow*flow*flow*p2.y);
+                    dl->AddCircleFilled(particle, 2.8f, ImGui::GetColorU32(ImVec4(1.0f,0.72f,1.0f,0.95f)), 10);
+                }
+            }
+        }
+
+        // A loop around every GRU column visualizes recurrent flow h(t-1) -> h(t).
+        if(!collapseHiddenLayers)
+        {
+            for(const Layer& layer : layers)
+            {
+                if(layer.kind != LayerKind::GRU) continue;
+                ImVec2 top(origin.x + layer.x0 + 10.0f, origin.y + layer.y0 + 82.0f);
+                ImVec2 bottom(origin.x + layer.x0 + 10.0f, origin.y + layer.y1 - 12.0f);
+                ImU32 recurrentColor = ImGui::GetColorU32(ImVec4(0.95f,0.35f,1.0f,0.82f));
+                dl->AddBezierCubic(top, ImVec2(top.x-38.0f,top.y), ImVec2(bottom.x-38.0f,bottom.y), bottom,
+                                   recurrentColor, 2.2f);
+                dl->AddTriangleFilled(bottom, ImVec2(bottom.x-7.0f,bottom.y-10.0f),
+                                      ImVec2(bottom.x+5.0f,bottom.y-9.0f), recurrentColor);
             }
         }
 
@@ -2548,7 +3062,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             if(collapseHiddenLayers)
             {
                 bool hiddenNode=false;
-                for(const Layer& layer:layers) if(layer.kind==LayerKind::Hidden &&
+                for(const Layer& layer:layers) if((layer.kind==LayerKind::Hidden || layer.kind==LayerKind::GRU) &&
                     std::find(layer.nodeIdx.begin(), layer.nodeIdx.end(), visibleIdx)!=layer.nodeIdx.end()){ hiddenNode=true; break; }
                 if(hiddenNode) continue;
             }
@@ -2557,21 +3071,32 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 
             // compute if this neuron is in the output layer
             bool isOutput = false;
+            bool isGRU = false;
             {
                 int idxN = int(&n - &nodes[0]);
                 for(const auto& L: layers)
                 {
-                    if(L.kind != LayerKind::Output) continue;
-                    for(int j : L.nodeIdx){ if(j==idxN){ isOutput = true; break; } }
-                    if(isOutput) break;
+                    if(L.kind != LayerKind::Output && L.kind != LayerKind::GRU) continue;
+                    for(int j : L.nodeIdx)
+                    {
+                        if(j==idxN)
+                        {
+                            isOutput = L.kind == LayerKind::Output;
+                            isGRU = L.kind == LayerKind::GRU;
+                            break;
+                        }
+                    }
+                    if(isOutput || isGRU) break;
                 }
             }
 
             auto colU = [&](const Vec3& v){ return ImGui::GetColorU32(ImVec4(v.x,v.y,v.z,1.0f)); };
-            ImU32 baseFill = n.isInput ? colU(_theme.nInput) : (isOutput ? colU(_theme.nOutput) : colU(_theme.nHidden));
+            ImU32 baseFill = isGRU ? ImGui::GetColorU32(ImVec4(0.52f,0.12f,0.68f,1.0f))
+                : (n.isInput ? colU(_theme.nInput) : (isOutput ? colU(_theme.nOutput) : colU(_theme.nHidden)));
             ImU32 fill = isSel ? ImGui::GetColorU32(ImVec4(0.2f,0.5f,1.0f,1.0f)) : baseFill;
             ImU32 ring = isSel ? colU(_theme.nRing)
-                               : ImGui::GetColorU32(ImVec4(0.9f,0.9f,0.95f,0.9f));
+                               : ImGui::GetColorU32(isGRU ? ImVec4(1.0f,0.48f,0.95f,1.0f)
+                                                         : ImVec4(0.9f,0.9f,0.95f,0.9f));
 
             // highlight top output: theme highlight
             if(isOutput && n.id == topOutId)
@@ -2579,8 +3104,21 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 fill = colU(_theme.nHighlight);
             }
 
-            dl->AddCircleFilled(p, n.radius, fill, 32);
-            dl->AddCircle(p, n.radius, ring, 32, 2.0f);
+            if(isGRU)
+            {
+                const ImVec2 diamond[4] = {
+                    ImVec2(p.x, p.y-n.radius-2.0f), ImVec2(p.x+n.radius+2.0f, p.y),
+                    ImVec2(p.x, p.y+n.radius+2.0f), ImVec2(p.x-n.radius-2.0f, p.y)
+                };
+                dl->AddConvexPolyFilled(diamond, 4, fill);
+                dl->AddPolyline(diamond, 4, ring, ImDrawFlags_Closed, 2.5f);
+                dl->AddCircle(p, n.radius*0.43f, ImGui::GetColorU32(ImVec4(1.0f,0.72f,1.0f,0.9f)), 16, 1.4f);
+            }
+            else
+            {
+                dl->AddCircleFilled(p, n.radius, fill, 32);
+                dl->AddCircle(p, n.radius, ring, 32, 2.0f);
+            }
 
             // Determine if this neuron is in a hidden layer
             bool isHidden = false;
@@ -2588,7 +3126,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 int idxN = int(&n - &nodes[0]);
                 for(const auto& L: layers)
                 {
-                    if(L.kind != LayerKind::Hidden) continue;
+                    if(L.kind != LayerKind::Hidden && L.kind != LayerKind::GRU) continue;
                     for(int j : L.nodeIdx){ if(j==idxN){ isHidden = true; break; } }
                     if(isHidden) break;
                 }
@@ -2909,6 +3447,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         ImGui::Checkbox("Live inputs (sin)", &liveInputs);
         ImGui::SameLine();
         if(ImGui::Button("Relayout")){ layoutLayers(canvasSize.x, canvasSize.y); }
+        ImGui::SameLine();
+        if(ImGui::Button("Add GRU layer")){ NG_InsertGRUAfterCurrent(*this); }
         ImGui::SameLine();
         if(ImGui::Button("Add neuron (N)")){ NG_AddNeuron(*this, currentLayer); }
         ImGui::SameLine();
@@ -3553,6 +4093,21 @@ void Engine::render()
             }
 
             ImGui::SameLine();
+            if(ImGui::Button("Deep GRU Factory"))
+            {
+                NG_BuildDeepGRUTopology(graph);
+                BuildFactorySequenceLessons(graph);
+                gTrain.lr = 0.001f;
+                gTrain.l1 = 0.0f;
+                gTrain.l2 = 0.0001f;
+                gTrain.totalEpochs = 5000;
+                gTrain.targetMSE = 0.015f;
+                SaveEngineConf("engine.conf");
+                Logf("Deep GRU Factory initialized: 12-48-GRU40-GRU32-48-8, neurons=%zu, sequence lessons=%d",
+                     graph.nodes.size(), gLessonsCount);
+            }
+
+            ImGui::SameLine();
             if(ImGui::Button("Help (H)")) gShowHelp = !gShowHelp;
             // Row 2: Start, Train To Target, Save Config
             if(ImGui::Button("Start"))
@@ -3629,11 +4184,50 @@ void Engine::render()
         if(ImGui::Button("Add Lesson (M)"))
         {
             std::vector<float> in,out; CollectIO(graph,in,out);
-            gDataset.push_back({in,out});
+            TrainSample sample;
+            sample.in = std::move(in);
+            sample.out = std::move(out);
+            gDataset.push_back(std::move(sample));
             gLessonsCount=(int)gDataset.size();
             SaveEngineConf("engine.conf");
             Logf("Lesson added. Total=%d", gLessonsCount);
         }
+
+        static std::vector<std::vector<float>> sequenceDraft;
+        ImGui::SameLine();
+        if(ImGui::Button("Add sequence frame"))
+        {
+            std::vector<float> in, out;
+            CollectIO(graph, in, out);
+            sequenceDraft.push_back(std::move(in));
+            Logf("Sequence frame added (%zu).", sequenceDraft.size());
+        }
+        ImGui::SameLine();
+        if(ImGui::Button("Save sequence lesson"))
+        {
+            if(sequenceDraft.empty())
+            {
+                Logf("Add at least one sequence frame first.");
+            }
+            else
+            {
+                std::vector<float> in, out;
+                CollectIO(graph, in, out);
+                TrainSample sample;
+                sample.sequence = sequenceDraft;
+                sample.in = sequenceDraft.back();
+                sample.out = std::move(out);
+                sample.desc = "Custom sequence";
+                gDataset.push_back(std::move(sample));
+                sequenceDraft.clear();
+                gLessonsCount = (int)gDataset.size();
+                Logf("Sequence lesson saved. Total=%d", gLessonsCount);
+            }
+        }
+        ImGui::SameLine();
+        if(ImGui::Button("Clear sequence")) sequenceDraft.clear();
+        ImGui::TextDisabled("Sequence draft: %zu frames (set inputs, add frame, repeat, then set outputs and save)",
+                            sequenceDraft.size());
 
         ImGui::SameLine();
         if(ImGui::Button("Randomize Hidden (X)"))
@@ -3690,9 +4284,10 @@ void Engine::render()
         }
 
         int pendingDelete = -1;
-        if(ImGui::BeginTable("lessons_table", 5, ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_Resizable|ImGuiTableFlags_SizingStretchSame))
+        if(ImGui::BeginTable("lessons_table", 6, ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_Resizable|ImGuiTableFlags_SizingStretchSame))
         {
             ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 40.0f);
+            ImGui::TableSetupColumn("steps", ImGuiTableColumnFlags_WidthFixed, 55.0f);
             ImGui::TableSetupColumn("in");
             ImGui::TableSetupColumn("out");
             ImGui::TableSetupColumn("desc", ImGuiTableColumnFlags_WidthStretch);
@@ -3705,6 +4300,8 @@ void Engine::render()
                 ImGui::TableSetColumnIndex(0); 
                 ImGui::Text("%d", i);
                 auto& s = gDataset[i];
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%zu", s.sequence.empty() ? size_t(1) : s.sequence.size());
                 auto vecToStr=[&](const std::vector<float>& v)
                 { 
                     std::string r="["; 
@@ -3719,24 +4316,24 @@ void Engine::render()
                     return r; 
                 };
 
-                ImGui::TableSetColumnIndex(1); 
+                ImGui::TableSetColumnIndex(2);
                 { 
                     std::string ins = vecToStr(s.in); 
                     ImGui::TextUnformatted(ins.c_str()); 
                 }
 
-                ImGui::TableSetColumnIndex(2); 
+                ImGui::TableSetColumnIndex(3);
                 {
                     std::string outs= vecToStr(s.out); 
                     ImGui::TextUnformatted(outs.c_str()); 
                 }
 
-                ImGui::TableSetColumnIndex(3);
+                ImGui::TableSetColumnIndex(4);
                 ImGui::PushID(i);
                 ImGui::SetNextItemWidth(-1);
                 ImGui::InputText("##desc", lessonDescBuf[i].data(), lessonDescBuf[i].size());
                 ImGui::PopID();
-                ImGui::TableSetColumnIndex(4);
+                ImGui::TableSetColumnIndex(5);
                 ImGui::PushID(i+100000);
                 if(ImGui::Button("Save"))
                 {
@@ -4441,7 +5038,19 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
 
     // 'S' handled below with save dialog (opens Save window)
     if(key==GLFW_KEY_X){ NG_RandomizeHidden(graph, 1.0f, 0.5f); Logf("Hidden layers randomized."); return; }
-    if(key==GLFW_KEY_M){ std::vector<float> in,out; CollectIO(graph,in,out); gDataset.push_back({in,out}); gLessonsCount=(int)gDataset.size(); SaveEngineConf("engine.conf"); Logf("Lesson added. Total=%d", gLessonsCount); return; }
+    if(key==GLFW_KEY_M)
+    {
+        std::vector<float> in,out;
+        CollectIO(graph,in,out);
+        TrainSample sample;
+        sample.in = std::move(in);
+        sample.out = std::move(out);
+        gDataset.push_back(std::move(sample));
+        gLessonsCount=(int)gDataset.size();
+        SaveEngineConf("engine.conf");
+        Logf("Lesson added. Total=%d", gLessonsCount);
+        return;
+    }
     if(key==GLFW_KEY_B)
     {
         gShowTrainingWindow = true;

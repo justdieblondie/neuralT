@@ -146,7 +146,7 @@ struct TurbineModel
 // ─────────────────────────────────────────
 // Neural network — data and graph
 // ─────────────────────────────────────────
-enum class LayerKind { Input, Hidden, Output };
+enum class LayerKind { Input, Hidden, GRU, Output };
 enum class Act { Linear, ReLU, Sigmoid, Tanh };
 namespace Activation
 {
@@ -170,6 +170,16 @@ struct Layer
     float windStrengthScale=1.0f;
     float windSpeedScale=1.0f;
     float windJitterScale=1.0f;
+
+    // GRU layers keep their gated recurrent parameters independently from
+    // the editor's ordinary visual edges. Matrices are stored row-major.
+    int gruInputSize=0;
+    std::vector<float> gruWz, gruWr, gruWh;
+    std::vector<float> gruUz, gruUr, gruUh;
+    std::vector<float> gruBz, gruBr, gruBh;
+    std::vector<float> gruState;
+    std::vector<float> gruLastInput, gruLastPrevious;
+    std::vector<float> gruLastUpdate, gruLastReset, gruLastCandidate;
 };
 
 struct Neuron
