@@ -8,6 +8,7 @@ NeuralT is a neural-network editor with an ImGui-based graphical interface.
 - GLFW;
 - GLEW;
 - OpenGL;
+- nlohmann/json headers (`nlohmann-json3-dev` on Debian/Ubuntu);
 - X11 system libraries: `dl`, `pthread`, `Xrandr`, `Xi`, and `m`.
 
 The project also requires an `imgui/` directory containing ImGui sources and the GLFW/OpenGL3 backends.

@@ -33,8 +33,18 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
-#include <regex>
+#include <nlohmann/json.hpp>
+#include <type_traits>
+#include <optional>
+#include <functional>
+#include <map>
+#include <set>
+#include <stdexcept>
+#include <system_error>
+#include <cerrno>
+#include <unistd.h>
 #include <unordered_map>
+#include <limits>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Forward declarations
@@ -46,6 +56,7 @@ extern Engine* gEngine;
 // Small globals for UI
 // ─────────────────────────────────────────────────────────────────────────────
 #ifdef USE_IMGUI
+static bool IsTrainingActive();
 static bool gShowHelp = false;
 static std::string gToastMsg; 
 static double gToastT=0.0; 
@@ -53,13 +64,57 @@ static bool gShowTrainingWindow=false;
 static bool gEditingLabel = false; // block shortcuts while editing labels
 // Visibility toggles for windows/panels (start hidden)
 static bool gShowEditorWindow = true;      // F1
-static bool gShowNeuralXPanel = false;      // F2 (mirrors cfg.showUI)
+static bool gShowNeuralTPanel = false;      // F2 (mirrors cfg.showUI)
 static bool gShowLogWindow    = false;      // F3
-static bool gShowParamsWindow = false;      // F4
+static bool gShowParamsWindow = false;
+static float gF1WindowWidth=850.0f, gF1WindowHeight=520.0f;
+static ImVec2 gF1WindowPos(10.0f,10.0f);
+static bool gSizeF4FromF1=false;      // F4
 static bool gShowLoadMenu     = false;      // 'O' key or button
 static bool gForceRelayoutWindows = false;  // 'Home' key re-arrangement
 static bool gShowSaveMenu     = false;      // 'S' key or button
 static char gSaveName[256]    = "saved/network.json";
+
+// Lesson targets never replace network predictions.
+static std::unordered_map<int, float> gLessonTargets;
+static unsigned int gLessonTargetRevision = 0;
+static bool gPauseLiveInference = false;
+static double gInferenceAccumulator = 0.0;
+static bool gInferenceNeedsReset = false;
+static constexpr double kInferenceStepSeconds = 1.0 / 30.0;
+
+static void ClearLessonTargets()
+{
+    gLessonTargets.clear();
+    ++gLessonTargetRevision;
+}
+
+struct TrainSample
+{
+    std::vector<float> in;
+    std::vector<float> out;
+    std::string desc = "Default";
+    std::vector<std::vector<float>> sequence;
+};
+static std::vector<TrainSample> gDataset;
+static int gLessonsCount = 0;
+
+static std::vector<std::vector<float>> gSequenceDraft;
+static unsigned int gDatasetRevision = 0;
+static int seqSelectedFrame = -1;
+static bool seqPlaying = false;
+static int seqPlaybackFrame = -1;
+static double seqPlaybackAccumulator = 0.0;
+static float seqPlaybackHz = 2.0f;
+struct PendingTopologyChange
+{
+    NeuralGraph graph;
+    std::vector<TrainSample> replacementLessons;
+    std::function<void()> afterCommit;
+};
+static std::optional<PendingTopologyChange> gPendingTopology;
+static bool gOpenTopologyPopup=false;
+static void TopologyCommitted();
 
 // New: Log window
 static std::vector<std::string> gLogLines;
@@ -132,6 +187,45 @@ static void InitializeGRU(Layer& layer, int inputSize)
     layer.gruBr.assign(hiddenSize, 0.0f);
     layer.gruBh.assign(hiddenSize, 0.0f);
     layer.gruState.assign(hiddenSize, 0.0f);
+}
+
+// Validate every parameter before indexing a GRU matrix or bias vector.
+static bool ValidateGRUParameters(const NeuralGraph& graph, std::string* error)
+{
+    for(size_t li = 0; li < graph.layers.size(); ++li)
+    {
+        const Layer& layer = graph.layers[li];
+        if(layer.kind != LayerKind::GRU) continue;
+        const size_t hidden = layer.nodeIdx.size();
+        const size_t input = li > 0 ? graph.layers[li - 1].nodeIdx.size() : 0;
+        auto fail = [&](const std::string& detail)
+        {
+            if(error) *error = "GRU layer " + std::to_string(li + 1) + " (" + layer.name + "): " + detail;
+            return false;
+        };
+        if(li == 0) return fail("requires a preceding input layer");
+        if(layer.gruInputSize < 0 || (size_t)layer.gruInputSize != input)
+            return fail("gru_input_size does not match the preceding layer");
+        auto check = [&](const std::vector<float>& values, size_t expected, const char* name)
+        {
+            if(values.size() != expected)
+                return fail(std::string(name) + " has " + std::to_string(values.size()) +
+                            " values; expected " + std::to_string(expected));
+            for(float value : values)
+                if(!std::isfinite(value)) return fail(std::string(name) + " contains a non-finite value");
+            return true;
+        };
+        if(!check(layer.gruWz, hidden * input, "gru_wz") ||
+           !check(layer.gruWr, hidden * input, "gru_wr") ||
+           !check(layer.gruWh, hidden * input, "gru_wh") ||
+           !check(layer.gruUz, hidden * hidden, "gru_uz") ||
+           !check(layer.gruUr, hidden * hidden, "gru_ur") ||
+           !check(layer.gruUh, hidden * hidden, "gru_uh") ||
+           !check(layer.gruBz, hidden, "gru_bz") ||
+           !check(layer.gruBr, hidden, "gru_br") ||
+           !check(layer.gruBh, hidden, "gru_bh")) return false;
+    }
+    return true;
 }
 
 static void ResetGRUState(NeuralGraph& graph)
@@ -1105,182 +1199,357 @@ void Renderer::destroy()
 // NeuralGraph helpers
 // ─────────────────────────────────────────────────────────────────────────────
 #ifdef USE_IMGUI
-static void NG_RebuildEdges(NeuralGraph& g)
+static bool NG_ValidateTopology(const NeuralGraph& graph, std::string& error)
 {
-    g.edges.clear();
-    auto nid = [&](int idx){ return g.nodes[idx].id; };
-    for(size_t L=0; L+1<g.layers.size(); ++L)
+    auto fail=[&](const std::string& text){ error=text; return false; };
+    if(graph.layers.size()<2 || graph.layers.front().kind!=LayerKind::Input ||
+       graph.layers.back().kind!=LayerKind::Output) return fail("Input and Output layers are required.");
+    std::vector<int> membership(graph.nodes.size(),-1);
+    std::unordered_map<int,int> idLayer;
+    for(size_t li=0;li<graph.layers.size();++li)
     {
-        for(int a : g.layers[L].nodeIdx)
+        const auto& layer=graph.layers[li];
+        if(layer.nodeIdx.empty() && li>0 && li+1<graph.layers.size())
+            return fail("A hidden or GRU layer cannot be empty; delete the whole layer instead.");
+        if(li>0 && li+1<graph.layers.size() && layer.kind!=LayerKind::Hidden && layer.kind!=LayerKind::GRU)
+            return fail("Internal layers must be Hidden or GRU.");
+        for(int index:layer.nodeIdx)
         {
-            for(int b : g.layers[L+1].nodeIdx)
-            {
-                g.edges.push_back({ nid(a), nid(b), 0.5f });
-            }
+            if(index<0 || (size_t)index>=graph.nodes.size()) return fail("Invalid neuron index.");
+            const auto& node=graph.nodes[index];
+            if(membership[index]>=0 || !idLayer.emplace(node.id,(int)li).second)
+                return fail("Duplicate neuron ID or layer membership.");
+            membership[index]=(int)li;
+            if(node.isInput!=(layer.kind==LayerKind::Input) || !std::isfinite(node.bias))
+                return fail("Invalid neuron type or bias.");
         }
     }
+    for(int li:membership) if(li<0) return fail("Neuron without a layer.");
+    std::set<std::pair<int,int>> pairs;
+    for(const auto& edge:graph.edges)
+    {
+        auto a=idLayer.find(edge.a),b=idLayer.find(edge.b);
+        if(a==idLayer.end() || b==idLayer.end() || a->second>=b->second || !std::isfinite(edge.w))
+            return fail("Invalid forward connection.");
+        if(!pairs.emplace(edge.a,edge.b).second) return fail("Duplicate connection.");
+        if(graph.layers[b->second].kind==LayerKind::GRU && a->second+1!=b->second)
+            return fail("GRU inputs must come from the preceding layer.");
+    }
+    return ValidateGRUParameters(graph,&error);
 }
 
-static int NG_NextId(const NeuralGraph& g)
+static void NG_ReportTopologyError(const std::string& error)
 {
-    int mx = -1;
-    for(const auto& n : g.nodes)
-    {
-        mx = std::max(mx, n.id);
-    }
-    return mx + 1;
-}
-static void NG_AddNeuron(NeuralGraph& g, int layerIdx)
-{
-    if(layerIdx < 0 || layerIdx >= (int)g.layers.size()) return;
-    auto& L = g.layers[layerIdx];
-    Neuron n;
-    n.id = NG_NextId(g);
-    n.isInput = (L.kind == LayerKind::Input);
-    n.label = (L.kind==LayerKind::Input? "In" :
-               L.kind==LayerKind::Output? "Out" : "H") + std::to_string((int)L.nodeIdx.size()+1);
-    g.nodes.push_back(n);
-    g.layers[layerIdx].nodeIdx.push_back((int)g.nodes.size()-1);
-    if(L.kind == LayerKind::GRU)
-    {
-        const int inputSize = layerIdx > 0 ? (int)g.layers[layerIdx - 1].nodeIdx.size() : 0;
-        InitializeGRU(L, inputSize);
-    }
-    g.layoutLayers(g.lastCanvasW>0?g.lastCanvasW:800.0f, g.lastCanvasH>0?g.lastCanvasH:500.0f);
-    NG_RebuildEdges(g);
+    gToastMsg="Topology change rejected: "+error;
+    gToastT=glfwGetTime();
+    Logf("%s",gToastMsg.c_str());
 }
 
-static void NG_RemoveLastNeuron(NeuralGraph& g, int layerIdx)
+static bool NG_CanEdit(const NeuralGraph& graph)
 {
-    if(layerIdx < 0 || layerIdx >= (int)g.layers.size()) return;
-    auto& L = g.layers[layerIdx];
-    if(L.nodeIdx.empty()) return;
-    int absIdx = L.nodeIdx.back();
-    int removedId = g.nodes[absIdx].id;
-    L.nodeIdx.pop_back();
-
-    // Erase neuron from nodes[] and fix indices in all layers
-    g.nodes.erase(g.nodes.begin() + absIdx);
-    for(auto& Lay : g.layers)
-    {
-        for(int& idx : Lay.nodeIdx)
-        {
-            if(idx > absIdx) idx -= 1;
-        }
-    }
-
-    // Clear selection if we removed selected
-    if(g.selected == removedId) g.selected = -1;
-
-    if(L.kind == LayerKind::GRU)
-    {
-        const int inputSize = layerIdx > 0 ? (int)g.layers[layerIdx - 1].nodeIdx.size() : 0;
-        InitializeGRU(L, inputSize);
-    }
-
-    // Rebuild full connections
-    NG_RebuildEdges(g);
-    g.layoutLayers(g.lastCanvasW>0?g.lastCanvasW:800.0f, g.lastCanvasH>0?g.lastCanvasH:500.0f);
-}
-
-// Insert a new hidden layer to the right of the current hidden layer
-static void NG_InsertHiddenAfterCurrent(NeuralGraph& g)
-{
-    int li = g.currentLayer;
-    if(li < 0 || li >= (int)g.layers.size()) return;
-    if(g.layers[li].kind != LayerKind::Hidden) return;
-    int insertPos = li + 1;
-    Layer L; L.kind = LayerKind::Hidden; L.act = Act::ReLU;
-    RandomizeLayerWind(L);
-    int hiddenCount = 0; for(const auto& Ly : g.layers) if(Ly.kind==LayerKind::Hidden) hiddenCount++;
-    L.name = std::string("HL ") + std::to_string(hiddenCount + 1);
-    L.nodeIdx.clear(); L.x0=L.y0=L.x1=L.y1=0.0f;
-
-    if(insertPos < 0) 
-    {
-        insertPos = 0;
-    }
-
-    if(insertPos > (int)g.layers.size()) 
-    {
-        insertPos = (int)g.layers.size();
-    }
-
-    g.layers.insert(g.layers.begin() + insertPos, L);
-    g.currentLayer = insertPos;
-    // Add a single neuron to keep connectivity meaningful and rebuild edges/layout
-    NG_AddNeuron(g, g.currentLayer);
-}
-
-static void NG_InsertGRUAfterCurrent(NeuralGraph& graph)
-{
-    const int current = graph.currentLayer;
-    if(current < 0 || current >= (int)graph.layers.size()) return;
-    if(graph.layers[current].kind == LayerKind::Output) return;
-    const int insertPosition = current + 1;
-    Layer layer;
-    layer.kind = LayerKind::GRU;
-    layer.act = Act::Tanh;
-    layer.name = "GRU " + std::to_string(insertPosition);
-    RandomizeLayerWind(layer);
-    int nextId = NG_NextId(graph);
-    for(int unit = 0; unit < 8; ++unit)
-    {
-        Neuron neuron;
-        neuron.id = nextId++;
-        neuron.label = "Memory" + std::to_string(unit + 1);
-        graph.nodes.push_back(std::move(neuron));
-        layer.nodeIdx.push_back((int)graph.nodes.size() - 1);
-    }
-    const int inputSize = (int)graph.layers[current].nodeIdx.size();
-    InitializeGRU(layer, inputSize);
-    graph.layers.insert(graph.layers.begin() + insertPosition, std::move(layer));
-    graph.currentLayer = insertPosition;
-    NG_RebuildEdges(graph);
-    graph.layoutLayers(graph.lastCanvasW > 0 ? graph.lastCanvasW : 800.0f,
-                       graph.lastCanvasH > 0 ? graph.lastCanvasH : 500.0f);
-}
-
-static bool NG_RemoveCurrentHiddenLayer(NeuralGraph& g)
-{
-    const int layerIdx=g.currentLayer;
-    if(layerIdx<0 || layerIdx>=(int)g.layers.size()) return false;
-    const LayerKind layerKind = g.layers[layerIdx].kind;
-    if(layerKind != LayerKind::Hidden && layerKind != LayerKind::GRU)
-    {
-        Logf("Only hidden or GRU layers can be deleted.");
-        return false;
-    }
-
-    std::vector<int> removedIndices=g.layers[layerIdx].nodeIdx;
-    std::vector<int> removedIds;
-    removedIds.reserve(removedIndices.size());
-    for(int idx:removedIndices)
-        if(idx>=0 && idx<(int)g.nodes.size()) removedIds.push_back(g.nodes[idx].id);
-
-    g.layers.erase(g.layers.begin()+layerIdx);
-    std::sort(removedIndices.begin(),removedIndices.end(),std::greater<int>());
-    for(int removedIdx:removedIndices)
-    {
-        if(removedIdx<0 || removedIdx>=(int)g.nodes.size()) continue;
-        g.nodes.erase(g.nodes.begin()+removedIdx);
-        for(Layer& layer:g.layers)
-            for(int& idx:layer.nodeIdx) if(idx>removedIdx) --idx;
-    }
-
-    if(std::find(removedIds.begin(),removedIds.end(),g.selected)!=removedIds.end()) g.selected=-1;
-    g.currentLayer=std::clamp(layerIdx-1,0,std::max(0,(int)g.layers.size()-1));
-    NG_RebuildEdges(g);
-    g.layoutLayers(g.lastCanvasW>0?g.lastCanvasW:800.0f,
-                   g.lastCanvasH>0?g.lastCanvasH:500.0f);
-    Logf("%s layer deleted; neighbouring layers reconnected.",
-         layerKind == LayerKind::GRU ? "GRU" : "Hidden");
+    if(IsTrainingActive() || gPendingTopology)
+    { Logf("Finish training or the pending topology dialog first."); return false; }
+    std::string error;
+    if(!NG_ValidateTopology(graph,error)) { NG_ReportTopologyError(error); return false; }
     return true;
+}
+
+// Initial construction only. Editing uses NG_PreserveTopologyParameters below.
+static void NG_RebuildEdges(NeuralGraph& graph)
+{
+    graph.edges.clear();
+    for(size_t li=0;li+1<graph.layers.size();++li)
+    {
+        const float scale=std::sqrt(6.0f / std::max<size_t>(1,graph.layers[li].nodeIdx.size()+graph.layers[li+1].nodeIdx.size()));
+        for(int a:graph.layers[li].nodeIdx) for(int b:graph.layers[li+1].nodeIdx)
+            graph.edges.push_back({graph.nodes[a].id,graph.nodes[b].id,RandomRange(-scale,scale)});
+    }
+    ResetGRUState(graph);
+}
+
+static int NG_NextId(const NeuralGraph& graph)
+{
+    int maximum=-1;
+    for(const auto& node:graph.nodes) maximum=std::max(maximum,node.id);
+    if(maximum==std::numeric_limits<int>::max()) throw std::runtime_error("No free neuron ID remains.");
+    return maximum+1;
+}
+
+static std::unordered_map<int,int> NG_LayerById(const NeuralGraph& graph)
+{
+    std::unordered_map<int,int> result;
+    for(size_t li=0;li<graph.layers.size();++li)
+        for(int index:graph.layers[li].nodeIdx) result.emplace(graph.nodes[index].id,(int)li);
+    return result;
+}
+
+static std::unordered_map<int,size_t> NG_Slots(const NeuralGraph& graph,const Layer& layer)
+{
+    std::unordered_map<int,size_t> result;
+    for(size_t i=0;i<layer.nodeIdx.size();++i) result.emplace(graph.nodes[layer.nodeIdx[i]].id,i);
+    return result;
+}
+
+static void NG_PreserveTopologyParameters(const NeuralGraph& before,NeuralGraph& after)
+{
+    const auto oldLayers=NG_LayerById(before),newLayers=NG_LayerById(after);
+    std::map<std::pair<int,int>,float> weights;
+    for(const auto& edge:before.edges) weights.emplace(std::make_pair(edge.a,edge.b),edge.w);
+    after.edges.clear();
+    for(size_t li=0;li+1<after.layers.size();++li)
+    {
+        const auto& source=after.layers[li]; const auto& target=after.layers[li+1];
+        const float scale=std::sqrt(6.0f / std::max<size_t>(1,source.nodeIdx.size()+target.nodeIdx.size()));
+        for(int ai:source.nodeIdx) for(int bi:target.nodeIdx)
+        {
+            const int a=after.nodes[ai].id,b=after.nodes[bi].id;
+            auto weight=weights.find({a,b});
+            auto oldA=oldLayers.find(a),oldB=oldLayers.find(b);
+            if(weight!=weights.end()) after.edges.push_back({a,b,weight->second});
+            // Keep intentionally absent connections in unchanged adjacent layers.
+            else if(oldA==oldLayers.end() || oldB==oldLayers.end() || oldA->second+1!=oldB->second)
+                after.edges.push_back({a,b,RandomRange(-scale,scale)});
+        }
+    }
+    // Retain explicit skip connections; an inserted layer replaces former adjacent edges.
+    for(const auto& edge:before.edges)
+    {
+        auto a=newLayers.find(edge.a),b=newLayers.find(edge.b);
+        if(a!=newLayers.end() && b!=newLayers.end() && a->second+1<b->second &&
+           oldLayers.at(edge.a)+1<oldLayers.at(edge.b) && after.layers[b->second].kind!=LayerKind::GRU)
+            after.edges.push_back(edge);
+    }
+    for(size_t li=1;li<after.layers.size();++li)
+    {
+        Layer& layer=after.layers[li];
+        if(layer.kind!=LayerKind::GRU) continue;
+        const Layer& input=after.layers[li-1];
+        const size_t H=layer.nodeIdx.size(),I=input.nodeIdx.size();
+        int oldIndex=-1;
+        for(int index:layer.nodeIdx)
+        {
+            auto found=oldLayers.find(after.nodes[index].id);
+            if(found!=oldLayers.end() && before.layers[found->second].kind==LayerKind::GRU)
+            { oldIndex=found->second; break; }
+        }
+        if(oldIndex<0) { InitializeGRU(layer,(int)I); continue; }
+        const Layer& old=before.layers[oldIndex];
+        const auto oldUnits=NG_Slots(before,old),oldInputs=NG_Slots(before,before.layers[oldIndex-1]);
+        const float inputScale=std::sqrt(6.0f/std::max<size_t>(1,I+H));
+        const float recurrentScale=std::sqrt(3.0f/std::max<size_t>(1,H));
+        auto resizeMatrix=[&](const std::vector<float>& values,bool recurrent)
+        {
+            const auto& columns=recurrent ? layer : input;
+            const auto& oldColumns=recurrent ? oldUnits : oldInputs;
+            const size_t width=columns.nodeIdx.size(),oldWidth=recurrent ? old.nodeIdx.size() : (size_t)old.gruInputSize;
+            std::vector<float> result(H*width);
+            for(size_t i=0;i<H;++i) for(size_t j=0;j<width;++j)
+            {
+                auto row=oldUnits.find(after.nodes[layer.nodeIdx[i]].id);
+                auto column=oldColumns.find(after.nodes[columns.nodeIdx[j]].id);
+                result[i*width+j]=row!=oldUnits.end() && column!=oldColumns.end()
+                    ? values[row->second*oldWidth+column->second]
+                    : RandomRange(-(recurrent ? recurrentScale : inputScale),recurrent ? recurrentScale : inputScale);
+            }
+            return result;
+        };
+        auto resizeBias=[&](const std::vector<float>& values)
+        {
+            std::vector<float> result(H,0.0f);
+            for(size_t i=0;i<H;++i)
+            {
+                auto row=oldUnits.find(after.nodes[layer.nodeIdx[i]].id);
+                if(row!=oldUnits.end()) result[i]=values[row->second];
+            }
+            return result;
+        };
+        layer.gruWz=resizeMatrix(old.gruWz,false); layer.gruWr=resizeMatrix(old.gruWr,false); layer.gruWh=resizeMatrix(old.gruWh,false);
+        layer.gruUz=resizeMatrix(old.gruUz,true); layer.gruUr=resizeMatrix(old.gruUr,true); layer.gruUh=resizeMatrix(old.gruUh,true);
+        layer.gruBz=resizeBias(old.gruBz); layer.gruBr=resizeBias(old.gruBr); layer.gruBh=resizeBias(old.gruBh);
+        layer.gruInputSize=(int)I;
+    }
+    ResetGRUState(after);
+    for(auto& layer:after.layers)
+    {
+        layer.gruLastInput.clear(); layer.gruLastPrevious.clear(); layer.gruLastUpdate.clear();
+        layer.gruLastReset.clear(); layer.gruLastCandidate.clear();
+    }
+    for(auto& node:after.nodes) if(!node.isInput) node.value=0;
+}
+
+// Lessons describe the external input/output interface, not the hidden topology.
+static bool NG_SameLessonInterface(const NeuralGraph& before, const NeuralGraph& after)
+{
+    if(before.layers.size()<2 || after.layers.size()<2) return false;
+    return before.layers.front().nodeIdx.size()==after.layers.front().nodeIdx.size() &&
+           before.layers.back().nodeIdx.size()==after.layers.back().nodeIdx.size();
+}
+
+static bool NG_KeepExistingLessons(const NeuralGraph& before, const PendingTopologyChange& change)
+{
+    return change.replacementLessons.empty() && NG_SameLessonInterface(before,change.graph);
+}
+
+static void NG_CommitTopology(NeuralGraph& destination,PendingTopologyChange change)
+{
+    const bool keepLessons=NG_KeepExistingLessons(destination,change);
+    destination=std::move(change.graph);
+    if(!keepLessons)
+    {
+        gDataset=std::move(change.replacementLessons);
+        gSequenceDraft.clear();
+        ++gDatasetRevision;
+    }
+    seqPlaying=false;
+    seqPlaybackFrame=-1;
+    gLessonsCount=(int)gDataset.size();
+    ClearLessonTargets();
+    gInferenceAccumulator=0; gInferenceNeedsReset=true;
+    gLiveFeedCurrentInput=0;
+    TopologyCommitted();
+    if(change.afterCommit) change.afterCommit();
+    Logf(keepLessons ? "Topology changed; lessons and sequence draft preserved. Retrain the network."
+                     : "Topology changed; incompatible lessons replaced or cleared. Retrain the network.");
+}
+
+static bool NG_RequestTopology(NeuralGraph& destination,NeuralGraph candidate,
+                               std::vector<TrainSample> replacementLessons={},std::function<void()> afterCommit={})
+{
+    if(IsTrainingActive() || gPendingTopology) return false;
+    std::string error;
+    if(!NG_ValidateTopology(candidate,error)) { NG_ReportTopologyError(error); return false; }
+    candidate.selected=-1; candidate.currentLayer=std::clamp(candidate.currentLayer,0,(int)candidate.layers.size()-1);
+    std::memset(candidate.editBuf,0,sizeof(candidate.editBuf));
+    candidate.layoutLayers(destination.lastCanvasW>0 ? destination.lastCanvasW : 800.0f,
+                           destination.lastCanvasH>0 ? destination.lastCanvasH : 500.0f);
+    PendingTopologyChange change{std::move(candidate),std::move(replacementLessons),std::move(afterCommit)};
+    if(!gDataset.empty() || !gSequenceDraft.empty())
+    {
+        gPendingTopology=std::move(change);
+        gOpenTopologyPopup=true;
+    }
+    else NG_CommitTopology(destination,std::move(change));
+    return true;
+}
+
+static void NG_AppendNeuron(NeuralGraph& graph,int layerIndex)
+{
+    Layer& layer=graph.layers[layerIndex];
+    Neuron neuron;
+    neuron.id=NG_NextId(graph); neuron.isInput=layer.kind==LayerKind::Input;
+    neuron.label=(neuron.isInput ? "In" : layer.kind==LayerKind::Output ? "Out" : "H")+std::to_string(layer.nodeIdx.size()+1);
+    graph.nodes.push_back(std::move(neuron));
+    layer.nodeIdx.push_back((int)graph.nodes.size()-1);
+}
+
+static void NG_AddNeuron(NeuralGraph& graph,int layerIndex)
+{
+    if(!NG_CanEdit(graph) || layerIndex<0 || layerIndex>=(int)graph.layers.size()) return;
+    try
+    {
+        NeuralGraph candidate=graph;
+        NG_AppendNeuron(candidate,layerIndex);
+        NG_PreserveTopologyParameters(graph,candidate);
+        NG_RequestTopology(graph,std::move(candidate));
+    }
+    catch(const std::exception& error) { NG_ReportTopologyError(error.what()); }
+}
+
+static void NG_EraseNode(NeuralGraph& graph,int index)
+{
+    graph.nodes.erase(graph.nodes.begin()+index);
+    for(auto& layer:graph.layers) for(int& nodeIndex:layer.nodeIdx) if(nodeIndex>index) --nodeIndex;
+}
+
+static void NG_RemoveSelectedNeuron(NeuralGraph& graph, int neuronId)
+{
+    if(!NG_CanEdit(graph)) return;
+    NeuralGraph candidate=graph;
+    int index=-1, layerIndex=-1;
+    for(size_t i=0;i<candidate.nodes.size();++i)
+        if(candidate.nodes[i].id==neuronId) { index=(int)i; break; }
+    if(index<0) return;
+    for(size_t li=0;li<candidate.layers.size();++li)
+    {
+        auto& ids=candidate.layers[li].nodeIdx;
+        auto it=std::find(ids.begin(),ids.end(),index);
+        if(it!=ids.end()) { layerIndex=(int)li; ids.erase(it); break; }
+    }
+    if(layerIndex<0) return;
+    // Internal layers must remain nonempty. Remove the layer itself if its last
+    // neuron was deleted; input/output layers are allowed to be temporarily empty.
+    if(candidate.layers[layerIndex].nodeIdx.empty() && layerIndex>0 &&
+       layerIndex+1<(int)candidate.layers.size())
+        candidate.layers.erase(candidate.layers.begin()+layerIndex);
+    NG_EraseNode(candidate,index);
+    candidate.selected=-1;
+    candidate.multiSelected.clear();
+    candidate.currentLayer=std::clamp(candidate.currentLayer,0,(int)candidate.layers.size()-1);
+    for(auto& group:candidate.neuronGroups)
+        group.ids.erase(std::remove(group.ids.begin(),group.ids.end(),neuronId),group.ids.end());
+    for(auto& group:candidate.syncGroups)
+        group.erase(std::remove(group.begin(),group.end(),neuronId),group.end());
+    NG_PreserveTopologyParameters(graph,candidate);
+    NG_RequestTopology(graph,std::move(candidate));
+}
+
+static void NG_RemoveLastNeuron(NeuralGraph& graph,int layerIndex)
+{
+    if(!NG_CanEdit(graph) || layerIndex<0 || layerIndex>=(int)graph.layers.size()) return;
+    if(graph.layers[layerIndex].nodeIdx.size()<=1)
+    { NG_ReportTopologyError("Cannot remove the last neuron. Delete the hidden layer instead."); return; }
+    NeuralGraph candidate=graph;
+    int index=candidate.layers[layerIndex].nodeIdx.back();
+    candidate.layers[layerIndex].nodeIdx.pop_back();
+    NG_EraseNode(candidate,index);
+    NG_PreserveTopologyParameters(graph,candidate);
+    NG_RequestTopology(graph,std::move(candidate));
+}
+
+static void NG_InsertLayer(NeuralGraph& graph,LayerKind kind)
+{
+    if(!NG_CanEdit(graph)) return;
+    const int current=graph.currentLayer;
+    if(current<0 || current>=(int)graph.layers.size() || graph.layers[current].kind==LayerKind::Output) return;
+    try
+    {
+        NeuralGraph candidate=graph;
+        Layer layer; layer.kind=kind; layer.act=kind==LayerKind::GRU ? Act::Tanh : Act::ReLU;
+        layer.name=std::string(kind==LayerKind::GRU ? "GRU " : "HL ")+std::to_string(current+1);
+        RandomizeLayerWind(layer);
+        candidate.layers.insert(candidate.layers.begin()+current+1,std::move(layer));
+        candidate.currentLayer=current+1;
+        for(int unit=0;unit<(kind==LayerKind::GRU ? 8 : 1);++unit) NG_AppendNeuron(candidate,current+1);
+        NG_PreserveTopologyParameters(graph,candidate);
+        NG_RequestTopology(graph,std::move(candidate));
+    }
+    catch(const std::exception& error) { NG_ReportTopologyError(error.what()); }
+}
+
+static void NG_InsertHiddenAfterCurrent(NeuralGraph& graph) { NG_InsertLayer(graph,LayerKind::Hidden); }
+static void NG_InsertGRUAfterCurrent(NeuralGraph& graph) { NG_InsertLayer(graph,LayerKind::GRU); }
+
+static bool NG_RemoveCurrentHiddenLayer(NeuralGraph& graph)
+{
+    if(!NG_CanEdit(graph)) return false;
+    const int current=graph.currentLayer;
+    if(current<0 || current>=(int)graph.layers.size()) return false;
+    const LayerKind kind=graph.layers[current].kind;
+    if(kind!=LayerKind::Hidden && kind!=LayerKind::GRU) { Logf("Only hidden or GRU layers can be deleted."); return false; }
+    NeuralGraph candidate=graph;
+    auto removed=candidate.layers[current].nodeIdx;
+    candidate.layers.erase(candidate.layers.begin()+current);
+    std::sort(removed.begin(),removed.end(),std::greater<int>());
+    for(int index:removed) NG_EraseNode(candidate,index);
+    candidate.currentLayer=current-1;
+    NG_PreserveTopologyParameters(graph,candidate);
+    return NG_RequestTopology(graph,std::move(candidate));
 }
 
 // Build a specific multi-layer topology
 static void NG_BuildTopology(NeuralGraph& g, int inN, const std::vector<int>& hidden, int outN)
 {
+    if(IsTrainingActive()) { Logf("Stop training before changing the model or lessons."); return; }
     g.nodes.clear(); g.edges.clear(); g.layers.clear();
     g.selected = -1; std::memset(g.editBuf,0,sizeof(g.editBuf));
     g.currentLayer = 0; g.liveInputs = false;
@@ -1332,6 +1601,7 @@ static void NG_BuildDinosaur(NeuralGraph& g)
 
 static void NG_BuildDeepGRUTopology(NeuralGraph& graph)
 {
+    if(IsTrainingActive()) { Logf("Stop training before changing the model or lessons."); return; }
     graph.nodes.clear();
     graph.edges.clear();
     graph.layers.clear();
@@ -1396,6 +1666,7 @@ auto ng_set_bias(T& n, float v) -> decltype(n.bias = v, void()) { n.bias = v; }
 
 static void NG_RandomizeHidden(NeuralGraph& g, float wRange=1.0f, float bRange=0.5f)
 {
+    if(IsTrainingActive()) { Logf("Stop training before changing the model or lessons."); return; }
     for(const auto& L : g.layers)
     {
         if(L.kind != LayerKind::Hidden && L.kind != LayerKind::Output) continue;
@@ -1438,20 +1709,10 @@ Act NextAct(Act a)
     return Act::Linear;
 }
 
-// Training params accessors (declared here, defined later)
-// Also define dataset model earlier for save/load embedding
-struct TrainSample
+// Build preset lessons locally so cancellation leaves the current dataset intact.
+static void BuildFactorySequenceLessons(NeuralGraph& graph, std::vector<TrainSample>& lessons)
 {
-    std::vector<float> in;
-    std::vector<float> out;
-    std::string desc = "Default";
-    std::vector<std::vector<float>> sequence;
-};
-static std::vector<TrainSample> gDataset;
-static int gLessonsCount = 0;
-
-static void BuildFactorySequenceLessons(NeuralGraph& graph)
-{
+    if(IsTrainingActive()) { Logf("Stop training before changing the model or lessons."); return; }
     static const char* sensorNames[12] = {
         "Vibration", "Temperature", "Pressure", "MotorCurrent", "RPM", "Acoustic",
         "OilQuality", "Flow", "Torque", "Humidity", "Voltage", "Load"
@@ -1473,7 +1734,7 @@ static void BuildFactorySequenceLessons(NeuralGraph& graph)
         neuron.desc = "Predicted machine condition after the observed sequence";
     }
 
-    gDataset.clear();
+    lessons.clear();
     auto lesson = [&](int target, const char* description, int variant)
     {
         TrainSample sample;
@@ -1503,7 +1764,7 @@ static void BuildFactorySequenceLessons(NeuralGraph& graph)
             sample.sequence.push_back(frame);
         }
         sample.in = sample.sequence.back();
-        gDataset.push_back(std::move(sample));
+        lessons.push_back(std::move(sample));
     };
 
     for(int variant = 0; variant < 4; ++variant)
@@ -1517,7 +1778,6 @@ static void BuildFactorySequenceLessons(NeuralGraph& graph)
         lesson(6, "Current and voltage become unstable: electrical fault", variant);
         lesson(7, "Multiple critical trends require emergency stop", variant);
     }
-    gLessonsCount = (int)gDataset.size();
 }
 static float TrainGetLR();
 static float TrainGetL1();
@@ -1526,633 +1786,625 @@ static int   TrainGetEpochs();
 static float TrainGetTargetMSE();
 static void  TrainApplyParams(float lr, float l1, float l2, int epochs, float targetMSE);
 
-static void NG_SaveJson(const NeuralGraph& g, const std::string& path)
+using Json = nlohmann::json;
+
+static void RequireJson(bool condition, const std::string& message)
 {
-    std::ofstream out(path);
-    if(!out) return;
-    out << "{\n";
-    out << "  \"version\": \"neuro-graph-2\",\n";
-
-    // Training parameters snapshot
-    out << "  \"learning_rate\": " << TrainGetLR() << ",\n";
-    out << "  \"l1\": " << TrainGetL1() << ",\n";
-    out << "  \"l2\": " << TrainGetL2() << ",\n";
-    out << "  \"epochs\": " << TrainGetEpochs() << ",\n";
-    out << "  \"target_mse\": " << TrainGetTargetMSE() << ",\n";
-    out << "  \"paired_theme\": " << gPairedThemeIndex << ",\n";
-
-    const TurbineModel::Params* turbineParams = gEngine ? &gEngine->turbine.params : nullptr;
-    out << "  \"f2_settings\": {\n";
-    out << "    \"rpm\": " << (turbineParams ? turbineParams->rpm : 60.0f) << ",\n";
-    out << "    \"startup_time\": " << (turbineParams ? turbineParams->startupTime : 4.0f) << ",\n";
-    out << "    \"shutdown_time\": " << (turbineParams ? turbineParams->shutdownTime : 6.0f) << ",\n";
-    out << "    \"blades\": " << (turbineParams ? turbineParams->blades : 3) << ",\n";
-    out << "    \"wind_strength\": " << gWind.strength << ",\n";
-    out << "    \"wind_speed\": " << gWind.speed << ",\n";
-    out << "    \"wind_jitter\": " << gWind.jitter << ",\n";
-    out << "    \"strength_sine\": " << (gStrengthSineEnabled ? "true" : "false") << ",\n";
-    out << "    \"speed_sine\": " << (gSpeedSineEnabled ? "true" : "false") << ",\n";
-    out << "    \"jitter_sine\": " << (gJitterSineEnabled ? "true" : "false") << ",\n";
-    out << "    \"strength_phase\": " << gWindStrengthPhase << ",\n";
-    out << "    \"speed_phase\": " << gWindSpeedPhase << ",\n";
-    out << "    \"jitter_phase\": " << gWindJitterPhase << ",\n";
-    out << "    \"live_wave_active\": " << (gLiveFeedWaveActive ? "true" : "false") << ",\n";
-    out << "    \"live_wave_phase\": " << gLiveFeedWavePhase << ",\n";
-    out << "    \"live_wave_speed\": " << gLiveFeedWaveSpeed << ",\n";
-    out << "    \"live_current_input\": " << gLiveFeedCurrentInput << ",\n";
-    out << "    \"live_input_delay\": " << gLiveFeedInputDelay << ",\n";
-    out << "    \"random_live_feed\": " << (gRandomLiveFeedActive ? "true" : "false") << ",\n";
-    out << "    \"all_inputs_live\": " << (g.liveInputs ? "true" : "false") << "\n";
-    out << "  },\n";
-
-    // Theme information
-    const UITheme& theme = (gEngine && gEngine->window ? gEngine->renderer.theme : UITheme::Cyberpunk());
-    out << "  \"theme\": {\n";
-    out << "    \"name\": \"" << theme.name << "\",\n";
-    out << "    \"bg\": [" << theme.bg.x << "," << theme.bg.y << "," << theme.bg.z << "],\n";
-    out << "    \"panel\": [" << theme.panel.x << "," << theme.panel.y << "," << theme.panel.z << "],\n";
-    out << "    \"accent\": [" << theme.accent.x << "," << theme.accent.y << "," << theme.accent.z << "],\n";
-    out << "    \"grid\": [" << theme.grid.x << "," << theme.grid.y << "," << theme.grid.z << "],\n";
-    out << "    \"text\": [" << theme.text.x << "," << theme.text.y << "," << theme.text.z << "],\n";
-    out << "    \"mesh\": [" << theme.mesh.x << "," << theme.mesh.y << "," << theme.mesh.z << "],\n";
-    out << "    \"nInput\": [" << theme.nInput.x << "," << theme.nInput.y << "," << theme.nInput.z << "],\n";
-    out << "    \"nHidden\": [" << theme.nHidden.x << "," << theme.nHidden.y << "," << theme.nHidden.z << "],\n";
-    out << "    \"nOutput\": [" << theme.nOutput.x << "," << theme.nOutput.y << "," << theme.nOutput.z << "],\n";
-    out << "    \"nRing\": [" << theme.nRing.x << "," << theme.nRing.y << "," << theme.nRing.z << "],\n";
-    out << "    \"nHighlight\": [" << theme.nHighlight.x << "," << theme.nHighlight.y << "," << theme.nHighlight.z << "],\n";
-    out << "    \"edgeStart\": [" << theme.edgeStart.x << "," << theme.edgeStart.y << "," << theme.edgeStart.z << "],\n";
-    out << "    \"edgeEnd\": [" << theme.edgeEnd.x << "," << theme.edgeEnd.y << "," << theme.edgeEnd.z << "],\n";
-    out << "    \"edgeAlpha\": " << theme.edgeAlpha << ",\n";
-    out << "    \"edgeBase\": " << theme.edgeBase << ",\n";
-    out << "    \"edgeScale\": " << theme.edgeScale << "\n";
-    out << "  },\n";
-    auto writeGRUColor = [&](const char* name, const Vec3& color, bool trailingComma)
-    {
-        out << "    \"" << name << "\": [" << color.x << "," << color.y << "," << color.z << "]";
-        if(trailingComma) out << ",";
-        out << "\n";
-    };
-    out << "  \"gru_theme\": {\n";
-    out << "    \"name\": \"" << gGRUTheme.name << "\",\n";
-    writeGRUColor("column_background", gGRUTheme.columnBackground, true);
-    writeGRUColor("unit_fill", gGRUTheme.unitFill, true);
-    writeGRUColor("unit_border", gGRUTheme.unitBorder, true);
-    writeGRUColor("connection_start", gGRUTheme.connectionStart, true);
-    writeGRUColor("connection_end", gGRUTheme.connectionEnd, true);
-    writeGRUColor("particle", gGRUTheme.particle, true);
-    writeGRUColor("recurrent_loop", gGRUTheme.recurrentLoop, false);
-    out << "  },\n";
-    out << "  \"nodes\": [\n";
-    for(size_t i=0;i<g.nodes.size();++i)
-    {
-        const auto& n = g.nodes[i];
-        out << "    {\n";
-        out << "      \"id\": " << n.id << ",\n";
-        out << "      \"label\": \"" << n.label << "\",\n";
-        out << "      \"desc\": \"" << n.desc << "\",\n";
-        out << "      \"isInput\": " << (n.isInput? "true":"false") << ",\n";
-        out << "      \"value\": " << n.value << ",\n";
-        out << "      \"speed\": " << n.speed << ",\n";
-        out << "      \"bias\": " << ng_get_bias(n) << ",\n";
-        out << "      \"amp\": " << n.amp << ",\n";
-        out << "      \"live\": " << (n.live ? "true" : "false") << ",\n";
-        out << "      \"phase\": " << n.phase << ",\n";
-        out << "      \"x\": " << n.x << ",\n";
-        out << "      \"y\": " << n.y << "\n";
-        out << "    }";
-
-        if(i+1<g.nodes.size()) out << ",";
-        out << "\n";
-    }
-    out << "  ],\n";
-
-    out << "  \"layers\": [\n";
-    for(size_t li=0; li<g.layers.size(); ++li)
-    {
-        const auto& L = g.layers[li];
-        const char* kind = L.kind==LayerKind::Input ? "Input" :
-            (L.kind==LayerKind::Output ? "Output" : (L.kind==LayerKind::GRU ? "GRU" : "Hidden"));
-        out << "    {\n";
-        out << "      \"kind\": \"" << kind << "\",\n";
-        out << "      \"name\": \"" << L.name << "\",\n";
-        out << "      \"activation\": \"" << ActName(L.act) << "\",\n";
-        out << "      \"node_ids\": [";
-
-        for(size_t j=0;j<L.nodeIdx.size();++j)
-        {
-            int idxN = L.nodeIdx[j];
-            int id = (idxN>=0 && idxN < (int)g.nodes.size()) ? g.nodes[idxN].id : -1;
-            out << id; if(j+1<L.nodeIdx.size()) out << ", ";
-        }
-        out << "]";
-        if(L.kind == LayerKind::GRU)
-        {
-            auto writeVector = [&](const char* name, const std::vector<float>& values)
-            {
-                out << ",\n      \"" << name << "\": [";
-                for(size_t i = 0; i < values.size(); ++i)
-                {
-                    out << values[i];
-                    if(i + 1 < values.size()) out << ", ";
-                }
-                out << "]";
-            };
-            out << ",\n      \"gru_input_size\": " << L.gruInputSize;
-            writeVector("gru_wz", L.gruWz); writeVector("gru_wr", L.gruWr); writeVector("gru_wh", L.gruWh);
-            writeVector("gru_uz", L.gruUz); writeVector("gru_ur", L.gruUr); writeVector("gru_uh", L.gruUh);
-            writeVector("gru_bz", L.gruBz); writeVector("gru_br", L.gruBr); writeVector("gru_bh", L.gruBh);
-        }
-        out << "\n";
-        out << "    }";
-        if(li+1<g.layers.size()) out << ",";
-        out << "\n";
-    }
-    out << "  ],\n";
-
-    out << "  \"edges\": [\n";
-    for(size_t ei=0; ei<g.edges.size(); ++ei)
-    {
-        const auto& e = g.edges[ei];
-        out << "    {\n";
-        out << "      \"a\": " << e.a << ",\n";
-        out << "      \"b\": " << e.b << ",\n";
-        out << "      \"w\": " << e.w << "\n";
-        out << "    }";
-        if(ei+1<g.edges.size()) out << ",";
-        out << "\n";
-    }
-
-    out << "  ],\n";
-    // Embed lessons dataset
-    out << "  \"lessons\": [\n";
-    for(size_t i=0;i<gDataset.size();++i)
-    {
-        const auto& s = gDataset[i];
-        out << "    {\n";
-        out << "      \"in\": [";
-        for(size_t j=0;j<s.in.size();++j)
-        { 
-            out << s.in[j]; 
-            if(j+1<s.in.size()) out << ", "; 
-        }
-
-        out << "],\n";
-        out << "      \"out\": [";
-        for(size_t j=0;j<s.out.size();++j)
-        { 
-            out << s.out[j]; 
-            if(j+1<s.out.size()) out << ", "; 
-        }
-        out << "],\n";
-        out << "      \"sequence_steps\": " << s.sequence.size() << ",\n";
-        out << "      \"sequence_flat\": [";
-        bool firstSequenceValue = true;
-        for(const auto& frame : s.sequence)
-        {
-            for(float value : frame)
-            {
-                if(!firstSequenceValue) out << ", ";
-                out << value;
-                firstSequenceValue = false;
-            }
-        }
-        out << "],\n";
-        out << "      \"desc\": \"" << s.desc << "\"\n";
-        out << "    }";
-        if(i+1<gDataset.size()) out << ",";
-        out << "\n";
-    }
-    out << "  ]\n";
-    out << "}\n";
+    if(!condition) throw std::runtime_error(message);
 }
 
-// Very simple loader matching NG_SaveJson format
-static bool NG_LoadJson(NeuralGraph& g, const std::string& path, std::string* msg)
+template<class T> static T JsonScalar(const Json& value, const std::string& name)
 {
-    std::ifstream in(path);
-    if(!in){ if(msg) *msg = "Missing file: " + path; return false; }
-    std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if constexpr(std::is_same_v<T, float>)
+    {
+        RequireJson(value.is_number(), name + " must be a number");
+        double number = value.get<double>();
+        RequireJson(std::isfinite(number) && std::fabs(number) <= std::numeric_limits<float>::max(),
+                    name + " is outside the finite float range");
+        return (float)number;
+    }
+    else if constexpr(std::is_same_v<T, int>)
+    {
+        RequireJson(value.is_number_integer(), name + " must be an integer");
+        double number = value.get<double>();
+        RequireJson(number >= std::numeric_limits<int>::min() && number <= std::numeric_limits<int>::max(),
+                    name + " is outside the integer range");
+        return value.get<int>();
+    }
+    else
+    {
+        if constexpr(std::is_same_v<T, bool>) RequireJson(value.is_boolean(), name + " must be boolean");
+        else RequireJson(value.is_string(), name + " must be text");
+        return value.get<T>();
+    }
+}
 
-    // Parse training parameters (if present)
-    try{
-        auto parseFloatC = [&](const char* key, float defv)
+template<class T> static T JsonField(const Json& object, const char* key, T fallback)
+{
+    RequireJson(object.is_object(), "Expected an object for field " + std::string(key));
+    return object.contains(key) ? JsonScalar<T>(object.at(key), key) : fallback;
+}
+
+static std::vector<float> JsonFloats(const Json& array, const std::string& name)
+{
+    RequireJson(array.is_array(), name + " must be an array");
+    std::vector<float> result;
+    result.reserve(array.size());
+    for(size_t i=0; i<array.size(); ++i) result.push_back(JsonScalar<float>(array[i], name + "[" + std::to_string(i) + "]"));
+    return result;
+}
+
+static Vec3 JsonColor(const Json& object, const char* key, Vec3 fallback)
+{
+    RequireJson(object.is_object(), "Theme must be an object");
+    if(!object.contains(key)) return fallback;
+    auto values = JsonFloats(object.at(key), key);
+    RequireJson(values.size() == 3, std::string(key) + " must contain three components");
+    return {values[0], values[1], values[2]};
+}
+
+static Json ColorJson(Vec3 color) { return Json::array({color.x, color.y, color.z}); }
+
+static void CheckJsonNumbers(const Json& value)
+{
+    if(value.is_number_float()) RequireJson(std::isfinite(value.get<double>()), "Cannot save NaN or infinity");
+    if(value.is_structured()) for(const auto& child : value) CheckJsonNumbers(child);
+}
+
+static Json ReadJson(const std::string& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    if(!input) throw std::runtime_error("Cannot open " + path);
+    // Read the whole file: parse() also rejects trailing non-whitespace data.
+    std::string contents((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    RequireJson(!input.bad(), "Read failed: " + path);
+    Json document = Json::parse(contents);
+    RequireJson(document.is_object(), "JSON root must be an object");
+    return document;
+}
+
+// POSIX/Linux: a unique sibling file is flushed and closed before atomic replacement.
+static void WriteJsonAtomic(const std::string& path, const Json& document)
+{
+    CheckJsonNumbers(document);
+    const std::string contents = document.dump(2) + "\n";
+    std::string pattern = path + ".tmp.XXXXXX";
+    std::vector<char> temporary(pattern.begin(), pattern.end());
+    temporary.push_back('\0');
+    int fd = ::mkstemp(temporary.data());
+    if(fd < 0) throw std::system_error(errno, std::generic_category(), "Cannot create temporary file for " + path);
+    FILE* output = ::fdopen(fd, "wb");
+    if(!output)
+    {
+        const int failure = errno;
+        ::close(fd); ::unlink(temporary.data());
+        throw std::system_error(failure, std::generic_category(), "Cannot open temporary stream");
+    }
+    int failure = 0;
+    if(std::fwrite(contents.data(), 1, contents.size(), output) != contents.size()) failure = errno ? errno : EIO;
+    if(!failure && std::fflush(output) != 0) failure = errno ? errno : EIO;
+    if(!failure && ::fsync(fd) != 0) failure = errno ? errno : EIO;
+    if(std::fclose(output) != 0 && !failure) failure = errno ? errno : EIO;
+    if(!failure && ::rename(temporary.data(), path.c_str()) != 0) failure = errno;
+    if(failure)
+    {
+        ::unlink(temporary.data());
+        throw std::system_error(failure, std::generic_category(), "Cannot save " + path);
+    }
+}
+
+static void ReportFileError(const std::string& action, const std::exception& error)
+{
+    gToastMsg = action + ": " + error.what();
+    gToastT = glfwGetTime();
+    Logf("%s", gToastMsg.c_str());
+}
+
+struct SavedTrainingParams
+{
+    float lr=TrainGetLR(), l1=TrainGetL1(), l2=TrainGetL2(), target=TrainGetTargetMSE();
+    int epochs=TrainGetEpochs();
+    void read(const Json& document)
+    {
+        lr=JsonField(document,"learning_rate",lr); l1=JsonField(document,"l1",l1);
+        l2=JsonField(document,"l2",l2); target=JsonField(document,"target_mse",target);
+        epochs=JsonField(document,"epochs",epochs);
+        RequireJson(std::isfinite(lr) && std::isfinite(l1) && std::isfinite(l2) && std::isfinite(target) &&
+                    lr>0 && l1>=0 && l2>=0 && epochs>0, "Invalid training parameters");
+    }
+    void write(Json& document) const
+    {
+        document["learning_rate"]=lr; document["l1"]=l1; document["l2"]=l2;
+        document["target_mse"]=target; document["epochs"]=epochs;
+    }
+    void apply() const { TrainApplyParams(lr,l1,l2,epochs,target); }
+};
+
+// Decodes into local objects only; no editor state is changed by validation.
+static const NeuronGroup* CollapsedGroupFor(const NeuralGraph& g, int id)
+{
+    for(const auto& group : g.neuronGroups)
+        if(group.collapsed && std::find(group.ids.begin(), group.ids.end(), id)!=group.ids.end()) return &group;
+    return nullptr;
+}
+static bool GroupMemberHidden(const NeuralGraph& g, int id)
+{
+    const NeuronGroup* group=CollapsedGroupFor(g,id);
+    return group && !group->ids.empty() && group->ids.front()!=id;
+}
+static void SyncNeuronProperties(NeuralGraph& g, int sourceId)
+{
+    const Neuron* source=nullptr;
+    for(const auto& n:g.nodes) if(n.id==sourceId) { source=&n; break; }
+    if(!source) return;
+    const Neuron snapshot=*source;
+    for(const auto& group:g.syncGroups)
+    {
+        if(std::find(group.begin(),group.end(),sourceId)==group.end()) continue;
+        for(auto& n:g.nodes)
         {
-            try{
-                std::regex rx(std::string("\"")+key+"\"\\s*:\\s*([-+eE0-9\\.]+)");
-                std::smatch m; if(std::regex_search(s,m,rx))
-                {
-                    std::stringstream ss(m[1].str());
-                    ss.imbue(std::locale::classic());
-                    float v=defv; ss >> v; return v;
-                }
-            }catch(...){}
-            return defv;
-        };
-
-        auto parseIntC = [&](const char* key, int defv)
-        {
-            try{
-                std::regex rx(std::string("\"")+key+"\"\\s*:\\s*([-+0-9]+)");
-                std::smatch m; if(std::regex_search(s,m,rx))
-                {
-                    std::stringstream ss(m[1].str());
-                    ss.imbue(std::locale::classic());
-                    int v=defv; ss >> v; return v;
-                }
-            }catch(...){}
-            return defv;
-        };
-
-        float _lr = parseFloatC("learning_rate", TrainGetLR());
-        float _l1 = parseFloatC("l1", TrainGetL1());
-        float _l2 = parseFloatC("l2", TrainGetL2());
-        float _tm = parseFloatC("target_mse", TrainGetTargetMSE());
-        int   _ep = parseIntC("epochs", TrainGetEpochs());
-        TrainApplyParams(_lr, _l1, _l2, _ep, _tm);
-        gPairedThemeIndex = parseIntC("paired_theme", -1);
-        if(gPairedThemeIndex < -1 || gPairedThemeIndex > 15) gPairedThemeIndex = -1;
-
-        std::regex f2Expression(R"(\"f2_settings\"\s*:\s*\{([^{}]*)\})");
-        std::smatch f2Match;
-        if(std::regex_search(s, f2Match, f2Expression))
-        {
-            const std::string section = f2Match[1].str();
-            auto parseF2Float = [&](const char* key, float fallback)
+            if(n.id==sourceId || std::find(group.begin(),group.end(),n.id)==group.end()) continue;
+            // Identity, labels, descriptions and connection weights stay independent.
+            if(n.isInput==snapshot.isInput)
             {
-                std::regex expression(std::string("\\\"") + key + "\\\"\\s*:\\s*([-+eE0-9\\.]+)");
-                std::smatch match;
-                return std::regex_search(section, match, expression) ? std::stof(match[1].str()) : fallback;
-            };
-            auto parseF2Int = [&](const char* key, int fallback)
-            {
-                std::regex expression(std::string("\\\"") + key + "\\\"\\s*:\\s*(-?[0-9]+)");
-                std::smatch match;
-                return std::regex_search(section, match, expression) ? std::stoi(match[1].str()) : fallback;
-            };
-            auto parseF2Bool = [&](const char* key, bool fallback)
-            {
-                std::regex expression(std::string("\\\"") + key + "\\\"\\s*:\\s*(true|false)");
-                std::smatch match;
-                return std::regex_search(section, match, expression) ? match[1].str() == "true" : fallback;
-            };
-
-            gWind.strength = std::clamp(parseF2Float("wind_strength", gWind.strength), 0.0f, 300.0f);
-            gWind.speed = std::clamp(parseF2Float("wind_speed", gWind.speed), 0.0f, 5.0f);
-            gWind.jitter = std::clamp(parseF2Float("wind_jitter", gWind.jitter), 0.0f, 0.5f);
-            gStrengthSineEnabled = parseF2Bool("strength_sine", gStrengthSineEnabled);
-            gSpeedSineEnabled = parseF2Bool("speed_sine", gSpeedSineEnabled);
-            gJitterSineEnabled = parseF2Bool("jitter_sine", gJitterSineEnabled);
-            gWindStrengthPhase = parseF2Float("strength_phase", gWindStrengthPhase);
-            gWindSpeedPhase = parseF2Float("speed_phase", gWindSpeedPhase);
-            gWindJitterPhase = parseF2Float("jitter_phase", gWindJitterPhase);
-            gLiveFeedWaveActive = parseF2Bool("live_wave_active", gLiveFeedWaveActive);
-            gLiveFeedWavePhase = parseF2Float("live_wave_phase", gLiveFeedWavePhase);
-            gLiveFeedWaveSpeed = std::clamp(parseF2Float("live_wave_speed", gLiveFeedWaveSpeed), 0.5f, 5.0f);
-            gLiveFeedCurrentInput = std::max(0, parseF2Int("live_current_input", gLiveFeedCurrentInput));
-            gLiveFeedInputDelay = std::clamp(parseF2Float("live_input_delay", gLiveFeedInputDelay), 0.1f, 1.0f);
-            gRandomLiveFeedActive = parseF2Bool("random_live_feed", gRandomLiveFeedActive);
-            g.liveInputs = parseF2Bool("all_inputs_live", g.liveInputs);
-            gLiveFeedInputTimer = 0.0f;
-
-            if(gEngine)
-            {
-                gEngine->turbine.params.rpm = std::clamp(parseF2Float("rpm", gEngine->turbine.params.rpm), 0.0f, 15000.0f);
-                gEngine->turbine.params.startupTime = std::clamp(
-                    parseF2Float("startup_time", gEngine->turbine.params.startupTime), 0.1f, 60.0f);
-                gEngine->turbine.params.shutdownTime = std::clamp(
-                    parseF2Float("shutdown_time", gEngine->turbine.params.shutdownTime), 0.1f, 60.0f);
-                const int loadedBlades = std::clamp(parseF2Int("blades", gEngine->turbine.params.blades), 1, 10);
-                if(loadedBlades != gEngine->turbine.params.blades)
-                {
-                    gEngine->turbine.params.blades = loadedBlades;
-                    gEngine->turbine.rebuild();
-                }
+                n.value=snapshot.value; n.speed=snapshot.speed; n.amp=snapshot.amp;
+                n.live=snapshot.live; n.phase=snapshot.phase; n.bias=snapshot.bias;
             }
-        }
-    }catch(...){}
-
-    auto find_section = [&](const char* key)->std::string
-    {
-        size_t ks = s.find(std::string("\"")+key+"\"");
-        if(ks==std::string::npos) return {};
-        size_t lb = s.find('[', ks);
-        if(lb==std::string::npos) return {};
-        int depth=0; size_t i=lb;
-        for(; i<s.size(); ++i)
-        {
-            char c=s[i];
-            if(c=='[') depth++;
-            else if(c==']'){ depth--; if(depth==0){ ++i; break; } }
-        }
-        return s.substr(lb, i-lb);
-    };
-
-    std::string nodesSec = find_section("nodes");
-    std::string layersSec = find_section("layers");
-    std::string edgesSec = find_section("edges");
-    std::string lessonsSec = find_section("lessons");
-    if(nodesSec.empty() || layersSec.empty()){ if(msg) *msg="Bad file (sections missing)."; return false; }
-
-    g.nodes.clear(); g.layers.clear(); g.edges.clear();
-
-    // Try regex with desc, fall back to legacy regex without desc
-    std::regex rxNodeFull(R"(\{[^{}]*\"id\"\s*:\s*(-?\d+)[^{}]*\"label\"\s*:\s*\"([^\"]*)\"[^{}]*\"desc\"\s*:\s*\"([^\"]*)\"[^{}]*\"isInput\"\s*:\s*(true|false)[^{}]*\"value\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"speed\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"bias\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"amp\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"live\"\s*:\s*(true|false)[^{}]*\"phase\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"x\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"y\"\s*:\s*([-+eE0-9\.]+)[^{}]*\})");
-    std::regex rxNodeDesc(R"(\{[^{}]*\"id\"\s*:\s*(-?\d+)[^{}]*\"label\"\s*:\s*\"([^\"]*)\"[^{}]*\"desc\"\s*:\s*\"([^\"]*)\"[^{}]*\"isInput\"\s*:\s*(true|false)[^{}]*\"value\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"speed\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"bias\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"x\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"y\"\s*:\s*([-+eE0-9\.]+)[^{}]*\})");
-    std::regex rxNodeLegacy(R"(\{[^{}]*\"id\"\s*:\s*(-?\d+)[^{}]*\"label\"\s*:\s*\"([^\"]*)\"[^{}]*\"isInput\"\s*:\s*(true|false)[^{}]*\"value\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"speed\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"bias\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"x\"\s*:\s*([-+eE0-9\.]+)[^{}]*\"y\"\s*:\s*([-+eE0-9\.]+)[^{}]*\})");
-    auto itFull = std::sregex_iterator(nodesSec.begin(), nodesSec.end(), rxNodeFull);
-    std::unordered_map<int, int> id2idx;
-    int idx=0;
-    if(itFull != std::sregex_iterator())
-    {
-        for(; itFull!=std::sregex_iterator(); ++itFull)
-        {
-            auto m=*itFull; Neuron n;
-            n.id = std::atoi(m[1].str().c_str());
-            n.label = m[2].str();
-            n.desc = m[3].str();
-            n.isInput = (m[4].str()=="true");
-            n.value = std::atof(m[5].str().c_str());
-            n.speed = std::atof(m[6].str().c_str());
-            n.bias = std::atof(m[7].str().c_str());
-            n.amp = std::atof(m[8].str().c_str());
-            n.live = m[9].str() == "true";
-            n.phase = std::atof(m[10].str().c_str());
-            n.x = std::atof(m[11].str().c_str());
-            n.y = std::atof(m[12].str().c_str());
-            g.nodes.push_back(n);
-            id2idx[n.id] = idx++;
+            else { n.speed=snapshot.speed; n.amp=snapshot.amp; n.bias=snapshot.bias; }
         }
     }
-    else 
-    {
-        auto it = std::sregex_iterator(nodesSec.begin(), nodesSec.end(), rxNodeDesc);
-        if(it != std::sregex_iterator())
-        {
-            for(; it!=std::sregex_iterator(); ++it)
-            {
-                auto m=*it; Neuron n;
-                n.id=std::atoi(m[1].str().c_str()); n.label=m[2].str(); n.desc=m[3].str();
-                n.isInput=m[4].str()=="true"; n.value=std::atof(m[5].str().c_str());
-                n.speed=std::atof(m[6].str().c_str()); n.bias=std::atof(m[7].str().c_str());
-                n.x=std::atof(m[8].str().c_str()); n.y=std::atof(m[9].str().c_str());
-                g.nodes.push_back(n); id2idx[n.id]=idx++;
-            }
-        }
-        else
-        {
-            auto it2 = std::sregex_iterator(nodesSec.begin(), nodesSec.end(), rxNodeLegacy);
-            for(; it2!=std::sregex_iterator(); ++it2)
-            {
-                auto m=*it2; Neuron n;
-                n.id=std::atoi(m[1].str().c_str()); n.label=m[2].str(); n.isInput=m[3].str()=="true";
-                n.value=std::atof(m[4].str().c_str()); n.speed=std::atof(m[5].str().c_str());
-                n.bias=std::atof(m[6].str().c_str()); n.x=std::atof(m[7].str().c_str());
-                n.y=std::atof(m[8].str().c_str()); g.nodes.push_back(n); id2idx[n.id]=idx++;
-            }
-        }
-    }
-    if(g.nodes.empty()){ if(msg) *msg="No nodes found."; return false; }
+}
+static void PruneNeuronCollections(NeuralGraph& g)
+{
+    auto exists=[&](int id){return std::any_of(g.nodes.begin(),g.nodes.end(),[&](const Neuron& n){return n.id==id;});};
+    auto prune=[&](std::vector<int>& ids){ids.erase(std::remove_if(ids.begin(),ids.end(),[&](int id){return !exists(id);}),ids.end());};
+    prune(g.multiSelected);
+    prune(g.ungroupedInputIds);
+    for(auto& group:g.neuronGroups) prune(group.ids);
+    g.neuronGroups.erase(std::remove_if(g.neuronGroups.begin(),g.neuronGroups.end(),[](const NeuronGroup& group){return group.ids.size()<2;}),g.neuronGroups.end());
+    for(auto& group:g.syncGroups) prune(group);
+    g.syncGroups.erase(std::remove_if(g.syncGroups.begin(),g.syncGroups.end(),[](const std::vector<int>& group){return group.size()<2;}),g.syncGroups.end());
+}
 
-    auto strToAct = [](const std::string& s)->Act
+static void DecodeGraph(const Json& document, NeuralGraph& graph, std::vector<TrainSample>& lessons)
+{
+    const std::string version=JsonField(document,"version",std::string("neuro-graph-1"));
+    RequireJson(version=="neuro-graph-1" || version=="neuro-graph-2", "Unsupported network version: " + version);
+    const auto& nodes=document.at("nodes"); const auto& layers=document.at("layers");
+    RequireJson(nodes.is_array() && layers.is_array() && layers.size()>=2,
+                "Network requires nodes and at least input/output layers");
+    std::unordered_map<int,int> indices;
+    for(const auto& entry:nodes)
     {
-        if(s=="ReLU") return Act::ReLU;
-        if(s=="Tanh") return Act::Tanh;
-        if(s=="Sigmoid") return Act::Sigmoid;
-        return Act::Linear;
-    };
+        Neuron n;
+        n.id=JsonScalar<int>(entry.at("id"),"id");
+        RequireJson(indices.emplace(n.id,(int)graph.nodes.size()).second,"Duplicate neuron ID: " + std::to_string(n.id));
+        n.label=JsonField(entry,"label",n.label); n.desc=JsonField(entry,"desc",n.desc);
+        n.isInput=JsonField(entry,"isInput",false);
+        n.value=JsonField(entry,"value",n.value);
+        n.speed=JsonField(entry,"speed",n.speed);
+        n.bias=JsonField(entry,"bias",n.bias);
+        n.amp=JsonField(entry,"amp",n.amp);
+        n.phase=JsonField(entry,"phase",n.phase);
+        n.x=JsonField(entry,"x",n.x);
+        n.y=JsonField(entry,"y",n.y);
+        n.live=JsonField(entry,"live",false);
+        graph.nodes.push_back(std::move(n));
+    }
+    if(document.contains("neuron_groups") && document["neuron_groups"].is_array())
+        for(const auto& entry:document["neuron_groups"])
+        {
+            NeuronGroup group;
+            group.name=entry.value("name",std::string("Group"));
+            group.collapsed=entry.value("collapsed",true);
+            if(entry.contains("ids") && entry["ids"].is_array())
+                for(const auto& id:entry["ids"]) if(id.is_number_integer()) group.ids.push_back(id.get<int>());
+            graph.neuronGroups.push_back(std::move(group));
+        }
+    if(document.contains("ungrouped_input_ids") && document["ungrouped_input_ids"].is_array())
+        for(const auto& id:document["ungrouped_input_ids"])
+            if(id.is_number_integer()) graph.ungroupedInputIds.push_back(id.get<int>());
+    if(document.contains("sync_groups") && document["sync_groups"].is_array())
+        for(const auto& entry:document["sync_groups"])
+            if(entry.is_array()) graph.syncGroups.push_back(entry.get<std::vector<int>>());
+    if(document.contains("expanded_input_groups") && document["expanded_input_groups"].is_array())
+        for(const auto& name:document["expanded_input_groups"])
+            if(name.is_string()) graph.expandedInputGroups.push_back(name.get<std::string>());
+    PruneNeuronCollections(graph);
+    std::vector<int> membership(graph.nodes.size(),-1);
+    size_t inputCount=0,outputCount=0;
+    for(const auto& entry:layers)
+    {
+        Layer layer;
+        const std::string kind=JsonScalar<std::string>(entry.at("kind"),"kind");
+        if(kind=="Input") layer.kind=LayerKind::Input;
+        else if(kind=="Output") layer.kind=LayerKind::Output;
+        else if(kind=="Hidden") layer.kind=LayerKind::Hidden;
+        else if(kind=="GRU") layer.kind=LayerKind::GRU;
+        else throw std::runtime_error("Unknown layer kind: " + kind);
+        layer.name=JsonField(entry,"name",layer.name);
+        const std::string act=JsonField(entry,"activation",std::string("Linear"));
+        if(act=="Linear") layer.act=Act::Linear;
+        else if(act=="ReLU") layer.act=Act::ReLU;
+        else if(act=="Sigmoid") layer.act=Act::Sigmoid;
+        else if(act=="Tanh") layer.act=Act::Tanh;
+        else throw std::runtime_error("Unknown activation: " + act);
+        const auto& ids=entry.at("node_ids");
+        RequireJson(ids.is_array(),"node_ids must be an array");
+        for(const auto& value:ids)
+        {
+            int id=JsonScalar<int>(value,"node_ids"); auto found=indices.find(id);
+            RequireJson(found!=indices.end(),"Unknown neuron ID: " + std::to_string(id));
+            int index=found->second;
+            RequireJson(membership[index]<0,"Neuron assigned more than once: " + std::to_string(id));
+            membership[index]=(int)graph.layers.size();
+            RequireJson(graph.nodes[index].isInput==(layer.kind==LayerKind::Input),"isInput disagrees with layer for neuron " + std::to_string(id));
+            layer.nodeIdx.push_back(index);
+        }
+        if(layer.kind==LayerKind::Input) inputCount+=ids.size();
+        if(layer.kind==LayerKind::Output) outputCount+=ids.size();
+        if(layer.kind==LayerKind::GRU)
+        {
+            layer.gruInputSize=JsonScalar<int>(entry.at("gru_input_size"),"gru_input_size");
+            layer.gruWz=JsonFloats(entry.at("gru_wz"),"gru_wz");
+            layer.gruWr=JsonFloats(entry.at("gru_wr"),"gru_wr");
+            layer.gruWh=JsonFloats(entry.at("gru_wh"),"gru_wh");
+            layer.gruUz=JsonFloats(entry.at("gru_uz"),"gru_uz");
+            layer.gruUr=JsonFloats(entry.at("gru_ur"),"gru_ur");
+            layer.gruUh=JsonFloats(entry.at("gru_uh"),"gru_uh");
+            layer.gruBz=JsonFloats(entry.at("gru_bz"),"gru_bz");
+            layer.gruBr=JsonFloats(entry.at("gru_br"),"gru_br");
+            layer.gruBh=JsonFloats(entry.at("gru_bh"),"gru_bh");
+            layer.gruState.assign(layer.nodeIdx.size(),0.0f);
+        }
+        graph.layers.push_back(std::move(layer));
+    }
+    for(int li:membership) RequireJson(li>=0,"Neuron without a layer");
+    RequireJson(graph.layers.front().kind==LayerKind::Input && graph.layers.back().kind==LayerKind::Output,
+                "First layer must be Input and last layer Output");
+    for(size_t li=1;li+1<graph.layers.size();++li)
+        RequireJson(graph.layers[li].kind==LayerKind::Hidden || graph.layers[li].kind==LayerKind::GRU,
+                    "Internal layers must be Hidden or GRU");
+    std::string gruError;
+    RequireJson(ValidateGRUParameters(graph,&gruError),gruError);
+    if(document.contains("edges"))
+    {
+        RequireJson(document.at("edges").is_array(),"edges must be an array");
+        for(const auto& entry:document.at("edges"))
+        {
+            Edge edge{JsonScalar<int>(entry.at("a"),"edge.a"),JsonScalar<int>(entry.at("b"),"edge.b"),
+                      JsonScalar<float>(entry.at("w"),"edge.w")};
+            auto a=indices.find(edge.a),b=indices.find(edge.b);
+            RequireJson(a!=indices.end() && b!=indices.end(),"Edge refers to an unknown neuron");
+            RequireJson(membership[a->second]<membership[b->second],"Edge must point to a later layer");
+            graph.edges.push_back(edge);
+        }
+    }
+    else // Legacy files without edges use full connections; explicit [] stays empty.
+        for(size_t li=0;li+1<graph.layers.size();++li)
+            for(int a:graph.layers[li].nodeIdx) for(int b:graph.layers[li+1].nodeIdx)
+                graph.edges.push_back({graph.nodes[a].id,graph.nodes[b].id,0.5f});
+    std::string topologyError;
+    RequireJson(NG_ValidateTopology(graph,topologyError),topologyError);
+    if(document.contains("lessons"))
+    {
+        RequireJson(document.at("lessons").is_array(),"lessons must be an array");
+        for(const auto& entry:document.at("lessons"))
+        {
+            const std::string label="Lesson " + std::to_string(lessons.size()+1);
+            TrainSample sample;
+            sample.in=JsonFloats(entry.at("in"),label+" input");
+            sample.out=JsonFloats(entry.at("out"),label+" output");
+            sample.desc=JsonField(entry,"desc",sample.desc);
+            RequireJson(sample.in.size()==inputCount && sample.out.size()==outputCount,label+" dimensions do not match the model");
+            int steps=JsonField(entry,"sequence_steps",0);
+            RequireJson(steps>=0,label+" has a negative step count");
+            auto flat=entry.contains("sequence_flat") ? JsonFloats(entry.at("sequence_flat"),label+" sequence") : std::vector<float>{};
+            RequireJson(steps==0 ? flat.empty() : inputCount>0 && flat.size()/inputCount==(size_t)steps && flat.size()%inputCount==0,
+                        label+" sequence size does not match steps and input count");
+            for(int ti=0;ti<steps;++ti)
+                sample.sequence.emplace_back(flat.begin()+(size_t)ti*inputCount,flat.begin()+((size_t)ti+1)*inputCount);
+            lessons.push_back(std::move(sample));
+        }
+    }
+}
 
-    std::regex rxLayer(R"(\{\s*\"kind\"\s*:\s*\"(Input|Hidden|GRU|Output)\"\s*,\s*\"name\"\s*:\s*\"([^\"]*)\"\s*,\s*\"activation\"\s*:\s*\"([^\"]*)\"\s*,\s*\"node_ids\"\s*:\s*\[([^\]]*)\]([^{}]*)\})");
-    auto itL = std::sregex_iterator(layersSec.begin(), layersSec.end(), rxLayer);
-    for(; itL!=std::sregex_iterator(); ++itL)
+struct SavedDisplaySettings
+{
+    TurbineModel::Params turbine = gEngine ? gEngine->turbine.params : TurbineModel::Params{};
+    float rpm = turbine.rpm;
+    float startup_time = turbine.startupTime;
+    float shutdown_time = turbine.shutdownTime;
+    int blades = turbine.blades;
+    float wind_strength = gWind.strength;
+    float wind_speed = gWind.speed;
+    float wind_jitter = gWind.jitter;
+    bool strength_sine = gStrengthSineEnabled;
+    bool speed_sine = gSpeedSineEnabled;
+    bool jitter_sine = gJitterSineEnabled;
+    float strength_phase = gWindStrengthPhase;
+    float speed_phase = gWindSpeedPhase;
+    float jitter_phase = gWindJitterPhase;
+    bool live_wave_active = gLiveFeedWaveActive;
+    float live_wave_phase = gLiveFeedWavePhase;
+    float live_wave_speed = gLiveFeedWaveSpeed;
+    int live_current_input = gLiveFeedCurrentInput;
+    float live_input_delay = gLiveFeedInputDelay;
+    bool random_live_feed = gRandomLiveFeedActive;
+    bool all_inputs_live=false;
+    int paired_theme=gPairedThemeIndex;
+    UITheme theme=gEngine ? gEngine->renderer.theme : UITheme::Cyberpunk();
+    GRUTheme gruTheme=gGRUTheme;
+    void read(const Json& document)
     {
-        auto m=*itL;
-        Layer L;
-        std::string k = m[1].str();
-        L.kind = (k=="Input") ? LayerKind::Input : (k=="Output") ? LayerKind::Output :
-            (k=="GRU" ? LayerKind::GRU : LayerKind::Hidden);
-        L.name = m[2].str();
-        L.act = strToAct(m[3].str());
-        RandomizeLayerWind(L);
-        L.nodeIdx.clear();
-        std::string ids = m[4].str();
-        std::stringstream ss(ids);
-        std::string tok;
-        while(std::getline(ss, tok, ','))
+        paired_theme=JsonField(document,"paired_theme",-1);
+        RequireJson(paired_theme>=-1 && paired_theme<16,"Invalid paired_theme");
+        if(document.contains("f2_settings"))
         {
-            int id = std::atoi(tok.c_str());
-            auto itid = id2idx.find(id);
-            if(itid!=id2idx.end()) L.nodeIdx.push_back(itid->second);
+            const auto& section=document.at("f2_settings");
+            rpm=JsonField(section,"rpm",rpm);
+            startup_time=JsonField(section,"startup_time",startup_time);
+            shutdown_time=JsonField(section,"shutdown_time",shutdown_time);
+            blades=JsonField(section,"blades",blades);
+            wind_strength=JsonField(section,"wind_strength",wind_strength);
+            wind_speed=JsonField(section,"wind_speed",wind_speed);
+            wind_jitter=JsonField(section,"wind_jitter",wind_jitter);
+            strength_sine=JsonField(section,"strength_sine",strength_sine);
+            speed_sine=JsonField(section,"speed_sine",speed_sine);
+            jitter_sine=JsonField(section,"jitter_sine",jitter_sine);
+            strength_phase=JsonField(section,"strength_phase",strength_phase);
+            speed_phase=JsonField(section,"speed_phase",speed_phase);
+            jitter_phase=JsonField(section,"jitter_phase",jitter_phase);
+            live_wave_active=JsonField(section,"live_wave_active",live_wave_active);
+            live_wave_phase=JsonField(section,"live_wave_phase",live_wave_phase);
+            live_wave_speed=JsonField(section,"live_wave_speed",live_wave_speed);
+            live_current_input=JsonField(section,"live_current_input",live_current_input);
+            live_input_delay=JsonField(section,"live_input_delay",live_input_delay);
+            random_live_feed=JsonField(section,"random_live_feed",random_live_feed);
+            all_inputs_live=JsonField(section,"all_inputs_live",all_inputs_live);
         }
-        if(L.kind == LayerKind::GRU)
+        RequireJson(rpm>=0 && rpm<=15000 && startup_time>=0.1f && startup_time<=60 &&
+                    shutdown_time>=0.1f && shutdown_time<=60 && blades>=1 && blades<=10,"Invalid turbine settings");
+        RequireJson(wind_strength>=0 && wind_strength<=300 && wind_speed>=0 && wind_speed<=5 &&
+                    wind_jitter>=0 && wind_jitter<=0.5f && live_wave_speed>=0.5f && live_wave_speed<=5 &&
+                    live_current_input>=0 && live_input_delay>=0.1f && live_input_delay<=1,"Invalid live input or wind settings");
+        if(document.contains("theme"))
         {
-            const std::string extras = m[5].str();
-            auto parseNamedVector = [&](const char* name)
-            {
-                std::vector<float> values;
-                std::regex expression(std::string("\\\"") + name + "\\\"\\s*:\\s*\\[([^\\]]*)\\]");
-                std::smatch match;
-                if(std::regex_search(extras, match, expression))
-                {
-                    std::stringstream valuesStream(match[1].str());
-                    std::string value;
-                    while(std::getline(valuesStream, value, ','))
-                    {
-                        try { values.push_back(std::stof(value)); } catch(...) {}
-                    }
-                }
-                return values;
-            };
-            std::regex inputSizeExpression(R"(\"gru_input_size\"\s*:\s*(\d+))");
-            std::smatch inputSizeMatch;
-            if(std::regex_search(extras, inputSizeMatch, inputSizeExpression))
-                L.gruInputSize = std::atoi(inputSizeMatch[1].str().c_str());
-            L.gruWz=parseNamedVector("gru_wz"); L.gruWr=parseNamedVector("gru_wr"); L.gruWh=parseNamedVector("gru_wh");
-            L.gruUz=parseNamedVector("gru_uz"); L.gruUr=parseNamedVector("gru_ur"); L.gruUh=parseNamedVector("gru_uh");
-            L.gruBz=parseNamedVector("gru_bz"); L.gruBr=parseNamedVector("gru_br"); L.gruBh=parseNamedVector("gru_bh");
-            L.gruState.assign(L.nodeIdx.size(), 0.0f);
+            const auto& section=document.at("theme");
+            theme.name=JsonField(section,"name",theme.name);
+            theme.bg=JsonColor(section,"bg",theme.bg);
+            theme.panel=JsonColor(section,"panel",theme.panel);
+            theme.accent=JsonColor(section,"accent",theme.accent);
+            theme.grid=JsonColor(section,"grid",theme.grid);
+            theme.text=JsonColor(section,"text",theme.text);
+            theme.mesh=JsonColor(section,"mesh",theme.mesh);
+            theme.nInput=JsonColor(section,"nInput",theme.nInput);
+            theme.nHidden=JsonColor(section,"nHidden",theme.nHidden);
+            theme.nOutput=JsonColor(section,"nOutput",theme.nOutput);
+            theme.nRing=JsonColor(section,"nRing",theme.nRing);
+            theme.nHighlight=JsonColor(section,"nHighlight",theme.nHighlight);
+            theme.edgeStart=JsonColor(section,"edgeStart",theme.edgeStart);
+            theme.edgeEnd=JsonColor(section,"edgeEnd",theme.edgeEnd);
+            theme.edgeAlpha=JsonField(section,"edgeAlpha",theme.edgeAlpha);
+            theme.edgeBase=JsonField(section,"edgeBase",theme.edgeBase);
+            theme.edgeScale=JsonField(section,"edgeScale",theme.edgeScale);
         }
-        g.layers.push_back(std::move(L));
+        if(document.contains("gru_theme"))
+        {
+            const auto& section=document.at("gru_theme");
+            gruTheme.name=JsonField(section,"name",gruTheme.name);
+            gruTheme.columnBackground=JsonColor(section,"column_background",gruTheme.columnBackground);
+            gruTheme.unitFill=JsonColor(section,"unit_fill",gruTheme.unitFill);
+            gruTheme.unitBorder=JsonColor(section,"unit_border",gruTheme.unitBorder);
+            gruTheme.connectionStart=JsonColor(section,"connection_start",gruTheme.connectionStart);
+            gruTheme.connectionEnd=JsonColor(section,"connection_end",gruTheme.connectionEnd);
+            gruTheme.particle=JsonColor(section,"particle",gruTheme.particle);
+            gruTheme.recurrentLoop=JsonColor(section,"recurrent_loop",gruTheme.recurrentLoop);
+        }
     }
-    if(g.layers.empty()){ if(msg) *msg="No layers found."; return false; }
+    void write(Json& document) const
+    {
+        document["paired_theme"]=paired_theme;
+        auto& section=document["f2_settings"];
+        section["rpm"]=rpm;
+        section["startup_time"]=startup_time;
+        section["shutdown_time"]=shutdown_time;
+        section["blades"]=blades;
+        section["wind_strength"]=wind_strength;
+        section["wind_speed"]=wind_speed;
+        section["wind_jitter"]=wind_jitter;
+        section["strength_sine"]=strength_sine;
+        section["speed_sine"]=speed_sine;
+        section["jitter_sine"]=jitter_sine;
+        section["strength_phase"]=strength_phase;
+        section["speed_phase"]=speed_phase;
+        section["jitter_phase"]=jitter_phase;
+        section["live_wave_active"]=live_wave_active;
+        section["live_wave_phase"]=live_wave_phase;
+        section["live_wave_speed"]=live_wave_speed;
+        section["live_current_input"]=live_current_input;
+        section["live_input_delay"]=live_input_delay;
+        section["random_live_feed"]=random_live_feed;
+        section["all_inputs_live"]=all_inputs_live;
+        auto& t=document["theme"]; t["name"]=theme.name;
+        t["bg"]=ColorJson(theme.bg);
+        t["panel"]=ColorJson(theme.panel);
+        t["accent"]=ColorJson(theme.accent);
+        t["grid"]=ColorJson(theme.grid);
+        t["text"]=ColorJson(theme.text);
+        t["mesh"]=ColorJson(theme.mesh);
+        t["nInput"]=ColorJson(theme.nInput);
+        t["nHidden"]=ColorJson(theme.nHidden);
+        t["nOutput"]=ColorJson(theme.nOutput);
+        t["nRing"]=ColorJson(theme.nRing);
+        t["nHighlight"]=ColorJson(theme.nHighlight);
+        t["edgeStart"]=ColorJson(theme.edgeStart);
+        t["edgeEnd"]=ColorJson(theme.edgeEnd);
+        t["edgeAlpha"]=theme.edgeAlpha;
+        t["edgeBase"]=theme.edgeBase;
+        t["edgeScale"]=theme.edgeScale;
+        auto& gt=document["gru_theme"]; gt["name"]=gruTheme.name;
+        gt["column_background"]=ColorJson(gruTheme.columnBackground);
+        gt["unit_fill"]=ColorJson(gruTheme.unitFill);
+        gt["unit_border"]=ColorJson(gruTheme.unitBorder);
+        gt["connection_start"]=ColorJson(gruTheme.connectionStart);
+        gt["connection_end"]=ColorJson(gruTheme.connectionEnd);
+        gt["particle"]=ColorJson(gruTheme.particle);
+        gt["recurrent_loop"]=ColorJson(gruTheme.recurrentLoop);
+    }
+    void apply()
+    {
+        gWind.strength=wind_strength;
+        gWind.speed=wind_speed;
+        gWind.jitter=wind_jitter;
+        gStrengthSineEnabled=strength_sine;
+        gSpeedSineEnabled=speed_sine;
+        gJitterSineEnabled=jitter_sine;
+        gWindStrengthPhase=strength_phase;
+        gWindSpeedPhase=speed_phase;
+        gWindJitterPhase=jitter_phase;
+        gLiveFeedWaveActive=live_wave_active;
+        gLiveFeedWavePhase=live_wave_phase;
+        gLiveFeedWaveSpeed=live_wave_speed;
+        gLiveFeedCurrentInput=live_current_input;
+        gLiveFeedInputDelay=live_input_delay;
+        gRandomLiveFeedActive=random_live_feed;
+        gPairedThemeIndex=paired_theme;
+        gGRUTheme=std::move(gruTheme);
+        gGRUThemeIndex=0;
+        for(size_t i=0;i<GRUThemes().size();++i) if(GRUThemes()[i].name==gGRUTheme.name) { gGRUThemeIndex=i; break; }
+        gLiveFeedInputTimer=0;
+        if(gEngine)
+        {
+            gEngine->renderer.theme=std::move(theme);
+            gEngine->turbine.params.rpm=rpm;
+            gEngine->turbine.params.startupTime=startup_time;
+            gEngine->turbine.params.shutdownTime=shutdown_time;
+            gEngine->turbine.params.blades=blades;
+        }
+    }
+};
 
-    // Load edges if present; otherwise, rebuild full connections
-    if(!edgesSec.empty())
-    {
-        std::regex rxEdge(R"(\{\s*\"a\"\s*:\s*(-?\d+)\s*,\s*\"b\"\s*:\s*(-?\d+)\s*,\s*\"w\"\s*:\s*([-+eE0-9\.]+)\s*\})");
-        auto itE = std::sregex_iterator(edgesSec.begin(), edgesSec.end(), rxEdge);
-        for(; itE!=std::sregex_iterator(); ++itE)
-        {
-            auto m=*itE;
-            Edge e; e.a = std::atoi(m[1].str().c_str()); e.b = std::atoi(m[2].str().c_str()); e.w = std::atof(m[3].str().c_str());
-            g.edges.push_back(e);
-        }
-        if(g.edges.empty()) NG_RebuildEdges(g);
-    } else {
-        NG_RebuildEdges(g);
-    }
-    // Load lessons if present
-    if(!lessonsSec.empty())
-    {
-        gDataset.clear();
-        std::regex rxLesson(R"(\{[^{}]*\"in\"\s*:\s*\[([^\]]*)\][^{}]*\"out\"\s*:\s*\[([^\]]*)\][^{}]*\})");
-        auto itL = std::sregex_iterator(lessonsSec.begin(), lessonsSec.end(), rxLesson);
-        auto parseVec = [&](const std::string& arr){
-            std::vector<float> v; std::stringstream ss(arr); std::string tok; while(std::getline(ss,tok,',')){ try{ v.push_back(std::stof(tok)); }catch(...){} } return v; };
-        for(; itL!=std::sregex_iterator(); ++itL){
-            auto m=*itL; TrainSample s; s.in = parseVec(m[1].str()); s.out = parseVec(m[2].str());
-            std::regex rxDesc(R"(\"desc\"\s*:\s*\"([^\"]*)\")"); std::smatch md; std::string block = m.str();
-            if(std::regex_search(block, md, rxDesc)) s.desc = md[1].str(); else s.desc = "Default";
-            std::regex rxSequence(R"(\"sequence_steps\"\s*:\s*(\d+)[^{}]*\"sequence_flat\"\s*:\s*\[([^\]]*)\])");
-            std::smatch sequenceMatch;
-            if(std::regex_search(block, sequenceMatch, rxSequence))
-            {
-                const int steps = std::atoi(sequenceMatch[1].str().c_str());
-                const std::vector<float> flat = parseVec(sequenceMatch[2].str());
-                const int width = steps > 0 ? (int)flat.size() / steps : 0;
-                if(steps > 0 && width > 0)
-                {
-                    for(int step = 0; step < steps; ++step)
-                    {
-                        s.sequence.emplace_back(flat.begin() + step * width, flat.begin() + (step + 1) * width);
-                    }
-                }
-            }
-            gDataset.push_back(std::move(s));
-        }
-        gLessonsCount = (int)gDataset.size();
-    }
-    
-    // Load theme if present
-    try{
-        std::regex rxTheme(R"(\"theme\"\s*:\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\})");
-        std::smatch themeMatch;
-        if(std::regex_search(s, themeMatch, rxTheme))
-        {
-            std::string themeSection = themeMatch[1].str();
-            
-            // Parse theme name
-            std::regex rxName(R"(\"name\"\s*:\s*\"([^\"]*)\")");
-            std::smatch nameMatch;
-            std::string themeName = "Cyberpunk"; // default
-            if(std::regex_search(themeSection, nameMatch, rxName))
-            {
-                themeName = nameMatch[1].str();
-            }
-            
-            // Helper function to parse Vec3 arrays
-            auto parseVec3 = [&](const std::string& key) -> Vec3 
-            {
-                std::regex rx(std::string("\"")+key+"\"\\s*:\\s*\\[\\s*([-+eE0-9\\.]+)\\s*,\\s*([-+eE0-9\\.]+)\\s*,\\s*([-+eE0-9\\.]+)\\s*\\]");
-                std::smatch m;
-                if(std::regex_search(themeSection, m, rx))
-                {
-                    try
-                    {
-                        return {std::stof(m[1].str()), std::stof(m[2].str()), std::stof(m[3].str())};
-                    }
-                    catch(...){}
-                }
-                return {0.0f, 0.0f, 0.0f};
-            };
-            
-            // Helper function to parse float values
-            auto parseFloat = [&](const std::string& key, float defVal) -> float 
-            {
-                std::regex rx(std::string("\"")+key+"\"\\s*:\\s*([-+eE0-9\\.]+)");
-                std::smatch m;
-                if(std::regex_search(themeSection, m, rx))
-                {
-                    try
-                    {
-                        return std::stof(m[1].str());
-                    }
-                    catch(...){}
-                }
-                return defVal;
-            };
-            
-            // Create theme from loaded data
-            UITheme loadedTheme;
-            loadedTheme.name = themeName;
-            loadedTheme.bg = parseVec3("bg");
-            loadedTheme.panel = parseVec3("panel");
-            loadedTheme.accent = parseVec3("accent");
-            loadedTheme.grid = parseVec3("grid");
-            loadedTheme.text = parseVec3("text");
-            loadedTheme.mesh = parseVec3("mesh");
-            loadedTheme.nInput = parseVec3("nInput");
-            loadedTheme.nHidden = parseVec3("nHidden");
-            loadedTheme.nOutput = parseVec3("nOutput");
-            loadedTheme.nRing = parseVec3("nRing");
-            loadedTheme.nHighlight = parseVec3("nHighlight");
-            loadedTheme.edgeStart = parseVec3("edgeStart");
-            loadedTheme.edgeEnd = parseVec3("edgeEnd");
-            loadedTheme.edgeAlpha = parseFloat("edgeAlpha", 0.85f);
-            loadedTheme.edgeBase = parseFloat("edgeBase", 0.6f);
-            loadedTheme.edgeScale = parseFloat("edgeScale", 0.8f);
-            
-            // Apply theme to renderer if engine exists
-            if(gEngine && gEngine->window)
-            {
-                gEngine->renderer.theme = loadedTheme;
-                Logf("Theme loaded: %s", themeName.c_str());
-            }
-        }
-    }
-    catch(...)
-    {
-        // If theme loading fails, continue with default theme
-        Logf("Theme loading failed, using default theme");
-    }
-
+static bool NG_SaveJson(const NeuralGraph& graph, const std::string& path)
+{
     try
     {
-        std::regex gruThemeExpression(R"(\"gru_theme\"\s*:\s*\{([^{}]*)\})");
-        std::smatch gruThemeMatch;
-        if(std::regex_search(s, gruThemeMatch, gruThemeExpression))
+        Json document={{"version","neuro-graph-2"}};
+        SavedTrainingParams training; training.write(document);
+        SavedDisplaySettings display; display.all_inputs_live=graph.liveInputs; display.write(document);
+        document["nodes"]=Json::array(); document["layers"]=Json::array();
+        document["edges"]=Json::array(); document["lessons"]=Json::array();
+        document["neuron_groups"]=Json::array();
+        for(const auto& group:graph.neuronGroups)
+            document["neuron_groups"].push_back({{"name",group.name},{"ids",group.ids},{"collapsed",group.collapsed}});
+        document["ungrouped_input_ids"]=graph.ungroupedInputIds;
+        document["sync_groups"]=graph.syncGroups;
+        document["expanded_input_groups"]=graph.expandedInputGroups;
+        for(const auto& n:graph.nodes)
+            document["nodes"].push_back({{"id",n.id},{"label",n.label},{"desc",n.desc},{"isInput",n.isInput},
+                {"value",n.value},{"speed",n.speed},{"bias",n.bias},{"amp",n.amp},{"live",n.live},
+                {"phase",n.phase},{"x",n.x},{"y",n.y}});
+        for(const auto& layer:graph.layers)
         {
-            const std::string section = gruThemeMatch[1].str();
-            auto parseColor = [&](const char* key, const Vec3& fallback)
+            const char* kind=layer.kind==LayerKind::Input ? "Input" : layer.kind==LayerKind::Output ? "Output" :
+                             layer.kind==LayerKind::GRU ? "GRU" : "Hidden";
+            Json entry={{"kind",kind},{"name",layer.name},{"activation",ActName(layer.act)},{"node_ids",Json::array()}};
+            for(int index:layer.nodeIdx)
             {
-                std::regex expression(std::string("\\\"") + key +
-                    "\\\"\\s*:\\s*\\[\\s*([-+eE0-9\\.]+)\\s*,\\s*([-+eE0-9\\.]+)\\s*,\\s*([-+eE0-9\\.]+)\\s*\\]");
-                std::smatch match;
-                if(!std::regex_search(section, match, expression)) return fallback;
-                return Vec3{std::stof(match[1].str()), std::stof(match[2].str()), std::stof(match[3].str())};
-            };
-            std::regex nameExpression(R"(\"name\"\s*:\s*\"([^\"]*)\")");
-            std::smatch nameMatch;
-            if(std::regex_search(section, nameMatch, nameExpression)) gGRUTheme.name = nameMatch[1].str();
-            gGRUTheme.columnBackground = parseColor("column_background", gGRUTheme.columnBackground);
-            gGRUTheme.unitFill = parseColor("unit_fill", gGRUTheme.unitFill);
-            gGRUTheme.unitBorder = parseColor("unit_border", gGRUTheme.unitBorder);
-            gGRUTheme.connectionStart = parseColor("connection_start", gGRUTheme.connectionStart);
-            gGRUTheme.connectionEnd = parseColor("connection_end", gGRUTheme.connectionEnd);
-            gGRUTheme.particle = parseColor("particle", gGRUTheme.particle);
-            gGRUTheme.recurrentLoop = parseColor("recurrent_loop", gGRUTheme.recurrentLoop);
-            for(size_t i = 0; i < GRUThemes().size(); ++i)
-                if(GRUThemes()[i].name == gGRUTheme.name) { gGRUThemeIndex = i; break; }
-            Logf("GRU theme loaded: %s", gGRUTheme.name.c_str());
+                RequireJson(index>=0 && (size_t)index<graph.nodes.size(),"Invalid neuron index during save");
+                entry["node_ids"].push_back(graph.nodes[index].id);
+            }
+            if(layer.kind==LayerKind::GRU)
+            {
+                entry["gru_input_size"]=layer.gruInputSize;
+                entry["gru_wz"]=layer.gruWz;
+                entry["gru_wr"]=layer.gruWr;
+                entry["gru_wh"]=layer.gruWh;
+                entry["gru_uz"]=layer.gruUz;
+                entry["gru_ur"]=layer.gruUr;
+                entry["gru_uh"]=layer.gruUh;
+                entry["gru_bz"]=layer.gruBz;
+                entry["gru_br"]=layer.gruBr;
+                entry["gru_bh"]=layer.gruBh;
+            }
+            document["layers"].push_back(std::move(entry));
         }
+        for(const auto& edge:graph.edges) document["edges"].push_back({{"a",edge.a},{"b",edge.b},{"w",edge.w}});
+        for(const auto& sample:gDataset)
+        {
+            std::vector<float> flat;
+            for(const auto& frame:sample.sequence)
+            {
+                RequireJson(frame.size()==sample.in.size(),"Sequence frames have inconsistent dimensions");
+                flat.insert(flat.end(),frame.begin(),frame.end());
+            }
+            document["lessons"].push_back({{"in",sample.in},{"out",sample.out},{"desc",sample.desc},
+                {"sequence_steps",sample.sequence.size()},{"sequence_flat",flat}});
+        }
+        // Validate the same schema we accept on load before touching the existing file.
+        NeuralGraph checked; std::vector<TrainSample> checkedLessons;
+        DecodeGraph(document,checked,checkedLessons);
+        training.read(document); display.read(document);
+        WriteJsonAtomic(path,document);
+        return true;
     }
-    catch(...)
-    {
-        Logf("GRU theme loading failed, using default theme");
-    }
+    catch(const std::exception& error) { ReportFileError("Save failed ("+path+")",error); return false; }
+}
 
-    // After loading, compute a fresh layout to scale to current canvas
-    float W = g.lastCanvasW>0? g.lastCanvasW : 800.0f;
-    float H = g.lastCanvasH>0? g.lastCanvasH : 500.0f;
-    g.layoutLayers(W, H);
-    for(auto& n : g.nodes){ n.vx=0.0f; n.vy=0.0f; }
-    if(!g.layers.empty() && !g.layers.front().nodeIdx.empty())
-        gLiveFeedCurrentInput %= (int)g.layers.front().nodeIdx.size();
-    return true;
+static bool NG_LoadJson(NeuralGraph& destination, const std::string& path, std::string* message)
+{
+    if(IsTrainingActive() || gPendingTopology)
+    { if(message) *message="Finish training or the pending topology change before loading a model."; return false; }
+    try
+    {
+        const Json document=ReadJson(path);
+        NeuralGraph graph;
+        std::vector<TrainSample> lessons;
+        SavedTrainingParams training; training.read(document);
+        SavedDisplaySettings display; display.all_inputs_live=destination.liveInputs; display.read(document);
+        DecodeGraph(document,graph,lessons);
+        graph.liveInputs=display.all_inputs_live;
+        graph.lastCanvasW=destination.lastCanvasW; graph.lastCanvasH=destination.lastCanvasH;
+        graph.collapseHiddenLayers=destination.collapseHiddenLayers;
+        graph.layoutLayers(graph.lastCanvasW>0 ? graph.lastCanvasW : 800.0f,
+                           graph.lastCanvasH>0 ? graph.lastCanvasH : 500.0f);
+        if(!graph.layers.front().nodeIdx.empty()) display.live_current_input%=(int)graph.layers.front().nodeIdx.size();
+        else display.live_current_input=0;
+        // Prepare potentially allocating geometry before committing any live settings.
+        TurbineModel rebuilt;
+        const bool rebuild=gEngine && display.blades!=gEngine->turbine.params.blades;
+        if(rebuild)
+        {
+            rebuilt.params=gEngine->turbine.params;
+            rebuilt.params.blades=display.blades;
+            try { rebuilt.rebuild(); } catch(...) { rebuilt.destroy(); throw; }
+        }
+        destination=std::move(graph);
+        gDataset=std::move(lessons); gLessonsCount=(int)gDataset.size();
+        ++gDatasetRevision;
+        seqPlaying=false; seqPlaybackFrame=-1; seqSelectedFrame=-1;
+        training.apply(); display.apply();
+        if(rebuild)
+        {
+            std::swap(gEngine->turbine,rebuilt);
+            // The prepared mesh uses the requested blade count; keep all loaded dynamics.
+            gEngine->turbine.params.rpm=display.rpm;
+            gEngine->turbine.params.startupTime=display.startup_time;
+            gEngine->turbine.params.shutdownTime=display.shutdown_time;
+            rebuilt.destroy();
+        }
+        ClearLessonTargets(); gSequenceDraft.clear(); gInferenceAccumulator=0; gInferenceNeedsReset=true;
+        if(message) message->clear();
+        return true;
+    }
+    catch(const std::exception& error)
+    {
+        if(message) *message=error.what();
+        return false;
+    }
 }
 
 // ===================== Training dataset & Engine config =====================
-static std::unordered_map<int,float> gManualOutputs;
-static bool gUseManualOverrides = true;
 
 struct TrainState
 {
@@ -2170,6 +2422,15 @@ struct TrainState
     double startTime=0.0;
 };
 static TrainState gTrain;
+static bool IsTrainingActive() { return gTrain.active; }
+static std::string gTrainingError;
+
+static void TopologyCommitted()
+{
+    gTrain.done=false; gTrain.epoch=0; gTrain.lastMSE=0;
+    gTrain.mseHistory.clear(); gTrain.avgEpochMs=0;
+    gCelebrationVisible=false; gTargetReachedVisual=false; gShowTrainingWindow=false;
+}
 
 // Accessors to avoid forward-dep issues
 static float TrainGetLR(){ return gTrain.lr; }
@@ -2179,7 +2440,8 @@ static int   TrainGetEpochs(){ return gTrain.totalEpochs; }
 static float TrainGetTargetMSE(){ return gTrain.targetMSE; }
 static void  TrainApplyParams(float lr, float l1, float l2, int epochs, float targetMSE)
 {
-    gTrain.lr = lr; 
+    if(gTrain.active) return;
+    gTrain.lr = lr;
     gTrain.l1 = l1; 
     gTrain.l2 = l2; 
     gTrain.totalEpochs = epochs; 
@@ -2202,89 +2464,55 @@ static double nowSeconds(){ return glfwGetTime(); }
 
 // Forward declaration to access camera when saving/loading config
 extern Engine* gEngine;
-static void SaveEngineConf(const char* path)
-{
-    std::ofstream f(path);
-    if(!f) return;
-    f << "{\n";
-    f << "  \"engine_version\": \"" << kAppVersion << ",\n";
-
-    f << "  \"learning_rate\": " << gTrain.lr << ",\n";
-    f << "  \"l1\": " << gTrain.l1 << ",\n";
-    f << "  \"l2\": " << gTrain.l2 << ",\n";
-    f << "  \"epochs\": " << gTrain.totalEpochs << "\n";
-
-    // Camera
-    f << ",\n  \"cam_yaw\": " << gEngine->cam.yaw;
-    f << ",\n  \"cam_pitch\": " << gEngine->cam.pitch;
-    f << ",\n  \"cam_distance\": " << gEngine->cam.distance;
-    f << ",\n  \"cam_tx\": " << gEngine->cam.target.x;
-    f << ",\n  \"cam_ty\": " << gEngine->cam.target.y;
-    f << ",\n  \"cam_tz\": " << gEngine->cam.target.z;
-    f << "}\n";
-}
-
-static float parseNumber(const std::string& s, const char* key, float defv)
+static bool SaveEngineConf(const char* path)
 {
     try
     {
-        std::regex rx(std::string("\"")+key+"\"\\s*:\\s*([-+eE0-9\\.]+)");
-        std::smatch m;
-        if(std::regex_search(s,m,rx)){ return std::stof(m[1].str()); }
+        Json document={{"engine_version",kAppVersion}};
+        SavedTrainingParams training; training.write(document); training.read(document);
+        const OrbitCamera camera=gEngine ? gEngine->cam : OrbitCamera{};
+        document["cam_yaw"]=camera.yaw; document["cam_pitch"]=camera.pitch;
+        document["cam_distance"]=camera.distance;
+        document["cam_tx"]=camera.target.x; document["cam_ty"]=camera.target.y; document["cam_tz"]=camera.target.z;
+        RequireJson(camera.distance>0,"Camera distance must be positive");
+        WriteJsonAtomic(path,document);
+        return true;
     }
-    catch(...){}
-    return defv;
-}
-static int parseInt(const std::string& s, const char* key, int defv)
-{
-    try
-    {
-        std::regex rx(std::string("\"")+key+"\"\\s*:\\s*([-+0-9]+)");
-        std::smatch m;
-        if(std::regex_search(s,m,rx)){ return std::stoi(m[1].str()); }
-    }
-    catch(...){}
-    return defv;
+    catch(const std::exception& error) { ReportFileError("Config save failed",error); return false; }
 }
 
 static void LoadEngineConf(const char* path)
 {
-    std::ifstream f(path);
-    if(!f)
+    try
     {
-        SaveEngineConf(path);
-        return;
+        if(!std::filesystem::exists(path)) { SaveEngineConf(path); return; }
+        const Json document=ReadJson(path);
+        SavedTrainingParams training; training.read(document);
+        EngineConf config=gConf;
+        config.engine_version=JsonField(document,"engine_version",std::string(kAppVersion));
+        config.cam_yaw=JsonField(document,"cam_yaw",config.cam_yaw);
+        config.cam_pitch=JsonField(document,"cam_pitch",config.cam_pitch);
+        config.cam_distance=JsonField(document,"cam_distance",config.cam_distance);
+        config.cam_tx=JsonField(document,"cam_tx",config.cam_tx);
+        config.cam_ty=JsonField(document,"cam_ty",config.cam_ty);
+        config.cam_tz=JsonField(document,"cam_tz",config.cam_tz);
+        RequireJson(config.cam_distance>0,"Camera distance must be positive");
+        config.lr=training.lr; config.l1=training.l1; config.l2=training.l2; config.epochs=training.epochs;
+        gConf=std::move(config); training.apply();
+        if(gEngine)
+        {
+            gEngine->cam.yaw=gConf.cam_yaw; gEngine->cam.pitch=gConf.cam_pitch;
+            gEngine->cam.distance=gConf.cam_distance;
+            gEngine->cam.target={gConf.cam_tx,gConf.cam_ty,gConf.cam_tz};
+        }
     }
-
-    std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    gTrain.lr = parseNumber(all, "learning_rate", gTrain.lr);
-    gTrain.l1 = parseNumber(all, "l1", gTrain.l1);
-    gTrain.l2 = parseNumber(all, "l2", gTrain.l2);
-    gTrain.targetMSE = parseNumber(all, "target_mse", gTrain.targetMSE);
-    gTrain.totalEpochs = parseInt(all, "epochs", gTrain.totalEpochs);
-
-    // lessons count is derived from dataset file; do not read from engine.conf anymore
-    // Camera (apply immediately if engine exists)
-    float cyaw = parseNumber(all, "cam_yaw", gConf.cam_yaw);
-    float cpitch = parseNumber(all, "cam_pitch", gConf.cam_pitch);
-    float cdist = parseNumber(all, "cam_distance", gConf.cam_distance);
-    float ctx = parseNumber(all, "cam_tx", gConf.cam_tx);
-    float cty = parseNumber(all, "cam_ty", gConf.cam_ty);
-    float ctz = parseNumber(all, "cam_tz", gConf.cam_tz);
-    gConf.cam_yaw=cyaw; gConf.cam_pitch=cpitch; gConf.cam_distance=cdist;
-    gConf.cam_tx=ctx; gConf.cam_ty=cty; gConf.cam_tz=ctz;
-    if(gEngine)
-    {
-        gEngine->cam.yaw = cyaw;
-        gEngine->cam.pitch = cpitch;
-        gEngine->cam.distance = cdist;
-        gEngine->cam.target = {ctx, cty, ctz};
-    }
+    catch(const std::exception& error) { ReportFileError("Config load failed",error); }
 }
 
 // Deprecated: lessons are embedded in the saved network file; 
 
-static void CollectIO(const NeuralGraph& g, std::vector<float>& in, std::vector<float>& out)
+static void CollectIO(const NeuralGraph& g, std::vector<float>& in, std::vector<float>& out,
+                      bool lessonTargets = false)
 {
     in.clear(); out.clear();
     for(const auto& L : g.layers)
@@ -2295,7 +2523,13 @@ static void CollectIO(const NeuralGraph& g, std::vector<float>& in, std::vector<
         } 
         else if(L.kind == LayerKind::Output)
         {
-            for(int idx : L.nodeIdx) out.push_back(g.nodes[idx].value);
+            for(int idx : L.nodeIdx)
+            {
+                const Neuron& node = g.nodes[idx];
+                auto target = gLessonTargets.find(node.id);
+                out.push_back(lessonTargets ? (target != gLessonTargets.end() ? target->second : 0.0f)
+                                            : node.value);
+            }
         }
     }
 }
@@ -2350,17 +2584,13 @@ static float Sigmoid(float value)
     return 1.0f / (1.0f + std::exp(-std::clamp(value, -30.0f, 30.0f)));
 }
 
-static void ForwardGRULayer(NeuralGraph& graph, size_t layerIndex)
+static bool ForwardGRULayer(NeuralGraph& graph, size_t layerIndex)
 {
     Layer& layer = graph.layers[layerIndex];
-    if(layerIndex == 0 || layer.nodeIdx.empty()) return;
+    if(layerIndex == 0 || layer.nodeIdx.empty()) return false;
     const Layer& previousLayer = graph.layers[layerIndex - 1];
     const int inputSize = (int)previousLayer.nodeIdx.size();
     const int hiddenSize = (int)layer.nodeIdx.size();
-    if(layer.gruInputSize != inputSize || layer.gruWz.size() != (size_t)inputSize * hiddenSize)
-    {
-        InitializeGRU(layer, inputSize);
-    }
 
     std::vector<float> input(inputSize, 0.0f);
     for(int j = 0; j < inputSize; ++j) input[j] = graph.nodes[previousLayer.nodeIdx[j]].value;
@@ -2386,6 +2616,7 @@ static void ForwardGRULayer(NeuralGraph& graph, size_t layerIndex)
             updateSum += layer.gruUz[(size_t)i * hiddenSize + j] * layer.gruLastPrevious[j];
             resetSum += layer.gruUr[(size_t)i * hiddenSize + j] * layer.gruLastPrevious[j];
         }
+        if(!std::isfinite(updateSum) || !std::isfinite(resetSum)) return false;
         layer.gruLastUpdate[i] = Sigmoid(updateSum);
         layer.gruLastReset[i] = Sigmoid(resetSum);
     }
@@ -2403,17 +2634,54 @@ static void ForwardGRULayer(NeuralGraph& graph, size_t layerIndex)
             candidateSum += layer.gruUh[(size_t)i * hiddenSize + j]
                 * layer.gruLastReset[j] * layer.gruLastPrevious[j];
         }
+        if(!std::isfinite(candidateSum)) return false;
         const float candidate = std::tanh(candidateSum);
         layer.gruLastCandidate[i] = candidate;
         const float update = layer.gruLastUpdate[i];
         nextState[i] = (1.0f - update) * layer.gruLastPrevious[i] + update * candidate;
-        graph.nodes[layer.nodeIdx[i]].value = nextState[i];
+        if(!std::isfinite(nextState[i])) return false;
     }
+    for(int i=0; i<hiddenSize; ++i) graph.nodes[layer.nodeIdx[i]].value = nextState[i];
     layer.gruState = std::move(nextState);
+    return true;
 }
 
-static void ForwardPass(NeuralGraph& g)
+// A preview recomputes dense layers but holds recurrent memory at its current step.
+static bool ForwardPass(NeuralGraph& g, bool advanceMemory = true, std::string* errorOut = nullptr)
 {
+    // A rejected step must not leave partially advanced recurrent memory or outputs.
+    std::vector<float> previousValues;
+    previousValues.reserve(g.nodes.size());
+    for(const auto& node : g.nodes) previousValues.push_back(node.value);
+    std::vector<std::vector<float>> previousStates(g.layers.size());
+    for(size_t i=0; i<g.layers.size(); ++i)
+        if(g.layers[i].kind==LayerKind::GRU) previousStates[i]=g.layers[i].gruState;
+    static std::string lastError;
+    auto fail = [&](const std::string& message)
+    {
+        for(size_t i=0; i<g.nodes.size(); ++i) g.nodes[i].value=previousValues[i];
+        for(size_t i=0; i<g.layers.size(); ++i)
+            if(g.layers[i].kind==LayerKind::GRU) g.layers[i].gruState=std::move(previousStates[i]);
+        if(errorOut) *errorOut=message;
+        gPauseLiveInference=true;
+        seqPlaying=false;
+        gInferenceAccumulator=0.0;
+        if(message!=lastError)
+        {
+            Logf("Inference stopped: %s",message.c_str());
+            gToastMsg="Inference stopped: "+message;
+            gToastT=glfwGetTime();
+            lastError=message;
+        }
+        return false;
+    };
+    std::string error;
+    if(!NG_ValidateTopology(g,error)) return fail(error);
+    for(const auto& node : g.nodes)
+        if(node.isInput && !std::isfinite(node.value)) return fail("Non-finite input in neuron "+std::to_string(node.id));
+    for(const auto& layer : g.layers) if(layer.kind==LayerKind::GRU)
+        for(float value : layer.gruState)
+            if(!std::isfinite(value)) return fail("Non-finite GRU memory.");
     GraphCache cache = BuildCache(g);
     for(size_t layerIndex = 0; layerIndex < g.layers.size(); ++layerIndex)
     {
@@ -2421,251 +2689,448 @@ static void ForwardPass(NeuralGraph& g)
         if(L.kind == LayerKind::Input) continue;
         if(L.kind == LayerKind::GRU)
         {
-            ForwardGRULayer(g, layerIndex);
+            if(advanceMemory)
+            {
+                if(!ForwardGRULayer(g, layerIndex)) return fail("Numerical overflow in GRU layer "+std::to_string(layerIndex));
+            }
+            else
+                for(size_t i = 0; i < L.nodeIdx.size(); ++i)
+                    g.nodes[L.nodeIdx[i]].value = i < L.gruState.size() ? L.gruState[i] : 0.0f;
             continue;
         }
         for(int idx : L.nodeIdx)
         {
             Neuron& n = g.nodes[idx];
-            float v_ = 0.0f;
-            bool usedOverride = false;
-            if(L.kind == LayerKind::Output && gUseManualOverrides && !gTrain.active && !g.liveInputs)
+            float sum = ng_get_bias(n);
+            auto it = cache.inEdges.find(n.id);
+            if(it != cache.inEdges.end())
             {
-                auto itov = gManualOutputs.find(n.id);
-                if(itov != gManualOutputs.end()){
-                    v_ = itov->second; usedOverride = true;
-                }
-            }
-
-            if(!usedOverride)
-            {
-                float sum = ng_get_bias(n);
-                auto it = cache.inEdges.find(n.id);
-                if(it != cache.inEdges.end())
+                for(int ei : it->second)
                 {
-                    for(int ei : it->second)
+                    const auto& e = g.edges[ei];
+                    auto source = cache.id2idx.find(e.a);
+                    if(source != cache.id2idx.end())
                     {
-                        const auto& e = g.edges[ei];
-                        auto ita = cache.id2idx.find(e.a);
-                        if(ita!=cache.id2idx.end()) sum += e.w * g.nodes[ita->second].value;
+                        sum += e.w * g.nodes[source->second].value;
+                        if(!std::isfinite(sum)) return fail("Numerical overflow in neuron "+std::to_string(n.id));
                     }
                 }
-                v_ = ActApply(L.act, sum);
             }
-            if(L.kind == LayerKind::Output){ if(v_ < 0.0f) v_ = 0.0f; else if(v_ > 1.0f) v_ = 1.0f; }
-            n.value = v_;
+            n.value = ActApply(L.act, sum);
+            if(!std::isfinite(n.value)) return fail("Non-finite activation in neuron "+std::to_string(n.id));
         }
     }
+    lastError.clear();
+    if(errorOut) errorOut->clear();
+    return true;
+}
+
+static void ResetInferenceMemory(NeuralGraph& graph)
+{
+    ResetGRUState(graph);
+    gInferenceAccumulator = 0.0;
+    gInferenceNeedsReset = false;
+    ForwardPass(graph, false);
+}
+
+static void UseManualInputs(NeuralGraph& graph)
+{
+    seqPlaying = false;
+    graph.liveInputs = false;
+    gLiveFeedWaveActive = false;
+    gRandomLiveFeedActive = false;
+    for(auto& node : graph.nodes) if(node.isInput) node.live = false;
+    gPauseLiveInference = true;
+    gInferenceAccumulator = 0.0;
+}
+
+static void UseLiveInputs(bool wave = false)
+{
+    seqPlaying = false;
+    gLiveFeedWaveActive = wave;
+    if(wave) gRandomLiveFeedActive = false;
+    gPauseLiveInference = false;
+    gInferenceAccumulator = 0.0;
+    gInferenceNeedsReset = true;
+}
+
+// Seeking replays the prefix; normal playback consumes each frame exactly once.
+static bool PreviewSequenceFrame(NeuralGraph& graph, int frame, bool seek)
+{
+    if(frame < 0 || frame >= (int)gSequenceDraft.size() || graph.layers.empty()) return false;
+    const auto& inputs = graph.layers.front().nodeIdx;
+    for(int step = seek ? 0 : frame; step <= frame; ++step)
+    {
+        if(gSequenceDraft[step].size() != inputs.size()) return false;
+        for(float value : gSequenceDraft[step]) if(!std::isfinite(value)) return false;
+    }
+    if(seek) ResetInferenceMemory(graph);
+    for(int step = seek ? 0 : frame; step <= frame; ++step)
+    {
+        for(size_t i=0; i<inputs.size(); ++i)
+            graph.nodes[inputs[i]].value = gSequenceDraft[step][i];
+        if(!ForwardPass(graph, true)) return false;
+        for(const auto& node : graph.nodes) if(!std::isfinite(node.value)) return false;
+    }
+    seqSelectedFrame = frame;
+    return true;
+}
+
+static void UpdateInference(NeuralGraph& graph, double dt)
+{
+    if(gPendingTopology) return;
+    if(gTrain.active)
+    {
+        seqPlaying = false;
+        gInferenceAccumulator = 0.0;
+        gInferenceNeedsReset = true;
+        return;
+    }
+    if(gInferenceNeedsReset) ResetInferenceMemory(graph);
+    if(seqPlaying)
+    {
+        if(gSequenceDraft.empty()) { seqPlaying=false; return; }
+        seqPlaybackAccumulator += std::clamp(dt, 0.0, 0.25);
+        const double interval = 1.0 / std::max(0.2f, seqPlaybackHz);
+        while(seqPlaybackAccumulator >= interval)
+        {
+            seqPlaybackAccumulator -= interval;
+            seqPlaybackFrame = (seqPlaybackFrame+1) % (int)gSequenceDraft.size();
+            if(!PreviewSequenceFrame(graph, seqPlaybackFrame, seqPlaybackFrame==0))
+            {
+                seqPlaying=false;
+                Logf("Sequence playback stopped: invalid frame or network parameters.");
+                break;
+            }
+        }
+        return;
+    }
+    bool hasLiveInput = graph.liveInputs || gLiveFeedWaveActive;
+    for(const auto& node : graph.nodes)
+        if(node.isInput && node.live) hasLiveInput = true;
+    if(gPauseLiveInference || !hasLiveInput)
+    {
+        gInferenceAccumulator = 0.0;
+        ForwardPass(graph, false);
+        return;
+    }
+    // Catch up short frame delays, but do not replay a long UI stall as new observations.
+    gInferenceAccumulator += std::clamp(dt, 0.0, 0.25);
+    while(gInferenceAccumulator >= kInferenceStepSeconds)
+    {
+        gInferenceAccumulator -= kInferenceStepSeconds;
+        graph.tickLiveInputs((float)kInferenceStepSeconds);
+        if(!ForwardPass(graph))
+        {
+            gPauseLiveInference = true;
+            gInferenceAccumulator = 0.0;
+            break;
+        }
+    }
+}
+
+static bool ValidateTrainingData(const NeuralGraph& graph, std::string& error)
+{
+    auto fail = [&](const std::string& message) { error = message; return false; };
+    if(!NG_ValidateTopology(graph,error)) return false;
+    if(graph.layers.front().nodeIdx.empty() || graph.layers.back().nodeIdx.empty())
+        return fail("Add an input and output neuron before training.");
+    if(gDataset.empty()) return fail("Dataset is empty.");
+    if(!std::isfinite(gTrain.lr) || gTrain.lr <= 0) return fail("Learning rate must be finite and positive.");
+    if(!std::isfinite(gTrain.l1) || gTrain.l1 < 0) return fail("L1 must be finite and non-negative.");
+    if(!std::isfinite(gTrain.l2) || gTrain.l2 < 0) return fail("L2 must be finite and non-negative.");
+    if(!std::isfinite(gTrain.targetMSE)) return fail("Target MSE must be finite.");
+    if(gTrain.totalEpochs <= 0) return fail("Epoch count must be positive.");
+    const size_t inputs=graph.layers.front().nodeIdx.size();
+    const size_t outputs=graph.layers.back().nodeIdx.size();
+    for(size_t si = 0; si < gDataset.size(); ++si)
+    {
+        const auto& sample = gDataset[si];
+        const std::string prefix = "Lesson " + std::to_string(si + 1) + ": ";
+        auto check = [&](const std::vector<float>& values, size_t expected, const std::string& name)
+        {
+            if(values.size() != expected)
+                return fail(prefix + name + " has " + std::to_string(values.size()) +
+                            " values; expected " + std::to_string(expected));
+            for(float value : values) if(!std::isfinite(value)) return fail(prefix + name + " contains NaN or infinity.");
+            return true;
+        };
+        if(!check(sample.in, inputs, "input") || !check(sample.out, outputs, "target")) return false;
+        for(size_t ti = 0; ti < sample.sequence.size(); ++ti)
+            if(!check(sample.sequence[ti], inputs, "frame " + std::to_string(ti + 1))) return false;
+    }
+    return true;
+}
+
+static bool TrainingForward(NeuralGraph& graph, const std::vector<float>& frame, std::string& error)
+{
+    size_t pos = 0;
+    for(const auto& layer : graph.layers) if(layer.kind == LayerKind::Input)
+        for(int idx : layer.nodeIdx) graph.nodes[idx].value = frame[pos++];
+    if(!ForwardPass(graph, true, &error)) return false;
+    for(const auto& node : graph.nodes)
+        if(!std::isfinite(node.value)) { error = "Non-finite activation in neuron " + std::to_string(node.id); return false; }
+    return true;
+}
+
+// Evaluate a fixed model; a copy keeps evaluation memory and inputs out of the editor.
+static float EvaluateTrainingMSE(const NeuralGraph& graph, std::string& error)
+{
+    const float invalid = std::numeric_limits<float>::quiet_NaN();
+    if(!ValidateTrainingData(graph, error)) return invalid;
+    NeuralGraph evaluation = graph;
+    std::vector<int> outputs;
+    for(const auto& layer : evaluation.layers) if(layer.kind == LayerKind::Output)
+        outputs.insert(outputs.end(), layer.nodeIdx.begin(), layer.nodeIdx.end());
+    double squaredError = 0.0;
+    for(size_t si = 0; si < gDataset.size(); ++si)
+    {
+        ResetGRUState(evaluation);
+        const auto& sample = gDataset[si];
+        const std::vector<std::vector<float>> single = {sample.in};
+        const auto& sequence = sample.sequence.empty() ? single : sample.sequence;
+        for(const auto& frame : sequence)
+            if(!TrainingForward(evaluation, frame, error))
+            { error = "Evaluation lesson " + std::to_string(si + 1) + ": " + error; return invalid; }
+        for(size_t oi = 0; oi < outputs.size(); ++oi)
+        {
+            const double difference = (double)evaluation.nodes[outputs[oi]].value - sample.out[oi];
+            squaredError += difference * difference;
+        }
+    }
+    const double mse = squaredError / ((double)gDataset.size() * outputs.size());
+    if(!std::isfinite(mse) || mse > std::numeric_limits<float>::max())
+    { error = "MSE is outside the finite numeric range."; return invalid; }
+    return (float)mse;
+}
+
+static bool StartTraining(NeuralGraph& graph, bool toTarget)
+{
+    if(gPendingTopology) { Logf("Resolve the topology change first."); return false; }
+    if(gTrain.active) { Logf("Training is already running."); return false; }
+    gTrainingError.clear();
+    if(!ValidateTrainingData(graph, gTrainingError) ||
+       (toTarget && gTrain.targetMSE <= 0.0f))
+    {
+        if(gTrainingError.empty()) gTrainingError = "Train to target requires Target MSE > 0.";
+        Logf("Cannot start training: %s", gTrainingError.c_str());
+        gToastMsg = gTrainingError; gToastT = nowSeconds();
+        return false;
+    }
+    // Starting or resuming training always retains the current learned parameters.
+    const float initialMSE = EvaluateTrainingMSE(graph, gTrainingError);
+    if(!std::isfinite(initialMSE))
+    {
+        Logf("Cannot start training: %s", gTrainingError.c_str());
+        gToastMsg = gTrainingError; gToastT = nowSeconds();
+        return false;
+    }
+    if(toTarget) gTrain.totalEpochs = std::max(gTrain.totalEpochs, 200000);
+    gTrain.active = true; gTrain.done = false; gTrain.epoch = 0;
+    gTrain.lastMSE = initialMSE;
+    gTrain.mseHistory = {initialMSE};
+    gTrain.startTime = nowSeconds(); gTrain.avgEpochMs = 0.0;
+    gCelebrationVisible = false; gTargetReachedVisual = false; gTrainInterrupted = false;
+    gShowTrainingWindow = true;
+    Logf("Training started: epochs=%d, lr=%.6f, L1=%.6f, L2=%.6f, targetMSE=%.6f, initialMSE=%.6f",
+         gTrain.totalEpochs, gTrain.lr, gTrain.l1, gTrain.l2, gTrain.targetMSE, initialMSE);
+    return true;
 }
 
 static float sgn(float x){ return (x>0)-(x<0); }
 
-static std::vector<float> TrainLastGRUStep(Layer& layer, const std::vector<float>& hiddenDelta,
-                                           float learningRate, float l1, float l2)
-{
-    const int hiddenSize = (int)layer.nodeIdx.size();
-    const int inputSize = layer.gruInputSize;
-    if((int)hiddenDelta.size() != hiddenSize ||
-       (int)layer.gruLastInput.size() != inputSize ||
-       (int)layer.gruLastPrevious.size() != hiddenSize) return {};
-
-    std::vector<float> candidateDelta(hiddenSize, 0.0f);
-    std::vector<float> updateDelta(hiddenSize, 0.0f);
-    std::vector<float> resetDelta(hiddenSize, 0.0f);
-    for(int i = 0; i < hiddenSize; ++i)
-    {
-        const float update = layer.gruLastUpdate[i];
-        const float candidate = layer.gruLastCandidate[i];
-        candidateDelta[i] = hiddenDelta[i] * update * (1.0f - candidate * candidate);
-        const float dz = hiddenDelta[i] * (candidate - layer.gruLastPrevious[i]);
-        updateDelta[i] = dz * update * (1.0f - update);
-    }
-    for(int j = 0; j < hiddenSize; ++j)
-    {
-        float resetGradient = 0.0f;
-        for(int i = 0; i < hiddenSize; ++i)
-        {
-            resetGradient += candidateDelta[i] * layer.gruUh[(size_t)i * hiddenSize + j]
-                * layer.gruLastPrevious[j];
-        }
-        const float reset = layer.gruLastReset[j];
-        resetDelta[j] = resetGradient * reset * (1.0f - reset);
-    }
-
-    std::vector<float> inputDelta(inputSize, 0.0f);
-    for(int j = 0; j < inputSize; ++j)
-    {
-        for(int i = 0; i < hiddenSize; ++i)
-        {
-            const size_t index = (size_t)i * inputSize + j;
-            inputDelta[j] += layer.gruWz[index] * updateDelta[i]
-                + layer.gruWr[index] * resetDelta[i]
-                + layer.gruWh[index] * candidateDelta[i];
-        }
-    }
-
-    auto applyGradient = [&](float& parameter, float gradient)
-    {
-        gradient += l2 * parameter + l1 * sgn(parameter);
-        parameter -= learningRate * std::clamp(gradient, -1.0f, 1.0f);
-    };
-    for(int i = 0; i < hiddenSize; ++i)
-    {
-        for(int j = 0; j < inputSize; ++j)
-        {
-            const size_t index = (size_t)i * inputSize + j;
-            applyGradient(layer.gruWz[index], updateDelta[i] * layer.gruLastInput[j]);
-            applyGradient(layer.gruWr[index], resetDelta[i] * layer.gruLastInput[j]);
-            applyGradient(layer.gruWh[index], candidateDelta[i] * layer.gruLastInput[j]);
-        }
-        for(int j = 0; j < hiddenSize; ++j)
-        {
-            const size_t index = (size_t)i * hiddenSize + j;
-            applyGradient(layer.gruUz[index], updateDelta[i] * layer.gruLastPrevious[j]);
-            applyGradient(layer.gruUr[index], resetDelta[i] * layer.gruLastPrevious[j]);
-            applyGradient(layer.gruUh[index], candidateDelta[i] * layer.gruLastReset[j]
-                * layer.gruLastPrevious[j]);
-        }
-        layer.gruBz[i] -= learningRate * std::clamp(updateDelta[i], -1.0f, 1.0f);
-        layer.gruBr[i] -= learningRate * std::clamp(resetDelta[i], -1.0f, 1.0f);
-        layer.gruBh[i] -= learningRate * std::clamp(candidateDelta[i], -1.0f, 1.0f);
-    }
-    return inputDelta;
-}
+// Sequence training: cache every time step, propagate gradients through time,
+// then apply one consistent, globally clipped update per training sample.
+struct GRUStepCache {
+    std::vector<float> x, prev, z, r, candidate;
+};
+struct SequenceStepCache {
+    std::vector<float> values;
+    std::vector<GRUStepCache> gru;
+};
+struct GRUGradient {
+    std::vector<float> wz, wr, wh, uz, ur, uh, bz, br, bh;
+};
 
 static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
 {
-    if(gDataset.empty()) return 0.0f;
-    float mse = 0.0f;
-
-    GraphCache cache = BuildCache(g);
-
-    for(const auto& s : gDataset)
+    if(!ValidateTrainingData(g, gTrainingError)) return std::numeric_limits<float>::quiet_NaN();
+    const GraphCache cache = BuildCache(g);
+    std::vector<int> nodeLayer(g.nodes.size(), -1);
+    for(size_t li=0;li<g.layers.size();++li)
+        for(int idx:g.layers[li].nodeIdx) nodeLayer[idx]=(int)li;
+    std::vector<int> outputs;
+    for(const auto& layer:g.layers) if(layer.kind==LayerKind::Output)
+        outputs.insert(outputs.end(),layer.nodeIdx.begin(),layer.nodeIdx.end());
+    for(const auto& sample:gDataset)
     {
         ResetGRUState(g);
-        const std::vector<std::vector<float>> fallbackSequence = { s.in };
-        const auto& sequence = s.sequence.empty() ? fallbackSequence : s.sequence;
-        for(const auto& frame : sequence)
+        const std::vector<std::vector<float>> fallback={sample.in};
+        const auto& sequence=sample.sequence.empty()?fallback:sample.sequence;
+        std::vector<SequenceStepCache> steps;
+        steps.reserve(sequence.size());
+        for(const auto& frame:sequence)
         {
-            size_t pi=0;
-            for(const auto& L : g.layers)
+            if(!TrainingForward(g, frame, gTrainingError)) return std::numeric_limits<float>::quiet_NaN();
+            SequenceStepCache step;
+            step.values.reserve(g.nodes.size());
+            for(const auto& n:g.nodes) step.values.push_back(n.value);
+            step.gru.resize(g.layers.size());
+            for(size_t li=0;li<g.layers.size();++li) if(g.layers[li].kind==LayerKind::GRU)
             {
-                if(L.kind != LayerKind::Input) continue;
-                for(int idx : L.nodeIdx)
-                {
-                    g.nodes[idx].value = (pi < frame.size() ? frame[pi++] : 0.0f);
-                }
+                const auto& L=g.layers[li];
+                step.gru[li]={L.gruLastInput,L.gruLastPrevious,L.gruLastUpdate,
+                              L.gruLastReset,L.gruLastCandidate};
             }
-            ForwardPass(g);
+            steps.push_back(std::move(step));
         }
-
-        std::vector<int> outNodeIdx;
-        Act outAct = Act::Linear;
-        for(const auto& L : g.layers){
-            if(L.kind == LayerKind::Output)
-            {
-                outAct = L.act;
-                for(int idx : L.nodeIdx) outNodeIdx.push_back(idx);
-            }
-        }
-
-        std::unordered_map<int,float> delta; // by node id
-        for(size_t i=0; i<outNodeIdx.size(); ++i)
+        std::vector<float> edgeGrad(g.edges.size(),0.0f),biasGrad(g.nodes.size(),0.0f);
+        std::vector<GRUGradient> gg(g.layers.size());
+        for(size_t li=0;li<g.layers.size();++li) if(g.layers[li].kind==LayerKind::GRU)
         {
-            int idx = outNodeIdx[i];
-            Neuron& n = g.nodes[idx];
-            float y = n.value;
-            float t = (i < s.out.size() ? s.out[i] : 0.0f);
-            float err = y - t;
-            mse += err*err;
-            float d = err * ActDeriv(outAct, y);
-            delta[n.id] = d;
+            const auto& L=g.layers[li]; auto& q=gg[li];
+            q.wz.resize(L.gruWz.size());q.wr.resize(L.gruWr.size());q.wh.resize(L.gruWh.size());
+            q.uz.resize(L.gruUz.size());q.ur.resize(L.gruUr.size());q.uh.resize(L.gruUh.size());
+            q.bz.resize(L.gruBz.size());q.br.resize(L.gruBr.size());q.bh.resize(L.gruBh.size());
         }
-
-        // Hidden layers backprop (right-to-left; skip last layer already handled)
-        for(int Li=(int)g.layers.size()-2; Li>=0; --Li)
+        std::vector<std::vector<float>> adj(steps.size(),std::vector<float>(g.nodes.size(),0.0f));
+        const size_t last=steps.size()-1;
+        for(size_t oi=0;oi<outputs.size();++oi)
         {
-            const auto& L = g.layers[Li];
-            if(L.kind == LayerKind::Input) continue;
-            Act act = L.act;
-            for(int idx : L.nodeIdx)
+            const int idx=outputs[oi];
+            const float error=steps[last].values[idx]-sample.out[oi];
+            adj[last][idx]+=error; // derivative of 0.5 * squared error
+        }
+        // Reverse both the time axis and the layer axis. No parameters change here.
+        for(int ti=(int)steps.size()-1;ti>=0;--ti)
+        {
+            const auto& step=steps[ti];
+            for(int li=(int)g.layers.size()-1;li>=0;--li)
             {
-                Neuron& n = g.nodes[idx];
-                float sum=0.0f;
-                auto it = cache.outEdges.find(n.id);
-                if(it != cache.outEdges.end())
+                const auto& L=g.layers[li];
+                if(L.kind==LayerKind::Input) continue;
+                if(L.kind==LayerKind::GRU)
                 {
-                    for(int ei : it->second)
+                    if(li==0) continue;
+                    const auto& q=step.gru[li];
+                    const int H=(int)L.nodeIdx.size(), I=(int)q.x.size();
+                    if((int)q.prev.size()!=H || (int)q.z.size()!=H ||
+                       (int)q.r.size()!=H || (int)q.candidate.size()!=H)
                     {
-                        const auto& e = g.edges[ei];
-                        auto it2 = delta.find(e.b);
-                        if(it2 != delta.end()) sum += e.w * it2->second;
+                        gTrainingError = "Invalid GRU cache during backpropagation.";
+                        return std::numeric_limits<float>::quiet_NaN();
+                    }
+                    std::vector<float> dz(H),dr(H),dh(H),dprev(H),dx(I);
+                    for(int i=0;i<H;++i)
+                    {
+                        const float d=adj[ti][L.nodeIdx[i]];
+                        dh[i]=d*q.z[i]*(1-q.candidate[i]*q.candidate[i]);
+                        dz[i]=d*(q.candidate[i]-q.prev[i])*q.z[i]*(1-q.z[i]);
+                        dprev[i]=d*(1-q.z[i]);
+                    }
+                    for(int j=0;j<H;++j)
+                    {
+                        float resetGrad=0;
+                        for(int i=0;i<H;++i)
+                            resetGrad+=dh[i]*L.gruUh[(size_t)i*H+j]*q.prev[j];
+                        dr[j]=resetGrad*q.r[j]*(1-q.r[j]);
+                    }
+                    for(int j=0;j<H;++j)
+                        for(int i=0;i<H;++i)
+                            dprev[j]+=L.gruUz[(size_t)i*H+j]*dz[i]
+                                     +L.gruUr[(size_t)i*H+j]*dr[i]
+                                     +L.gruUh[(size_t)i*H+j]*dh[i]*q.r[j];
+                    auto& grad=gg[li];
+                    for(int i=0;i<H;++i)
+                    {
+                        grad.bz[i]+=dz[i];grad.br[i]+=dr[i];grad.bh[i]+=dh[i];
+                        for(int j=0;j<I;++j)
+                        {
+                            const size_t k=(size_t)i*I+j;
+                            grad.wz[k]+=dz[i]*q.x[j];grad.wr[k]+=dr[i]*q.x[j];grad.wh[k]+=dh[i]*q.x[j];
+                            dx[j]+=L.gruWz[k]*dz[i]+L.gruWr[k]*dr[i]+L.gruWh[k]*dh[i];
+                        }
+                        for(int j=0;j<H;++j)
+                        {
+                            const size_t k=(size_t)i*H+j;
+                            grad.uz[k]+=dz[i]*q.prev[j];grad.ur[k]+=dr[i]*q.prev[j];
+                            grad.uh[k]+=dh[i]*q.r[j]*q.prev[j];
+                        }
+                    }
+                    const auto& previous=g.layers[li-1];
+                    for(int j=0;j<I && j<(int)previous.nodeIdx.size();++j)
+                        adj[ti][previous.nodeIdx[j]]+=dx[j];
+                    if(ti>0) for(int j=0;j<H;++j) adj[ti-1][L.nodeIdx[j]]+=dprev[j];
+                    continue;
+                }
+                for(int idx:L.nodeIdx)
+                {
+                    const auto& n=g.nodes[idx];
+                    const float d=adj[ti][idx]*ActDeriv(L.act,step.values[idx]);
+                    biasGrad[idx]+=d;
+                    auto it=cache.inEdges.find(n.id);
+                    if(it==cache.inEdges.end()) continue;
+                    for(int ei:it->second)
+                    {
+                        const auto& e=g.edges[ei];
+                        auto src=cache.id2idx.find(e.a);
+                        if(src==cache.id2idx.end()) continue;
+                        const int si=src->second;
+                        // GRU inputs are represented by their gated matrices, not graph edges.
+                        edgeGrad[ei]+=d*step.values[si];
+                        adj[ti][si]+=d*e.w;
                     }
                 }
-                float d = L.kind == LayerKind::GRU ? sum : ActDeriv(act, n.value) * sum;
-                delta[n.id] = d;
             }
         }
-
-        // Train gated parameters and pass their input gradient into the dense
-        // feature extractor immediately before the GRU.
-        for(int layerIndex = (int)g.layers.size() - 1; layerIndex >= 0; --layerIndex)
+        // Regularize weights (not biases) and clip the combined gradient norm.
+        double norm2=0.0;
+        auto regularize=[&](float grad,float weight){return grad+l2*weight+l1*sgn(weight);};
+        std::vector<char> entersGRU(g.edges.size(),0);
+        for(size_t ei=0;ei<g.edges.size();++ei)
         {
-            Layer& layer = g.layers[layerIndex];
-            if(layer.kind != LayerKind::GRU) continue;
-            std::vector<float> hiddenDelta;
-            hiddenDelta.reserve(layer.nodeIdx.size());
-            for(int idx : layer.nodeIdx) hiddenDelta.push_back(delta[g.nodes[idx].id]);
-            const std::vector<float> inputDelta = TrainLastGRUStep(layer, hiddenDelta, lr, l1, l2);
-            if(layerIndex > 0)
-            {
-                const Layer& previous = g.layers[layerIndex - 1];
-                for(size_t i = 0; i < previous.nodeIdx.size() && i < inputDelta.size(); ++i)
-                {
-                    Neuron& neuron = g.nodes[previous.nodeIdx[i]];
-                    delta[neuron.id] = previous.kind == LayerKind::GRU ? inputDelta[i]
-                        : inputDelta[i] * ActDeriv(previous.act, neuron.value);
-                }
-            }
+            auto it=cache.id2idx.find(g.edges[ei].b);
+            if(it!=cache.id2idx.end() && nodeLayer[it->second]>=0 &&
+               g.layers[nodeLayer[it->second]].kind==LayerKind::GRU) entersGRU[ei]=1;
+            if(!entersGRU[ei]) {edgeGrad[ei]=regularize(edgeGrad[ei],g.edges[ei].w);norm2+=(double)edgeGrad[ei]*edgeGrad[ei];}
         }
-
-        // Weights update
-        for(auto& e : g.edges)
+        for(float v:biasGrad) norm2+=(double)v*v;
+        auto regVec=[&](std::vector<float>& grad,const std::vector<float>& weight)
         {
-            bool entersGRU = false;
-            for(const Layer& layer : g.layers)
-            {
-                if(layer.kind != LayerKind::GRU) continue;
-                for(int idx : layer.nodeIdx)
-                {
-                    if(g.nodes[idx].id == e.b) { entersGRU = true; break; }
-                }
-                if(entersGRU) break;
-            }
-            if(entersGRU) continue;
-            float srcv = 0.0f;
-            auto ita = cache.id2idx.find(e.a);
-            if(ita!=cache.id2idx.end()) srcv = g.nodes[ita->second].value;
-            float db = delta[e.b];
-            float grad = srcv * db + l2*e.w + l1*sgn(e.w);
-            e.w -= lr * grad;
+            for(size_t k=0;k<grad.size();++k){grad[k]=regularize(grad[k],weight[k]);norm2+=(double)grad[k]*grad[k];}
+        };
+        for(size_t li=0;li<g.layers.size();++li) if(g.layers[li].kind==LayerKind::GRU)
+        {
+            auto& q=gg[li];const auto& L=g.layers[li];
+            regVec(q.wz,L.gruWz);regVec(q.wr,L.gruWr);regVec(q.wh,L.gruWh);
+            regVec(q.uz,L.gruUz);regVec(q.ur,L.gruUr);regVec(q.uh,L.gruUh);
+            for(const auto* v:{&q.bz,&q.br,&q.bh}) for(float x:*v) norm2+=(double)x*x;
         }
-
-        // Bias update
-        for(const auto& L : g.layers)
+        if(!std::isfinite(norm2))
         {
-            if(L.kind == LayerKind::Input || L.kind == LayerKind::GRU) continue;
-            for(int idx : L.nodeIdx)
+            gTrainingError = "Non-finite gradient; parameter update was rejected.";
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+        const float scale=(float)std::min(1.0,1.0/std::max(1e-12,std::sqrt(norm2)));
+        for(size_t ei=0;ei<g.edges.size();++ei) if(!entersGRU[ei]) g.edges[ei].w-=lr*scale*edgeGrad[ei];
+        for(size_t li=0;li<g.layers.size();++li)
+        {
+            auto& L=g.layers[li];
+            if(L.kind==LayerKind::Input) continue;
+            if(L.kind!=LayerKind::GRU)
             {
-                Neuron& n = g.nodes[idx];
-                float db = delta[n.id];
-                float b = ng_get_bias(n);
-                ng_set_bias(n, b - lr * db);
+                for(int idx:L.nodeIdx) ng_set_bias(g.nodes[idx],ng_get_bias(g.nodes[idx])-lr*scale*biasGrad[idx]);
+                continue;
             }
+            auto& q=gg[li];
+            auto apply=[&](std::vector<float>& w,const std::vector<float>& grad)
+            {for(size_t k=0;k<w.size();++k)w[k]-=lr*scale*grad[k];};
+            apply(L.gruWz,q.wz);apply(L.gruWr,q.wr);apply(L.gruWh,q.wh);
+            apply(L.gruUz,q.uz);apply(L.gruUr,q.ur);apply(L.gruUh,q.uh);
+            apply(L.gruBz,q.bz);apply(L.gruBr,q.br);apply(L.gruBh,q.bh);
         }
     }
-    mse /= (float)std::max<size_t>(1, gDataset.size());
-    return mse;
+    return EvaluateTrainingMSE(g, gTrainingError);
 }
 
 #endif
@@ -2679,20 +3144,39 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
 // Forward declaration of global engine pointer for theme access
 extern Engine* gEngine;
 
+// Use exactly the same visibility rules as the canvas renderer. Hidden input
+// groups keep stale coordinates, so searching all nodes selects wrong neurons.
+static bool IsVisibleInput(const NeuralGraph& graph, int nodeIndex);
 Neuron* NeuralGraph::findAt(float mx, float my)
 {
-    for(auto& n: nodes)
+    Neuron* closest = nullptr;
+    float bestDistanceSquared = std::numeric_limits<float>::max();
+    for(size_t i=0; i<nodes.size(); ++i)
     {
-        float dx=mx-n.x, dy=my-n.y;
-        if(dx*dx+dy*dy <= n.radius*n.radius) return &n;
+        Neuron& n = nodes[i];
+        if(!IsVisibleInput(*this, static_cast<int>(i)) || (!n.isInput && GroupMemberHidden(*this,n.id))) continue;
+        if(collapseHiddenLayers)
+        {
+            bool hiddenLayer = false;
+            for(const Layer& layer : layers)
+                if(layer.kind == LayerKind::Hidden || layer.kind == LayerKind::GRU)
+                    if(std::find(layer.nodeIdx.begin(),layer.nodeIdx.end(),static_cast<int>(i)) != layer.nodeIdx.end())
+                    { hiddenLayer = true; break; }
+            if(hiddenLayer) continue;
+        }
+        const float dx=mx-n.x, dy=my-n.y;
+        const float d2=dx*dx+dy*dy;
+        if(d2<=n.radius*n.radius && d2<bestDistanceSquared)
+        { closest=&n; bestDistanceSquared=d2; }
     }
-    return nullptr;
+    return closest;
 }
 
 static std::string InputGroupName(const std::string& label)
 {
     const size_t cut = label.find_first_of("_:/");
-    std::string key = (cut == std::string::npos || cut == 0) ? "Other" : label.substr(0, cut);
+    if(cut == std::string::npos || cut == 0) return {}; // No prefix: ungrouped neuron
+    std::string key = label.substr(0, cut);
     static const std::unordered_map<std::string, std::string> friendly = 
     {
         {"NPC", "NPC"}, {"Scene", "Scene"}, {"Act", "Actions"},
@@ -2706,13 +3190,32 @@ static std::string InputGroupName(const std::string& label)
 static std::vector<std::pair<std::string, std::vector<int>>> InputGroups(const NeuralGraph& graph)
 {
     std::vector<std::pair<std::string, std::vector<int>>> result;
+    // User-defined input groups replace the automatic prefix group for their
+    // members, so both kinds use exactly the same layout and hit testing.
+    for(const auto& custom : graph.neuronGroups)
+    {
+        std::vector<int> members;
+        for(const Layer& layer : graph.layers)
+            if(layer.kind == LayerKind::Input)
+                for(int idx : layer.nodeIdx)
+                    if(idx >= 0 && idx < (int)graph.nodes.size() &&
+                       std::find(custom.ids.begin(), custom.ids.end(), graph.nodes[idx].id) != custom.ids.end())
+                        members.push_back(idx);
+        if(!members.empty()) result.push_back({custom.name, std::move(members)});
+    }
     for(const Layer& layer : graph.layers)
     {
         if(layer.kind != LayerKind::Input) continue;
         for(int idx : layer.nodeIdx)
         {
             if(idx < 0 || idx >= (int)graph.nodes.size()) continue;
+            bool customMember=false;
+            for(const auto& custom : graph.neuronGroups)
+                if(std::find(custom.ids.begin(), custom.ids.end(), graph.nodes[idx].id)!=custom.ids.end())
+                { customMember=true; break; }
+            if(customMember || std::find(graph.ungroupedInputIds.begin(),graph.ungroupedInputIds.end(),graph.nodes[idx].id)!=graph.ungroupedInputIds.end()) continue;
             const std::string name = InputGroupName(graph.nodes[idx].label);
+            if(name.empty()) continue; // Ungrouped inputs remain ordinary neurons
             auto it = std::find_if(result.begin(), result.end(), [&](const auto& group){ return group.first == name; });
             if(it == result.end()) result.push_back({name, {idx}});
             else it->second.push_back(idx);
@@ -2721,10 +3224,39 @@ static std::vector<std::pair<std::string, std::vector<int>>> InputGroups(const N
     return result;
 }
 
+static bool InputGroupExpanded(const NeuralGraph& graph, const std::string& name)
+{
+    for(const auto& group : graph.neuronGroups)
+        if(group.name == name) return !group.collapsed;
+    return std::find(graph.expandedInputGroups.begin(),graph.expandedInputGroups.end(),name)
+        != graph.expandedInputGroups.end();
+}
+
+static void SetInputGroupExpanded(NeuralGraph& graph, const std::string& name, bool expanded)
+{
+    for(auto& group : graph.neuronGroups)
+        if(group.name == name) { group.collapsed = !expanded; return; }
+    auto& names = graph.expandedInputGroups;
+    auto it = std::find(names.begin(),names.end(),name);
+    if(expanded && it == names.end()) names.push_back(name);
+    if(!expanded && it != names.end()) names.erase(it);
+}
+
+static std::string DisplayInputGroup(const NeuralGraph& graph, int nodeIndex)
+{
+    if(nodeIndex < 0 || nodeIndex >= (int)graph.nodes.size()) return {};
+    for(const auto& custom : graph.neuronGroups)
+        if(std::find(custom.ids.begin(), custom.ids.end(), graph.nodes[nodeIndex].id)!=custom.ids.end())
+            return custom.name;
+    if(std::find(graph.ungroupedInputIds.begin(),graph.ungroupedInputIds.end(),graph.nodes[nodeIndex].id)!=graph.ungroupedInputIds.end()) return {};
+    return InputGroupName(graph.nodes[nodeIndex].label);
+}
+
 static bool IsVisibleInput(const NeuralGraph& graph, int nodeIndex)
 {
     if(nodeIndex < 0 || nodeIndex >= (int)graph.nodes.size() || !graph.nodes[nodeIndex].isInput) return true;
-    return graph.expandedInputGroup.empty() || InputGroupName(graph.nodes[nodeIndex].label) == graph.expandedInputGroup;
+    const std::string group = DisplayInputGroup(graph,nodeIndex);
+    return group.empty() || InputGroupExpanded(graph,group);
 }
 
 static int InputDisplaySlotCount(const NeuralGraph& graph)
@@ -2732,7 +3264,11 @@ static int InputDisplaySlotCount(const NeuralGraph& graph)
     const auto groups = InputGroups(graph);
     int slots = 0;
     for(const auto& group : groups)
-        slots += (group.first == graph.expandedInputGroup) ? (int)group.second.size() : 1;
+        slots += InputGroupExpanded(graph,group.first) ? (int)group.second.size() : 1;
+    for(const Layer& layer : graph.layers)
+        if(layer.kind == LayerKind::Input)
+            for(int idx : layer.nodeIdx)
+                if(idx >= 0 && idx < (int)graph.nodes.size() && DisplayInputGroup(graph,idx).empty()) ++slots;
     return std::max(1, slots);
 }
 
@@ -2763,64 +3299,10 @@ static float CompactNeuronSlotY(int slot, int count, float y0, float y1, float r
 
 void NeuralGraph::buildDemo()
 {
-    nodes.clear(); edges.clear(); layers.clear();
-    selected = -1; std::memset(editBuf,0,sizeof(editBuf));
-    currentLayer = 0;
-    liveInputs = false;
-
-    int nIn = 3;
-    std::array<int,3> nHL = {5, 8, 5};
-    int nOut = 3;
-
-    int id = 0;
-
-    // Inputs
-    {
-        Layer L;
-        RandomizeLayerWind(L);
-        L.kind = LayerKind::Input; 
-        L.name = "Inputs"; 
-        L.act = Act::Linear;
-        layers.push_back(L);
-        for(int i=0;i<nIn;i++)
-        {
-            Neuron n; n.id=id++; n.isInput=true; n.label = "In"+std::to_string(i+1); n.speed = 0.0f; n.amp = 1.0f;
-            nodes.push_back(n); layers.back().nodeIdx.push_back((int)nodes.size()-1);
-        }
-    }
-
-    // HL1..HL3
-    for(int li=0; li<3; ++li)
-    {
-        Layer L;
-        RandomizeLayerWind(L);
-        L.kind = LayerKind::Hidden; 
-        L.name = "HL " + std::to_string(li+1);
-        L.act = Act::ReLU;
-        for(int i=0;i<nHL[li]; ++i)
-        {
-            Neuron n; n.id=id++; n.isInput=false; n.label = "H"+std::to_string(li+1)+"."+std::to_string(i+1);
-            nodes.push_back(n); L.nodeIdx.push_back((int)nodes.size()-1);
-        }
-        layers.push_back(std::move(L));
-    }
-
-    // Outputs
-    {
-        Layer L; L.kind = LayerKind::Output;
-        RandomizeLayerWind(L);
-        L.name = "Outputs"; 
-        L.act = Act::Sigmoid;
-        layers.push_back(L);
-        for(int i=0;i<nOut;i++)
-        {
-            Neuron n; n.id=id++; n.isInput=false; n.label = "Out"+std::to_string(i+1);
-            nodes.push_back(n); layers.back().nodeIdx.push_back((int)nodes.size()-1);
-        }
-    }
-
-    NG_RebuildEdges(*this);
-    layoutLayers(800.0f, 500.0f);
+    if(IsTrainingActive() || gPendingTopology) return;
+    NeuralGraph candidate;
+    NG_BuildTopology(candidate,3,{5,8,5},3);
+    NG_RequestTopology(*this,std::move(candidate));
 }
 
 void NeuralGraph::layoutLayers(float W, float H)
@@ -2891,7 +3373,7 @@ void NeuralGraph::layoutLayers(float W, float H)
             int slot=0;
             for(const auto& group : InputGroups(*this))
             {
-                if(group.first == expandedInputGroup)
+                if(InputGroupExpanded(*this,group.first))
                 {
                     for(int idx : group.second)
                     {
@@ -2900,6 +3382,14 @@ void NeuralGraph::layoutLayers(float W, float H)
                         ++slot;
                     }
                 } else ++slot; // one row is occupied by the group's pseudoneuron
+            }
+            // Ungrouped neurons occupy their own rows, with no synthetic group.
+            for(int idx : L.nodeIdx)
+            {
+                if(idx < 0 || idx >= (int)nodes.size() || !DisplayInputGroup(*this,idx).empty()) continue;
+                const float yy=CompactInputSlotY(slot,N,y0,y1,endpointR);
+                nodes[idx].x=x+colW*0.5f; nodes[idx].y=yy;
+                ++slot;
             }
         } 
         else for(int i=0;i<(int)visible.size();i++)
@@ -2927,7 +3417,6 @@ void NeuralGraph::layoutLayers(float W, float H)
 
 void NeuralGraph::tickLiveInputs(float dt)
 {
-    // Do not clear manual output overrides here; they are used when liveInputs is off
     if(layers.empty()) return;
     
     // Update live feed wave effect
@@ -2977,15 +3466,13 @@ void NeuralGraph::tickLiveInputs(float dt)
             n.value = 0.5f + 0.5f * a * std::sin(n.phase);
         }
     }
+    // A synchronized live input follows the first member of its synchronization group.
+    for(const auto& group:syncGroups)
+        if(!group.empty()) SyncNeuronProperties(*this,group.front());
 }
 
 void NeuralGraph::stepLayout(float dt, float W, float H)
 {
-    tickLiveInputs(dt);
-    
-    // Recompute forward pass whenever inputs may have changed
-    ForwardPass(*this);
-
     const float headerH=3.0f*ImGui::GetTextLineHeightWithSpacing()+6.0f;
     const float y0=40.0f+headerH;
     const float y1=H-40.0f;
@@ -3040,8 +3527,12 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 
     char editorTitle[128];
     std::snprintf(editorTitle, sizeof(editorTitle), "Neural Network (Neurons: %zu)###Neural Editor", nodes.size());
-    if(ImGui::Begin(editorTitle, &open, ImGuiWindowFlags_NoCollapse))
+    if(ImGui::Begin(editorTitle, &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus))
     {
+        gF1WindowWidth=ImGui::GetWindowSize().x;
+        gF1WindowHeight=ImGui::GetWindowSize().y;
+        gF1WindowPos=ImGui::GetWindowPos();
+        PruneNeuronCollections(*this);
         // Block shortcuts while editing labels; reset per frame and set when inputs are focused
         gEditingLabel = false;
         // Split: top=canvas, optional bottom=live feed.  Keep the preference
@@ -3054,13 +3545,28 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         if(avail.y < 140) avail.y = 140;
 
         const auto inputGroups = InputGroups(*this);
-        if(!inputGroups.empty() && (expandedInputGroup.empty() ||
-           std::none_of(inputGroups.begin(), inputGroups.end(), [&](const auto& g){ return g.first == expandedInputGroup; })))
-        {
-            expandedInputGroup = inputGroups.front().first;
-            layoutLayers(lastCanvasW > 0 ? lastCanvasW : 800.0f, lastCanvasH > 0 ? lastCanvasH : 500.0f);
-        }
+        // Keep each group's visibility independent; do not auto-expand another group.
 
+        ImGui::BeginDisabled(gTrain.active || gPendingTopology.has_value());
+        if(ImGui::Checkbox("Pause live inference", &gPauseLiveInference)) seqPlaying=false;
+        ImGui::SameLine();
+        if(ImGui::Button("Next sample"))
+        {
+            seqPlaying = false;
+            gPauseLiveInference = true;
+            gInferenceAccumulator = 0.0;
+            if(gInferenceNeedsReset) ResetInferenceMemory(*this);
+            ForwardPass(*this);
+        }
+        ImGui::SameLine();
+        if(ImGui::Button("Reset memory"))
+        {
+            seqPlaying = false;
+            gPauseLiveInference = true;
+            ResetInferenceMemory(*this);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
         ImGui::Checkbox("Live Feed", &showLiveFeed);
         ImGui::SameLine();
         if(ImGui::Button(collapseHiddenLayers ? "Show hidden layers" : "Hide hidden layers"))
@@ -3068,14 +3574,25 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             collapseHiddenLayers = !collapseHiddenLayers;
             layoutLayers(lastCanvasW > 0 ? lastCanvasW : 800.0f, lastCanvasH > 0 ? lastCanvasH : 500.0f);
         }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if(ImGui::IsItemHovered())
+            ImGui::SetTooltip("Live: 30 samples/s. Manual: set inputs, Apply, then Next sample.");
+        avail = ImGui::GetContentRegionAvail();
 
         // The small control row is the only space retained when the feed is
         // collapsed, allowing the graph to fill all remaining editor space.
         const float controlsH = ImGui::GetFrameHeightWithSpacing();
         const float maxFeedH = std::max(80.0f, avail.y - 120.0f);
         const float feedH = showLiveFeed ? std::clamp(preferredLiveFeedH, 80.0f, maxFeedH) : 0.0f;
-        float canvasH = avail.y - controlsH - feedH - (showLiveFeed ? 8.0f : 0.0f);
-        if(canvasH < 80.0f) canvasH = 80.0f;
+        // Persistent user-controlled canvas height; the lower edge is draggable.
+        static float userCanvasHeight = -1.0f;
+        const float naturalCanvasH = std::max(100.0f, avail.y - controlsH - feedH - (showLiveFeed ? 8.0f : 0.0f) - 28.0f);
+        if(userCanvasHeight < 0.0f) userCanvasHeight = naturalCanvasH;
+        // Leave a minimum strip for the controls below; ImGui window scrolling
+        // remains available when the group table extends below the viewport.
+        const float maxCanvasH = std::max(100.0f, avail.y - 70.0f);
+        float canvasH = std::clamp(userCanvasHeight, 100.0f, maxCanvasH);
         ImVec2 canvasSize = ImVec2(avail.x, canvasH);
 
         // Auto relayout when size changes
@@ -3148,7 +3665,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 
             ImVec2 actMin = actPos;
             ImVec2 actMax = ImVec2(b.x - 8.0f, actPos.y + lh);
-            if(!isGRULayer && ImGui::IsMouseHoveringRect(actMin, actMax) &&
+            if(!gTrain.active && !gPendingTopology && !isGRULayer && ImGui::IsMouseHoveringRect(actMin, actMax) &&
                ImGui::IsMouseClicked(ImGuiMouseButton_Left))
             {
                 L.act = NextAct(L.act);
@@ -3181,7 +3698,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 int slot=0;
                 for(const auto& group:inputGroups)
                 {
-                    if(group.first==expandedInputGroup){ slot+=(int)group.second.size(); continue; }
+                    if(InputGroupExpanded(*this,group.first)){ slot+=(int)group.second.size(); continue; }
                     float inputRadius=14.0f;
                     if(!inputLayer->nodeIdx.empty()) inputRadius=nodes[inputLayer->nodeIdx.front()].radius;
                     const float yy=CompactInputSlotY(slot,slots,y0,y1,inputRadius);
@@ -3214,7 +3731,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 }
                 if(!requestedInputGroup.empty())
                 {
-                    expandedInputGroup=requestedInputGroup;
+                    SetInputGroupExpanded(*this,requestedInputGroup,true);
                     layoutLayers(canvasSize.x,canvasSize.y);
                 }
             }
@@ -3303,7 +3820,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             Neuron* B = findById(e.b);
             if(!A||!B) continue;
             const int ai = int(A - nodes.data()), bi = int(B - nodes.data());
-            if(!IsVisibleInput(*this, ai) || !IsVisibleInput(*this, bi)) continue;
+            if(!IsVisibleInput(*this, ai) || !IsVisibleInput(*this, bi) ||
+               (!A->isInput && GroupMemberHidden(*this,A->id)) || (!B->isInput && GroupMemberHidden(*this,B->id))) continue;
             if(collapseHiddenLayers) continue;
             const Layer* layerA = findLayerForNode(ai);
             const Layer* layerB = findLayerForNode(bi);
@@ -3487,7 +4005,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         for(auto& n: nodes)
         {
             const int visibleIdx = int(&n - nodes.data());
-            if(!IsVisibleInput(*this, visibleIdx)) continue;
+            if(!IsVisibleInput(*this, visibleIdx) || (!n.isInput && GroupMemberHidden(*this,n.id))) continue;
             if(collapseHiddenLayers)
             {
                 bool hiddenNode=false;
@@ -3496,7 +4014,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 if(hiddenNode) continue;
             }
             ImVec2 p(origin.x+n.x, origin.y+n.y);
-            bool isSel = (selected==n.id);
+            bool isSel = std::find(multiSelected.begin(),multiSelected.end(),n.id)!=multiSelected.end();
 
             // compute if this neuron is in the output layer
             bool isOutput = false;
@@ -3523,6 +4041,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             ImU32 baseFill = isGRU ? ImGui::GetColorU32(ImVec4(
                     gGRUTheme.unitFill.x,gGRUTheme.unitFill.y,gGRUTheme.unitFill.z,1.0f))
                 : (n.isInput ? colU(_theme.nInput) : (isOutput ? colU(_theme.nOutput) : colU(_theme.nHidden)));
+            const NeuronGroup* collapsedHere=n.isInput ? nullptr : CollapsedGroupFor(*this,n.id);
+            const bool groupHub=collapsedHere && !collapsedHere->ids.empty() && collapsedHere->ids.front()==n.id;
             ImU32 fill = isSel ? ImGui::GetColorU32(ImVec4(0.2f,0.5f,1.0f,1.0f)) : baseFill;
             ImU32 ring = isSel ? colU(_theme.nRing)
                                : ImGui::GetColorU32(isGRU ? ImVec4(gGRUTheme.unitBorder.x,
@@ -3535,7 +4055,13 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 fill = colU(_theme.nHighlight);
             }
 
-            if(isGRU)
+            if(groupHub)
+            {
+                dl->AddCircleFilled(p,n.radius+6.0f,ImGui::GetColorU32(ImVec4(.12f,.42f,.42f,1.0f)),32);
+                dl->AddCircle(p,n.radius+6.0f,ImGui::GetColorU32(ImVec4(.35f,.95f,.85f,1.0f)),32,3.0f);
+                dl->AddText(ImVec2(p.x-5.0f,p.y-7.0f),IM_COL32(255,255,255,255),"+");
+            }
+            else if(isGRU)
             {
                 const ImVec2 diamond[4] = {
                     ImVec2(p.x, p.y-n.radius-2.0f), ImVec2(p.x+n.radius+2.0f, p.y),
@@ -3565,7 +4091,10 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             }
 
             // label: hidden BELOW, input on LEFT (leave space for mini-plot), output on RIGHT
-            ImVec2 ts = ImGui::CalcTextSize(n.label.c_str());
+            const std::string shownLabel = (groupHub ? collapsedHere->name : n.label) +
+                (n.isInput && !groupHub && !DisplayInputGroup(*this,(int)(&n-nodes.data())).empty()
+                    ? " [" + DisplayInputGroup(*this,(int)(&n-nodes.data())) + "]" : "");
+            ImVec2 ts = ImGui::CalcTextSize(shownLabel.c_str());
             ImVec2 tl;
             if(isHidden)
             {
@@ -3598,7 +4127,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 ImU32 labelCol = ImGui::GetColorU32( (isTopIn || isTopOut)
                     ? ImVec4(0.0f,0.0f,0.0f,1.0f)
                     : ImVec4(1.0f,1.0f,0.85f,1.0f) );
-                dl->AddText(ImGui::GetFont(),ImGui::GetFontSize(),tl,labelCol,n.label.c_str());
+                dl->AddText(ImGui::GetFont(),ImGui::GetFontSize(),tl,labelCol,shownLabel.c_str());
                 // Tooltip over label area
                 ImVec2 br = ImVec2(tl.x + ts.x, tl.y + ts.y);
                 if(ImGui::IsMouseHoveringRect(tl, br))
@@ -3609,16 +4138,11 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 }
             }
 
-            // Manual override icon next to output labels when active
+            // Mark a separately configured lesson target, never a prediction override.
             if(isOutput)
             {
-                bool manualActive = false;
-                if(gUseManualOverrides && !gTrain.active && !liveInputs)
-                {
-                    manualActive = (gManualOutputs.find(n.id) != gManualOutputs.end());
-                }
-
-                if(manualActive)
+                auto target = gLessonTargets.find(n.id);
+                if(target != gLessonTargets.end())
                 {
                     ImVec2 iconC = ImVec2(tl.x - 10.0f, p.y);
                     ImU32 icoCol = ImGui::GetColorU32(ImVec4(1.0f,0.95f,0.3f,1.0f)); // yellow icon
@@ -3627,7 +4151,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                     // Tooltip area
                     ImGui::SetCursorScreenPos(ImVec2(iconC.x - 6.0f, iconC.y - 6.0f));
                     ImGui::InvisibleButton((std::string("ovr##")+std::to_string(n.id)).c_str(), ImVec2(12,12));
-                    if(ImGui::IsItemHovered()) ImGui::SetTooltip("Manual override active");
+                    if(ImGui::IsItemHovered()) ImGui::SetTooltip("Lesson target: %.4f (prediction is unchanged)", target->second);
                 }
             }
 
@@ -3661,38 +4185,90 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 
                 dl->AddRectFilled(pp0, pp1, plotBg, 3.0f);
                 dl->AddRect(pp0, pp1, ImGui::GetColorU32(ImVec4(0.35f,0.35f,0.40f,1.0f)), 3.0f, 0, 1.0f);
-                const int S=32;
-                ImVec2 prev = {pp0.x, pp0.y + PH*(1.0f - (0.5f+0.5f*std::sin(n.phase - 2*3.14159f)))};
-                for(int i=1;i<=S;i++)
+                // Show a flat line at the current input value when live feed is off.
+                // The sequential wave mode animates only its currently active input.
+                const bool waveThisInput = gLiveFeedWaveActive &&
+                    !layers.empty() &&
+                    gLiveFeedCurrentInput >= 0 &&
+                    gLiveFeedCurrentInput < (int)layers.front().nodeIdx.size() &&
+                    layers.front().nodeIdx[gLiveFeedCurrentInput] == int(&n - nodes.data());
+                const bool showSine = waveThisInput ||
+                    (!gLiveFeedWaveActive && (liveInputs || n.live) && n.speed > 0.0f);
+                if(showSine)
                 {
-                    float t=(float)i/(float)S;
-                    float val = 0.5f + 0.5f*std::sin(n.phase + t*2.0f*3.14159265f);
-                    ImVec2 cur = { pp0.x + t*PW, pp0.y + PH*(1.0f - val) };
-                    dl->AddLine(prev, cur, plotFg, 1.5f);
-                    prev = cur;
+                    const int S=32;
+                    const float amplitude = waveThisInput ? 1.0f : std::clamp(n.amp, 0.0f, 1.0f);
+                    const float phase = waveThisInput ? gLiveFeedWavePhase : n.phase;
+                    ImVec2 prev = {pp0.x, pp0.y + PH*(1.0f - (0.5f + 0.5f*amplitude*std::sin(phase)))};
+                    for(int i=1;i<=S;i++)
+                    {
+                        float t=(float)i/(float)S;
+                        float val = 0.5f + 0.5f*amplitude*std::sin(phase + t*2.0f*3.14159265f);
+                        ImVec2 cur = {pp0.x + t*PW, pp0.y + PH*(1.0f - val)};
+                        dl->AddLine(prev, cur, plotFg, 1.5f);
+                        prev = cur;
+                    }
+                }
+                else
+                {
+                    const float value = std::clamp(n.value, 0.0f, 1.0f);
+                    const float y = pp0.y + PH*(1.0f - value);
+                    dl->AddLine(ImVec2(pp0.x, y), ImVec2(pp1.x, y), plotFg, 1.5f);
                 }
                 // mini plot is not clickable
             }
         }
 
-        // click elsewhere on canvas selects neuron but doesn't toggle live/value
-        if(isHovered && !inputGroupClickConsumed && ImGui::IsMouseClicked(ImGuiMouseButton_Left)){
-            if(Neuron* hit = findAt(mx,my))
+        // Ctrl+click extends/toggles selection. A collapsed hub expands on click.
+        if(isHovered && !inputGroupClickConsumed && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        {
+            if(Neuron* hit=findAt(mx,my))
             {
-                selected = hit->id;
-                std::snprintf(editBuf, sizeof(editBuf), "%s", hit->label.c_str());
-                ForwardPass(*this);
-            } else 
+                const NeuronGroup* hub=CollapsedGroupFor(*this,hit->id);
+                if(hub && !hub->ids.empty() && hub->ids.front()==hit->id)
+                {
+                    for(auto& group:neuronGroups)
+                        if(group.collapsed && !group.ids.empty() && group.ids.front()==hit->id)
+                        { group.collapsed=false; break; }
+                }
+                else if(ImGui::GetIO().KeyCtrl)
+                {
+                    auto it=std::find(multiSelected.begin(),multiSelected.end(),hit->id);
+                    if(it==multiSelected.end()) multiSelected.push_back(hit->id);
+                    else multiSelected.erase(it);
+                    selected=multiSelected.empty() ? -1 : multiSelected.back();
+                }
+                else
+                {
+                    multiSelected={hit->id};
+                    selected=hit->id;
+                }
+                if(selected>=0)
+                    for(const auto& n:nodes) if(n.id==selected)
+                    { std::snprintf(editBuf,sizeof(editBuf),"%s",n.label.c_str()); break; }
+            }
+            else if(!ImGui::GetIO().KeyCtrl)
             {
-                selected = -1;
+                multiSelected.clear(); selected=-1;
                 std::memset(editBuf,0,sizeof(editBuf));
             }
         }
 
+        // Draggable bottom border of the canvas.
+        ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + canvasSize.y));
+        ImGui::InvisibleButton("##canvas_height_grip", ImVec2(std::max(1.0f, canvasSize.x), 12.0f));
+        if(ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        if(ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+            userCanvasHeight = std::clamp(userCanvasHeight + ImGui::GetIO().MouseDelta.y, 100.0f, maxCanvasH);
+        dl->AddLine(ImVec2(origin.x, origin.y + canvasSize.y + 5.0f),
+                    ImVec2(origin.x + canvasSize.x, origin.y + canvasSize.y + 5.0f),
+                    ImGui::GetColorU32(ImVec4(.65f,.72f,.78f,.85f)), 2.0f);
+
         // ====== LIVE FEED (under the graph) ======
         if(showLiveFeed)
         {
-            ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + canvasSize.y + 8.0f));
+            ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + canvasSize.y + 14.0f));
             ImGui::BeginChild("live_feed", ImVec2(avail.x, feedH), true, ImGuiWindowFlags_HorizontalScrollbar);
             {
             const Layer& L = layers[std::clamp(currentLayer, 0, (int)layers.size()-1)];
@@ -3715,7 +4291,9 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0); ImGui::Text("%d", n.id);
-                    ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(n.label.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    const std::string rowGroup=n.isInput ? DisplayInputGroup(*this,idx) : std::string();
+                    ImGui::TextUnformatted((n.label + (rowGroup.empty() ? "" : " ["+rowGroup+"]")).c_str());
 
                     ImGui::TableSetColumnIndex(2);
                     float v = n.value;
@@ -3738,155 +4316,363 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 ImGui::EndTable();
             }
 
-            // Selected neuron editor
-            if(selected != -1)
-            {
-                Neuron* sel = nullptr;
-                for(auto& n : nodes) if(n.id==selected){ sel=&n; break; }
-                if(sel)
-                {
-                    ImGui::Separator();
-                    ImGui::Text(u8"Neuron editor (ID %d)", sel->id);
-                    ImGui::PushItemWidth(320.f);
-
-                    ImGui::InputText(u8"Label", editBuf, IM_ARRAYSIZE(editBuf));
-                    bool labelEnter = false; // Enter handled globally below
-                    gEditingLabel = ImGui::IsItemActive() || ImGui::IsItemFocused();
-
-                    // Is output?
-                    bool isOutput = false;
-                    for(const auto& Lchk : layers)
-                    {
-                        if(Lchk.kind == LayerKind::Output)
-                        {
-                            for(int idxN : Lchk.nodeIdx)
-                            {
-                                if(nodes[idxN].id == sel->id){ isOutput = true; break; }
-                            }
-                        }
-                        if(isOutput) break;
-                    }
-
-                    static int lastSelForVal = -1;
-                    static float pendingVal = 0.0f;
-                    static float pendingSpeed = 0.0f;
-                    if(lastSelForVal != sel->id){
-                        pendingVal = sel->value;
-                        pendingSpeed = sel->speed;
-                        std::snprintf(editBuf, sizeof(editBuf), "%s", sel->label.c_str());
-                        lastSelForVal = sel->id;
-                    }
-
-                    // Description: reset input when switching selected neuron
-                    static char descBuf[256];
-                    static int lastSelForDesc = -1;
-                    if(lastSelForDesc != sel->id)
-                    {
-                        // Clear the description field on neuron change (per request)
-                        descBuf[0] = '\0';
-                        lastSelForDesc = sel->id;
-                    }
-
-                    ImGui::InputTextMultiline("Description", descBuf, IM_ARRAYSIZE(descBuf), ImVec2(320, 60));
-                    gEditingLabel = gEditingLabel || ImGui::IsItemActive() || ImGui::IsItemFocused();
-
-                    if(isOutput)
-                    {
-                        ImGui::SliderFloat(u8"Value", &pendingVal, 0.0f, 1.0f, "%.4f");
-                    } 
-                    else if(sel->isInput)
-                    {
-                        ImGui::SliderFloat(u8"Value", &pendingVal, 0.0f, 1.0f, "%.4f");
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(120.f);
-                        ImGui::InputFloat("##val", &pendingVal, 0.0f, 0.0f, "%.4f");
-                    }
-                    else
-                    {
-                        ImGui::BeginDisabled();
-                        float vtmp = sel->value;
-                        ImGui::SliderFloat(u8"Value", &vtmp, -10.0f, 10.0f, "%.4f");
-                        ImGui::EndDisabled();
-                    }
-
-                    if(sel->isInput)
-                    {
-                        if(ImGui::SliderFloat(u8"Speed (Hz)", &pendingSpeed, 0.0f, 1.0f, "%.3f"))
-                        {
-                            // Quantize to 0.001 increments
-                            pendingSpeed = std::round(pendingSpeed * 1000.0f) / 1000.0f;
-                            float prev = sel->speed;
-                            sel->speed = std::max(0.0f, pendingSpeed);
-
-                            // If user sets speed > 0, enable per-neuron live and reset phase for visible motion
-                            if(sel->speed > 0.0f) 
-                            {
-                                if(prev <= 0.0f) sel->phase = 0.0f;
-                                sel->live = true;
-                            } else 
-                            {
-                                // speed == 0 stops motion; keep value as-is; live flag can remain
-                            }
-                        }
-
-                        ImGui::Checkbox(u8"Live feed", &sel->live);
-                    } 
-                    else 
-                    {
-                        ImGui::BeginDisabled(); float dummy=0.f;
-                        ImGui::SliderFloat(u8"Speed (Hz)", &dummy, 0.0f, 0.0f, "-");
-                        ImGui::EndDisabled();
-                    }
-
-                    bool doApply = false;
-                    doApply |= ImGui::Button(u8"Apply");
-
-                    // Enter anywhere in this window applies changes
-                    bool enterPressed = ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter);
-                    doApply |= labelEnter || enterPressed;
-                    if(doApply)
-                    {
-                        // Commit label
-                        sel->label = editBuf;
-                        sel->desc = descBuf;
-                        // Commit value behavior
-                        if(isOutput)
-                        {
-                            if(pendingVal < 0.0f) pendingVal = 0.0f; else if(pendingVal > 1.0f) pendingVal = 1.0f;
-                            sel->value = pendingVal;
-                            gManualOutputs[sel->id] = pendingVal;
-                            gUseManualOverrides = true;
-                        } 
-                        else if(sel->isInput)
-                        {
-                            if(pendingVal < 0.0f) pendingVal = 0.0f; else if(pendingVal > 1.0f) pendingVal = 1.0f;
-                            sel->value = pendingVal;
-                            sel->speed = std::max(0.0f, pendingSpeed);
-                            liveInputs = false;
-                        }
-                        ForwardPass(*this);
-                    }
-
-                    ImGui::PopItemWidth();
-                }
-            }
             }
             ImGui::EndChild();
         }
 
         // Local actions panel
         ImGui::Separator();
-        ImGui::Checkbox("Live inputs (sin)", &liveInputs);
+        if(ImGui::Checkbox("Live inputs (sin)", &liveInputs) && liveInputs) UseLiveInputs();
         ImGui::SameLine();
         if(ImGui::Button("Relayout")){ layoutLayers(canvasSize.x, canvasSize.y); }
         ImGui::SameLine();
+        ImGui::BeginDisabled(gTrain.active || gPendingTopology.has_value());
         if(ImGui::Button("Add GRU layer")){ NG_InsertGRUAfterCurrent(*this); }
         ImGui::SameLine();
         if(ImGui::Button("Add neuron (N)")){ NG_AddNeuron(*this, currentLayer); }
         ImGui::SameLine();
         if(ImGui::Button("Remove last (D)")){ NG_RemoveLastNeuron(*this, currentLayer); }
+        ImGui::EndDisabled();
+        // Unified group table: both automatic prefix groups and named user groups.
+        ImGui::Separator();
+        ImGui::TextUnformatted("Neuron groups");
+        const auto visibleGroups = InputGroups(*this);
+        struct GroupTableRow { std::string name; std::vector<int> ids; int customIndex; bool isInput; };
+        std::vector<GroupTableRow> rows;
+        for(const auto& entry : visibleGroups)
+        {
+            GroupTableRow row{entry.first, {}, -1, true};
+            for(int idx : entry.second) if(idx >= 0 && idx < (int)nodes.size()) row.ids.push_back(nodes[idx].id);
+            for(int i=0;i<(int)neuronGroups.size();++i)
+                if(neuronGroups[i].name == row.name) { row.customIndex=i; break; }
+            rows.push_back(std::move(row));
+        }
+        for(int i=0;i<(int)neuronGroups.size();++i)
+        {
+            const NeuronGroup& group=neuronGroups[i];
+            bool hasNonInput=false;
+            for(int id : group.ids)
+                for(const auto& n : nodes) if(n.id==id && !n.isInput) hasNonInput=true;
+            if(hasNonInput && std::none_of(rows.begin(),rows.end(),[&](const GroupTableRow& row){return row.customIndex==i;})) rows.push_back({group.name, group.ids, i, false});
+        }
+        static std::string renameGroupKey;
+        static char renameGroupBuf[128] = {};
+        static int renameGroupCustomIndex = -1;
+        static std::vector<int> renameGroupIds;
+        if(ImGui::BeginTable("##neuron_groups_table", 4,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+        {
+            ImGui::TableSetupColumn("Group");
+            ImGui::TableSetupColumn("Neurons", ImGuiTableColumnFlags_WidthFixed, 75.0f);
+            ImGui::TableSetupColumn("Visibility", ImGuiTableColumnFlags_WidthFixed, 105.0f);
+            ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 125.0f);
+            ImGui::TableHeadersRow();
+            for(int i=0;i<(int)rows.size();++i)
+            {
+                const GroupTableRow& row=rows[i];
+                const bool expanded=row.isInput ? InputGroupExpanded(*this,row.name)
+                    : (row.customIndex>=0 && !neuronGroups[row.customIndex].collapsed);
+                ImGui::PushID(i);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(row.name.c_str());
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%zu",row.ids.size());
+                ImGui::TableSetColumnIndex(2);
+                if(ImGui::SmallButton(expanded ? "Collapse" : "Expand"))
+                {
+                    if(row.isInput)
+                    {
+                        SetInputGroupExpanded(*this,row.name,!expanded);
+                        layoutLayers(canvasSize.x, canvasSize.y);
+                    }
+                    else if(row.customIndex>=0)
+                        neuronGroups[row.customIndex].collapsed = expanded;
+                    multiSelected.clear(); selected=-1;
+                }
+                ImGui::TableSetColumnIndex(3);
+                if(ImGui::SmallButton("Edit"))
+                {
+                    renameGroupKey=row.name;
+                    renameGroupCustomIndex=row.customIndex;
+                    renameGroupIds=row.ids;
+                    std::snprintf(renameGroupBuf,sizeof(renameGroupBuf),"%s",row.name.c_str());
+                    ImGui::OpenPopup("Rename group");
+                }
+                ImGui::SameLine();
+                if(ImGui::SmallButton("Delete"))
+                {
+                    // Deleting a group removes only its presentation membership,
+                    // never the neurons or their connections.
+                    for(int id : row.ids)
+                        if(std::find(ungroupedInputIds.begin(),ungroupedInputIds.end(),id)==ungroupedInputIds.end())
+                            ungroupedInputIds.push_back(id);
+                    if(row.customIndex>=0 && row.customIndex<(int)neuronGroups.size())
+                        neuronGroups.erase(neuronGroups.begin()+row.customIndex);
+                    expandedInputGroups.erase(std::remove(expandedInputGroups.begin(),expandedInputGroups.end(),row.name),expandedInputGroups.end());
+                    multiSelected.clear(); selected=-1;
+                    layoutLayers(lastCanvasW>0?lastCanvasW:800.0f,lastCanvasH>0?lastCanvasH:500.0f);
+                    ImGui::PopID();
+                    break;
+                }
+                if(ImGui::BeginPopupModal("Rename group",nullptr,ImGuiWindowFlags_AlwaysAutoResize))
+                {
+                    ImGui::InputText("Name",renameGroupBuf,IM_ARRAYSIZE(renameGroupBuf));
+                    if(ImGui::Button("Save") && renameGroupBuf[0])
+                    {
+                        const std::string newName=renameGroupBuf;
+                        bool duplicate=false;
+                        for(const auto& other : rows)
+                            if(other.name==newName && other.name!=renameGroupKey) duplicate=true;
+                        if(!duplicate)
+                        {
+                            if(renameGroupCustomIndex>=0 && renameGroupCustomIndex<(int)neuronGroups.size())
+                                neuronGroups[renameGroupCustomIndex].name=newName;
+                            else
+                                neuronGroups.push_back({newName,renameGroupIds,false});
+                            auto oldIt=std::find(expandedInputGroups.begin(),expandedInputGroups.end(),renameGroupKey);
+                            if(oldIt!=expandedInputGroups.end()) *oldIt=newName;
+                            layoutLayers(canvasSize.x,canvasSize.y);
+                            ImGui::CloseCurrentPopup();
+                        }
+                    }
+                    ImGui::SameLine();
+                    ImGui::SameLine();
+                    if(ImGui::Button("Delete group"))
+                    {
+                        for(int id:renameGroupIds)
+                            if(std::find(ungroupedInputIds.begin(),ungroupedInputIds.end(),id)==ungroupedInputIds.end())
+                                ungroupedInputIds.push_back(id);
+                        if(renameGroupCustomIndex>=0 && renameGroupCustomIndex<(int)neuronGroups.size())
+                            neuronGroups.erase(neuronGroups.begin()+renameGroupCustomIndex);
+                        expandedInputGroups.erase(std::remove(expandedInputGroups.begin(),expandedInputGroups.end(),renameGroupKey),expandedInputGroups.end());
+                        multiSelected.clear(); selected=-1;
+                        layoutLayers(lastCanvasW>0?lastCanvasW:800.0f,lastCanvasH>0?lastCanvasH:500.0f);
+                        ImGui::CloseCurrentPopup();
+                    }
+                    if(ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+
     }
     ImGui::End();
+    // Selection actions are separate from the neuron properties window.
+    if(multiSelected.size()>1)
+    {
+        ImGui::SetNextWindowSize(ImVec2(340,130),ImGuiCond_FirstUseEver);
+        if(ImGui::Begin("Neuron selection##F1",nullptr,ImGuiWindowFlags_NoCollapse))
+        {
+            ImGui::Text("Selected neurons: %zu",multiSelected.size());
+            if(ImGui::Button("Group"))
+            {
+                ImGui::OpenPopup("Name neuron group");
+            }
+            ImGui::SameLine();
+            if(ImGui::Button("Synchronize"))
+            {
+                // Merge overlapping synchronization sets into a single component.
+                std::vector<int> merged=multiSelected;
+                bool changed=true;
+                while(changed)
+                {
+                    changed=false;
+                    for(auto it=syncGroups.begin();it!=syncGroups.end();)
+                    {
+                        bool overlap=false;
+                        for(int id:*it) if(std::find(merged.begin(),merged.end(),id)!=merged.end()) {overlap=true;break;}
+                        if(overlap)
+                        {
+                            for(int id:*it) if(std::find(merged.begin(),merged.end(),id)==merged.end()) merged.push_back(id);
+                            it=syncGroups.erase(it); changed=true;
+                        }
+                        else ++it;
+                    }
+                }
+                syncGroups.push_back(merged);
+                SyncNeuronProperties(*this,selected);
+            }
+            ImGui::TextDisabled("Ctrl+click to add or remove neurons.");
+            static char groupName[128]="";
+            if(ImGui::BeginPopupModal("Name neuron group",nullptr,ImGuiWindowFlags_AlwaysAutoResize))
+            {
+                if(ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+                const bool confirmGroupName = ImGui::InputText("Group name",groupName,IM_ARRAYSIZE(groupName),ImGuiInputTextFlags_EnterReturnsTrue);
+                if((confirmGroupName || ImGui::Button("Create")) && groupName[0])
+                {
+                    for(auto it=neuronGroups.begin();it!=neuronGroups.end();)
+                    {
+                        auto& ids=it->ids;
+                        ids.erase(std::remove_if(ids.begin(),ids.end(),[&](int id){
+                            return std::find(multiSelected.begin(),multiSelected.end(),id)!=multiSelected.end();
+                        }),ids.end());
+                        if(ids.size()<2) it=neuronGroups.erase(it); else ++it;
+                    }
+                    // Input-only groups join the same exclusive accordion as
+                    // the built-in NPC/Scene/Actions groups.
+                    bool inputOnly=true;
+                    for(int id:multiSelected)
+                    {
+                        auto it=std::find_if(nodes.begin(),nodes.end(),[&](const Neuron& n){return n.id==id;});
+                        if(it==nodes.end() || !it->isInput) {inputOnly=false;break;}
+                    }
+                    std::vector<int> orderedIds;
+                    for(const Layer& layer:layers)
+                        for(int idx:layer.nodeIdx)
+                            if(idx>=0 && idx<(int)nodes.size() &&
+                               std::find(multiSelected.begin(),multiSelected.end(),nodes[idx].id)!=multiSelected.end())
+                                orderedIds.push_back(nodes[idx].id);
+                    // Newly created groups start collapsed, regardless of neuron type.
+                    for(int id:orderedIds) ungroupedInputIds.erase(std::remove(ungroupedInputIds.begin(),ungroupedInputIds.end(),id),ungroupedInputIds.end());
+                    neuronGroups.push_back({groupName,orderedIds,true});
+                    if(inputOnly)
+                    {
+                        layoutLayers(lastCanvasW > 0.0f ? lastCanvasW : 800.0f,
+                                     lastCanvasH > 0.0f ? lastCanvasH : 500.0f);
+                    }
+                    multiSelected.clear(); selected=-1;
+                    groupName[0]='\0'; ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+            }
+        }
+        ImGui::End();
+    }
+    // Independent editor. A two-column layout keeps every label visible.
+    if(selected != -1)
+    {
+        // Enforce usable width even when an older narrow size was saved in imgui.ini.
+        // Avoid AlwaysAutoResize: stretch columns cannot determine a sensible width from it.
+        ImGui::SetNextWindowSizeConstraints(ImVec2(460.0f, 310.0f), ImVec2(FLT_MAX, FLT_MAX));
+        ImGui::SetNextWindowSize(ImVec2(480.0f, 350.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(40.0f, 90.0f), ImGuiCond_FirstUseEver);
+        bool propertiesOpen = true;
+        if(ImGui::Begin("Neuron properties##F1", &propertiesOpen,
+                        ImGuiWindowFlags_NoCollapse))
+        {
+            Neuron* sel = nullptr;
+            for(auto& n : nodes) if(n.id == selected) { sel = &n; break; }
+            if(sel)
+            {
+                bool isOutput = false;
+                for(const auto& layer : layers)
+                {
+                    if(layer.kind != LayerKind::Output) continue;
+                    for(int idxN : layer.nodeIdx)
+                        if(nodes[idxN].id == sel->id) { isOutput = true; break; }
+                    if(isOutput) break;
+                }
+
+                static int lastSelectedId = -1;
+                static unsigned int lastTargetRevision = 0;
+                static float pendingVal = 0.0f;
+                static float pendingSpeed = 0.0f;
+                static char descBuf[256] = {};
+                if(lastSelectedId != sel->id || lastTargetRevision != gLessonTargetRevision)
+                {
+                    const auto target = gLessonTargets.find(sel->id);
+                    pendingVal = isOutput ? (target != gLessonTargets.end() ? target->second : 0.0f) : sel->value;
+                    pendingSpeed = sel->speed;
+                    std::snprintf(editBuf, sizeof(editBuf), "%s", sel->label.c_str());
+                    std::snprintf(descBuf, sizeof(descBuf), "%s", sel->desc.c_str());
+                    lastSelectedId = sel->id;
+                    lastTargetRevision = gLessonTargetRevision;
+                }
+
+                const Neuron beforeProperties=*sel;
+                ImGui::Text("Neuron ID: %d", sel->id);
+                ImGui::Separator();
+                ImGui::BeginDisabled(gTrain.active || gPendingTopology.has_value());
+                if(ImGui::BeginTable("##neuron_property_fields", 2, ImGuiTableFlags_SizingStretchProp))
+                {
+                    ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthFixed, 115.0f);
+                    ImGui::TableSetupColumn("Control", ImGuiTableColumnFlags_WidthStretch);
+                    auto nextField = [](const char* caption)
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted(caption);
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::SetNextItemWidth(-1.0f);
+                    };
+
+                    nextField("Label");
+                    if(ImGui::InputText("##neuron_label", editBuf, IM_ARRAYSIZE(editBuf))) sel->label = editBuf;
+                    gEditingLabel = ImGui::IsItemActive() || ImGui::IsItemFocused();
+
+                    nextField("Description");
+                    if(ImGui::InputTextMultiline("##neuron_description", descBuf, IM_ARRAYSIZE(descBuf),
+                                                 ImVec2(-1.0f, 70.0f))) sel->desc = descBuf;
+                    gEditingLabel = gEditingLabel || ImGui::IsItemActive() || ImGui::IsItemFocused();
+
+                    if(isOutput)
+                    {
+                        nextField("Prediction");
+                        ImGui::Text("%.4f", sel->value);
+                        nextField("Lesson target");
+                        if(ImGui::InputFloat("##lesson_target", &pendingVal, 0.0f, 0.0f, "%.4f") && std::isfinite(pendingVal))
+                            gLessonTargets[sel->id] = pendingVal;
+                    }
+                    else if(sel->isInput)
+                    {
+                        pendingVal = sel->value;
+                        pendingSpeed = sel->speed;
+                        nextField("Value");
+                        if(ImGui::SliderFloat("##neuron_value", &pendingVal, 0.0f, 1.0f, "%.4f"))
+                        {
+                            sel->value = pendingVal;
+                            UseManualInputs(*this);
+                            if(!gTrain.active) ForwardPass(*this, false);
+                        }
+                        nextField("Speed (Hz)");
+                        if(ImGui::SliderFloat("##neuron_speed", &pendingSpeed, 0.0f, 1.0f, "%.3f"))
+                        {
+                            pendingSpeed = std::round(pendingSpeed * 1000.0f) / 1000.0f;
+                            const float previousSpeed = sel->speed;
+                            sel->speed = std::max(0.0f, pendingSpeed);
+                            if(sel->speed > 0.0f)
+                            {
+                                if(previousSpeed <= 0.0f) sel->phase = 0.0f;
+                                sel->live = true;
+                                UseLiveInputs();
+                            }
+                        }
+                        nextField("Amplitude");
+                        ImGui::SliderFloat("##neuron_amplitude", &sel->amp, 0.0f, 1.0f, "%.3f");
+                        nextField("Live feed");
+                        if(ImGui::Checkbox("##neuron_live_feed", &sel->live) && sel->live) UseLiveInputs();
+                    }
+                    else
+                    {
+                        nextField("Value");
+                        ImGui::Text("%.4f", sel->value);
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::EndDisabled();
+                const bool propertiesChanged = beforeProperties.value!=sel->value || beforeProperties.speed!=sel->speed ||
+                    beforeProperties.amp!=sel->amp || beforeProperties.live!=sel->live || beforeProperties.bias!=sel->bias;
+                if(propertiesChanged) SyncNeuronProperties(*this,sel->id);
+                if(ImGui::Button("Delete neuron"))
+                {
+                    const int deleteId=sel->id;
+                    NG_RemoveSelectedNeuron(*this,deleteId);
+                    // A topology change may be deferred while lessons exist.
+                    // Do not keep the deleted neuron selected in either case.
+                    selected=-1;
+                    multiSelected.clear();
+                }
+
+            }
+        }
+        ImGui::End();
+        if(!propertiesOpen) { selected = -1; multiSelected.clear(); }
+    }
+
 }
 #endif
 
@@ -3999,14 +4785,6 @@ bool Engine::init(const AppConfig& cfgIn)
 #endif
     
     LoadEngineConf("engine.conf");
-    {
-      bool exists = (std::ifstream("engine.conf").good());
-      if(!exists)
-      {
-          // First run: write defaults
-          SaveEngineConf("engine.conf");
-      }
-    }
     Logf("Engine %s initialized.", kAppVersion);
     return true;
 }
@@ -4014,6 +4792,9 @@ bool Engine::init(const AppConfig& cfgIn)
 void Engine::update()
 {
     double t = glfwGetTime(); timer.update(t);
+#ifdef USE_IMGUI
+    UpdateInference(graph, timer.dt);
+#endif
 
     const float targetRpm = cfg.rotate ? turbine.params.rpm : 0.0f;
     const float transitionTime = cfg.rotate
@@ -4214,7 +4995,7 @@ void Engine::render()
         ImGuiCond layCond = gForceRelayoutWindows ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
         ImGui::SetNextWindowPos(ImVec2(disp.x - 360.0f, 10.0f), layCond);
         ImGui::SetNextWindowSize(ImVec2(350.0f, 270.0f), layCond);
-        if(cfg.showUI && gShowNeuralXPanel)
+        if(cfg.showUI && gShowNeuralTPanel)
         {
             ImGui::Begin("Steam Punk Uber Crap Turbine", nullptr, ImGuiWindowFlags_NoCollapse);
             char title[128];
@@ -4288,6 +5069,7 @@ void Engine::render()
                 gLiveFeedWaveActive = !gLiveFeedWaveActive;
                 if(gLiveFeedWaveActive)
                 {
+                    UseLiveInputs(true);
                     gLiveFeedCurrentInput = 0;
                     gLiveFeedInputTimer = 0.0f;
                     gLiveFeedWavePhase = 0.0f;
@@ -4312,6 +5094,7 @@ void Engine::render()
             if(ImGui::Button(gRandomLiveFeedActive ? "Disable Random Feed (Q)" : "Enable Random Feed (Q)"))
             {
                 gRandomLiveFeedActive = !gRandomLiveFeedActive;
+                if(gRandomLiveFeedActive) UseLiveInputs();
                 int inputCount = 0;
                 for(const auto& L : graph.layers)
                 {
@@ -4384,6 +5167,8 @@ void Engine::render()
                 // Disable wave effect
                 gLiveFeedWaveActive = false;
                 gRandomLiveFeedActive = false;
+                UseManualInputs(graph);
+                ResetInferenceMemory(graph);
                 Logf("All %d input neurons set to zero and live feeds disabled", inputCount);
             }
 
@@ -4413,26 +5198,35 @@ void Engine::render()
 
         // Right-bottom: Training parameters
         float paramsW = disp.x - (10.0f + logW) - 20.0f;
-        if(paramsW < 320.0f) paramsW = 320.0f;
+        if(paramsW < 850.0f) paramsW = 850.0f;
         float paramsH = std::max(220.0f, disp.y * 0.38f);
         if(gShowParamsWindow)
         {
-        ImGui::SetNextWindowPos(ImVec2(disp.x - paramsW - 10.0f, disp.y - paramsH - 10.0f), layCond);
-        ImGui::SetNextWindowSize(ImVec2(paramsW, paramsH), layCond);
+        if(!gSizeF4FromF1) ImGui::SetNextWindowPos(ImVec2(disp.x - paramsW - 10.0f, disp.y - paramsH - 10.0f), layCond);
+        if(gSizeF4FromF1)
+        {
+            ImGui::SetNextWindowSize(ImVec2(gF1WindowWidth,gF1WindowHeight),ImGuiCond_Always);
+            ImGui::SetNextWindowPos(gF1WindowPos,ImGuiCond_Always);
+            gSizeF4FromF1=false;
+        }
+        else ImGui::SetNextWindowSize(ImVec2(paramsW, paramsH), layCond);
             ImGui::Begin("Training parameters", nullptr, ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoSavedSettings);
         if(!gTrain.active)
         {
+            ImGui::BeginDisabled(gPendingTopology.has_value());
             ImGui::SliderInt("Epochs", &gTrain.totalEpochs, 10, 5000);
             ImGui::SliderFloat("Learning rate", &gTrain.lr, 1e-5f, 1.0f, "%.6f", ImGuiSliderFlags_Logarithmic);
             ImGui::SliderFloat("L1", &gTrain.l1, 0.0f, 0.1f, "%.6f", ImGuiSliderFlags_Logarithmic);
             ImGui::SliderFloat("L2", &gTrain.l2, 0.0f, 0.1f, "%.6f", ImGuiSliderFlags_Logarithmic);
             ImGui::InputFloat("Target MSE (<=0 off)", &gTrain.targetMSE, 0.0f, 0.0f, "%.6f");
             ImGui::Separator();
-            // Row 1: Rabbit Example, Help
+            // Row 1: presets, help, training controls and config.
             if(ImGui::Button("Rabbit Example"))
             {
+                NeuralGraph candidate;
+                std::vector<TrainSample> lessons;
                 // Build 6-10-8-5 network for rabbit scenario
-                NG_BuildTopology(graph, 6, {10,8}, 5);
+                NG_BuildTopology(candidate, 6, {10,8}, 5);
                 // Label inputs/outputs with descriptions
                 {
                     static const char* kInputs[6]  = 
@@ -4465,128 +5259,91 @@ void Engine::render()
                         "Action to rest and recover"
                     };
 
-                    if(!graph.layers.empty() && graph.layers.front().kind==LayerKind::Input)
+                    if(!candidate.layers.empty() && candidate.layers.front().kind==LayerKind::Input)
                     {
-                        auto& L = graph.layers.front();
+                        auto& L = candidate.layers.front();
                         for(size_t i=0;i<L.nodeIdx.size() && i<6;i++)
                         { 
-                            graph.nodes[L.nodeIdx[i]].label = std::string(kInputs[i]);
-                            graph.nodes[L.nodeIdx[i]].desc = std::string(kInputDescs[i]);
+                            candidate.nodes[L.nodeIdx[i]].label = std::string(kInputs[i]);
+                            candidate.nodes[L.nodeIdx[i]].desc = std::string(kInputDescs[i]);
                         }
                     }
-                    if(!graph.layers.empty())
+                    if(!candidate.layers.empty())
                     {
-                        auto& L = graph.layers.back();
+                        auto& L = candidate.layers.back();
                         if(L.kind==LayerKind::Output)
                         {
                             for(size_t i=0;i<L.nodeIdx.size() && i<5;i++)
                             { 
-                                graph.nodes[L.nodeIdx[i]].label = std::string(kActions[i]);
-                                graph.nodes[L.nodeIdx[i]].desc = std::string(kActionDescs[i]);
+                                candidate.nodes[L.nodeIdx[i]].label = std::string(kActions[i]);
+                                candidate.nodes[L.nodeIdx[i]].desc = std::string(kActionDescs[i]);
                             }
                         }
                     }
                 }
 
                 // Randomize hidden layers for a fresh start
-                NG_RandomizeHidden(graph, 0.8f, 0.3f);
-
-                // Training params
-                gTrain.lr = 0.01f;
-                gTrain.l1 = 0.0f;
-                gTrain.l2 = 0.0001f;
-                gTrain.totalEpochs = 3000;
-                gTrain.targetMSE = 0.02f;
+                NG_RandomizeHidden(candidate, 0.8f, 0.3f);
 
                 // Dataset from specification (6 inputs, 5 outputs one-hot) with descriptions
-                gDataset.clear();
+                lessons.clear();
                 auto make_sample = [&](const std::array<float,6>& in, const std::array<float,5>& out, const std::string& desc)
                 {
                     TrainSample s; s.in.assign(in.begin(), in.end()); s.out.assign(out.begin(), out.end()); s.desc = desc; return s;
                 };
 
-                gDataset.push_back(make_sample({0.0f, 0.9f, 0.0f, 0.8f, 0.3f, 0.6f}, {1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, "Fox nearby, no food → Flee"));
-                gDataset.push_back(make_sample({0.0f, 0.8f, 0.0f, 0.7f, 0.9f, 0.5f}, {0.0f, 1.0f, 0.0f, 0.0f, 0.0f}, "Fox nearby, bush close → Hide"));
-                gDataset.push_back(make_sample({0.0f, 0.0f, 0.9f, 0.0f, 0.2f, 0.1f}, {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, "Hungry, sees carrot, no threat → Move to food"));
-                gDataset.push_back(make_sample({0.8f, 0.0f, 0.9f, 0.0f, 0.1f, 0.2f}, {0.0f, 0.0f, 0.0f, 1.0f, 0.0f}, "At carrot, hungry, safe → Eat"));
-                gDataset.push_back(make_sample({0.1f, 0.0f, 0.0f, 0.0f, 0.2f, 0.9f}, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, "Full, no threat → Rest"));
-                gDataset.push_back(make_sample({0.7f, 0.8f, 0.6f, 0.7f, 0.2f, 0.3f}, {1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, "Fox and food nearby, low hunger → Flee"));
-                gDataset.push_back(make_sample({0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.8f}, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, "Tired, full, no signals → Rest"));
-                gDataset.push_back(make_sample({0.0f, 0.2f, 0.9f, 0.1f, 0.1f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, "Very hungry, sees carrot, fox far → Move to food"));
-                gDataset.push_back(make_sample({0.0f, 0.9f, 0.0f, 0.7f, 0.0f, 0.2f}, {1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, "Low energy, smells fox, no shelter → Flee"));
-                gDataset.push_back(make_sample({0.6f, 0.0f, 0.9f, 0.0f, 0.1f, 1.0f}, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, "Full, sees carrot, no fox → Rest"));
-                gDataset.push_back(make_sample({0.0f, 0.9f, 0.0f, 0.6f, 0.5f, 0.4f}, {0.0f, 1.0f, 0.0f, 0.0f, 0.0f}, "Strong fox smell, no shelter → Hide"));
-                gDataset.push_back(make_sample({0.0f, 0.2f, 0.0f, 0.4f, 0.9f, 0.6f}, {0.0f, 1.0f, 0.0f, 0.0f, 0.0f}, "Fox far, bush close → Hide"));
-                gDataset.push_back(make_sample({0.0f, 0.0f, 0.0f, 0.0f, 0.3f, 0.6f}, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, "Slightly hungry, safe → Rest"));
-                gDataset.push_back(make_sample({0.7f, 0.1f, 0.0f, 0.2f, 0.0f, 0.3f}, {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, "Fox very far, smells carrot → Move to food"));
-                gDataset.push_back(make_sample({0.5f, 0.2f, 0.4f, 0.1f, 0.0f, 0.9f}, {0.0f, 0.0f, 0.0f, 1.0f, 0.0f}, "Full, slight fox smell → Eat (safe, enough energy)"));
-                gDataset.push_back(make_sample({0.6f, 0.0f, 0.7f, 0.0f, 0.1f, 0.7f}, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, "High energy, senses carrot and safety → Rest"));
-                gDataset.push_back(make_sample({0.0f, 0.0f, 0.7f, 0.0f, 0.8f, 0.3f}, {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, "Carrot visible behind bush, no fox → Move to food"));
-                gLessonsCount = (int)gDataset.size();
-                SaveEngineConf("engine.conf");
-                Logf("Rabbit Example initialized: topology 6-10-8-5, lessons=%d", gLessonsCount);
+                lessons.push_back(make_sample({0.0f, 0.9f, 0.0f, 0.8f, 0.3f, 0.6f}, {1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, "Fox nearby, no food → Flee"));
+                lessons.push_back(make_sample({0.0f, 0.8f, 0.0f, 0.7f, 0.9f, 0.5f}, {0.0f, 1.0f, 0.0f, 0.0f, 0.0f}, "Fox nearby, bush close → Hide"));
+                lessons.push_back(make_sample({0.0f, 0.0f, 0.9f, 0.0f, 0.2f, 0.1f}, {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, "Hungry, sees carrot, no threat → Move to food"));
+                lessons.push_back(make_sample({0.8f, 0.0f, 0.9f, 0.0f, 0.1f, 0.2f}, {0.0f, 0.0f, 0.0f, 1.0f, 0.0f}, "At carrot, hungry, safe → Eat"));
+                lessons.push_back(make_sample({0.1f, 0.0f, 0.0f, 0.0f, 0.2f, 0.9f}, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, "Full, no threat → Rest"));
+                lessons.push_back(make_sample({0.7f, 0.8f, 0.6f, 0.7f, 0.2f, 0.3f}, {1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, "Fox and food nearby, low hunger → Flee"));
+                lessons.push_back(make_sample({0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.8f}, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, "Tired, full, no signals → Rest"));
+                lessons.push_back(make_sample({0.0f, 0.2f, 0.9f, 0.1f, 0.1f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, "Very hungry, sees carrot, fox far → Move to food"));
+                lessons.push_back(make_sample({0.0f, 0.9f, 0.0f, 0.7f, 0.0f, 0.2f}, {1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, "Low energy, smells fox, no shelter → Flee"));
+                lessons.push_back(make_sample({0.6f, 0.0f, 0.9f, 0.0f, 0.1f, 1.0f}, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, "Full, sees carrot, no fox → Rest"));
+                lessons.push_back(make_sample({0.0f, 0.9f, 0.0f, 0.6f, 0.5f, 0.4f}, {0.0f, 1.0f, 0.0f, 0.0f, 0.0f}, "Strong fox smell, no shelter → Hide"));
+                lessons.push_back(make_sample({0.0f, 0.2f, 0.0f, 0.4f, 0.9f, 0.6f}, {0.0f, 1.0f, 0.0f, 0.0f, 0.0f}, "Fox far, bush close → Hide"));
+                lessons.push_back(make_sample({0.0f, 0.0f, 0.0f, 0.0f, 0.3f, 0.6f}, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, "Slightly hungry, safe → Rest"));
+                lessons.push_back(make_sample({0.7f, 0.1f, 0.0f, 0.2f, 0.0f, 0.3f}, {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, "Fox very far, smells carrot → Move to food"));
+                lessons.push_back(make_sample({0.5f, 0.2f, 0.4f, 0.1f, 0.0f, 0.9f}, {0.0f, 0.0f, 0.0f, 1.0f, 0.0f}, "Full, slight fox smell → Eat (safe, enough energy)"));
+                lessons.push_back(make_sample({0.6f, 0.0f, 0.7f, 0.0f, 0.1f, 0.7f}, {0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, "High energy, senses carrot and safety → Rest"));
+                lessons.push_back(make_sample({0.0f, 0.0f, 0.7f, 0.0f, 0.8f, 0.3f}, {0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, "Carrot visible behind bush, no fox → Move to food"));
+                NG_RequestTopology(graph,std::move(candidate),std::move(lessons),[]()
+                {
+                    gTrain.lr=0.01f; gTrain.l1=0; gTrain.l2=0.0001f;
+                    gTrain.totalEpochs=3000; gTrain.targetMSE=0.02f;
+                    SaveEngineConf("engine.conf");
+                    Logf("Rabbit Example initialized: lessons=%d",gLessonsCount);
+                });
             }
 
             ImGui::SameLine();
             if(ImGui::Button("Deep GRU Factory"))
             {
-                NG_BuildDeepGRUTopology(graph);
-                BuildFactorySequenceLessons(graph);
-                gTrain.lr = 0.001f;
-                gTrain.l1 = 0.0f;
-                gTrain.l2 = 0.0001f;
-                gTrain.totalEpochs = 5000;
-                gTrain.targetMSE = 0.015f;
-                SaveEngineConf("engine.conf");
-                Logf("Deep GRU Factory initialized: 12-48-GRU40-GRU32-48-8, neurons=%zu, sequence lessons=%d",
-                     graph.nodes.size(), gLessonsCount);
+                NeuralGraph candidate;
+                std::vector<TrainSample> lessons;
+                NG_BuildDeepGRUTopology(candidate);
+                BuildFactorySequenceLessons(candidate,lessons);
+                NG_RequestTopology(graph,std::move(candidate),std::move(lessons),[]()
+                {
+                    gTrain.lr=0.001f; gTrain.l1=0; gTrain.l2=0.0001f;
+                    gTrain.totalEpochs=5000; gTrain.targetMSE=0.015f;
+                    SaveEngineConf("engine.conf");
+                    Logf("Deep GRU Factory initialized: sequence lessons=%d",gLessonsCount);
+                });
             }
 
             ImGui::SameLine();
             if(ImGui::Button("Help (H)")) gShowHelp = !gShowHelp;
-            // Row 2: Start, Train To Target, Save Config
-            if(ImGui::Button("Start"))
-            {
-                if(!gDataset.empty())
-                {
-                    // Break symmetry if weights look uniform (e.g., freshly rebuilt)
-                    bool uniform = true; float ref = (!graph.edges.empty()? graph.edges.front().w : 0.0f);
-                    for(const auto& e_ : graph.edges){ if(std::fabs(e_.w - ref) > 1e-6f){ uniform=false; break; } }
-                    if(uniform) NG_RandomizeHidden(graph, 1.0f, 0.5f);
-                    gTrain.active=true; gTrain.done=false; gTrain.epoch=0; gTrain.mseHistory.clear(); gTrain.startTime = nowSeconds(); gTrain.avgEpochMs=0.0;
-                    Logf("Training started: epochs=%d, lr=%.6f, L1=%.6f, L2=%.6f, targetMSE=%.6f",
-                         gTrain.totalEpochs, gTrain.lr, gTrain.l1, gTrain.l2, gTrain.targetMSE);
-                }
-                else
-                {
-                    Logf("Cannot start training: dataset is empty.");
-                }
-            }
+            ImGui::SameLine();
+            if(ImGui::Button("Start")) StartTraining(graph, false);
+            ImGui::SameLine();
+            if(ImGui::Button("Train To Target (T)")) StartTraining(graph, true);
 
             ImGui::SameLine();
-            if(ImGui::Button("Train To Target (T)"))
-            {
-                if(gDataset.empty())
-                {
-                    Logf("Cannot train to target: dataset is empty. idiot.");
-                } 
-                else if(gTrain.targetMSE <= 0.0f)
-                {
-                    Logf("Cannot train to target: set Target MSE > 0 first. dushebag.");
-                } 
-                else 
-                {
-                    bool uniform = true; float ref = (!graph.edges.empty()? graph.edges.front().w : 0.0f);
-                    for(const auto& e_ : graph.edges){ if(std::fabs(e_.w - ref) > 1e-6f){ uniform=false; break; } }
-                    if(uniform) NG_RandomizeHidden(graph, 1.0f, 0.5f);
-                    gTrain.totalEpochs = std::max(gTrain.totalEpochs, 200000); // give plenty of room
-                    gTrain.active=true; gTrain.done=false; gTrain.epoch=0; gTrain.mseHistory.clear(); gTrain.startTime = nowSeconds(); gTrain.avgEpochMs=0.0;
-                    Logf("Train-to-target started: targetMSE=%.6f, epochs=%d, lr=%.6f", gTrain.targetMSE, gTrain.totalEpochs, gTrain.lr);
-                }
-            }
-
-            ImGui::SameLine();
-            if(ImGui::Button("Save Config")){ SaveEngineConf("engine.conf"); Logf("Config saved: engine.conf"); }
+            if(ImGui::Button("Save Config") && SaveEngineConf("engine.conf")) Logf("Config saved: engine.conf");
+            ImGui::EndDisabled();
         }
         else
         {
@@ -4613,12 +5370,36 @@ void Engine::render()
         }
 
         ImGui::Separator();
+        ImGui::BeginDisabled(gTrain.active || gPendingTopology.has_value());
         ImGui::Text("Dataset: %d lessons", gLessonsCount);
+        ImGui::TextWrapped("Lesson outputs use the applied Lesson target values; unset targets are zero. Predictions are shown separately.");
+        // An existing lesson is edited in the same F4 controls, not in a popup.
+        static int editingLesson = -1;
+        static std::vector<float> singleEditInputs, singleEditOutputs;
+        static char lessonEditDescription[256] = {};
+        static int lessonDescriptionSync = -1;
+        static unsigned int editorDatasetRevision = 0;
+        auto cancelLessonEdit = [&]()
+        {
+            editingLesson = -1;
+            singleEditInputs.clear(); singleEditOutputs.clear();
+            gSequenceDraft.clear(); seqSelectedFrame = -1; seqPlaying = false;
+        };
+        if(editorDatasetRevision != gDatasetRevision)
+        {
+            cancelLessonEdit();
+            lessonDescriptionSync = -1;
+            editorDatasetRevision = gDatasetRevision;
+        }
+        if(editingLesson >= (int)gDataset.size()) cancelLessonEdit();
+        if(ImGui::Button("Clear lesson targets")) ClearLessonTargets();
+        ImGui::SameLine();
 
-        // Row 3: Add Lesson, Randomize Hidden, Delete All Lessons
+        // Keep the lesson-target actions on a single row.
         if(ImGui::Button("Add Lesson (M)"))
         {
-            std::vector<float> in,out; CollectIO(graph,in,out);
+            if(editingLesson >= 0) cancelLessonEdit();
+            std::vector<float> in,out; CollectIO(graph,in,out, true);
             TrainSample sample;
             sample.in = std::move(in);
             sample.out = std::move(out);
@@ -4628,43 +5409,234 @@ void Engine::render()
             Logf("Lesson added. Total=%d", gLessonsCount);
         }
 
-        static std::vector<std::vector<float>> sequenceDraft;
-        ImGui::SameLine();
-        if(ImGui::Button("Add sequence frame"))
+        if(editingLesson >= 0 && editingLesson < (int)gDataset.size() &&
+           gDataset[editingLesson].sequence.empty())
         {
-            std::vector<float> in, out;
-            CollectIO(graph, in, out);
-            sequenceDraft.push_back(std::move(in));
-            Logf("Sequence frame added (%zu).", sequenceDraft.size());
+            ImGui::Separator();
+            ImGui::Text("Edit single lesson #%d", editingLesson);
+            ImGui::SetNextItemWidth(340.0f);
+            ImGui::InputText("Description##single", lessonEditDescription, sizeof(lessonEditDescription));
+            int inputPos = 0, outputPos = 0;
+            for(const auto& layer : graph.layers)
+            {
+                if(layer.kind != LayerKind::Input && layer.kind != LayerKind::Output) continue;
+                for(int idx : layer.nodeIdx)
+                {
+                    const bool input = layer.kind == LayerKind::Input;
+                    int pos = input ? inputPos++ : outputPos++;
+                    auto& values = input ? singleEditInputs : singleEditOutputs;
+                    if(pos >= (int)values.size()) values.resize(pos+1, 0.0f);
+                    ImGui::PushID(input ? pos : 10000+pos);
+                    ImGui::SetNextItemWidth(150.0f);
+                    if(ImGui::InputFloat("##lesson_value", &values[pos], 0, 0, "%.4f"))
+                    {
+                        if(!std::isfinite(values[pos])) values[pos] = 0.0f;
+                        values[pos] = std::clamp(values[pos], 0.0f, 1.0f);
+                    }
+                    ImGui::SameLine();
+                    ImGui::Text("%s: %s", input ? "Input" : "Output", graph.nodes[idx].label.c_str());
+                    ImGui::PopID();
+                }
+            }
+            if(ImGui::Button("Save Lesson Changes"))
+            {
+                auto& sample = gDataset[editingLesson];
+                sample.in = singleEditInputs;
+                sample.out = singleEditOutputs;
+                sample.desc = lessonEditDescription;
+                lessonDescriptionSync = editingLesson;
+                SaveEngineConf("engine.conf");
+                Logf("Lesson %d updated.", editingLesson);
+                cancelLessonEdit();
+            }
+            ImGui::SameLine();
+            if(ImGui::Button("Cancel Lesson Edit")) cancelLessonEdit();
+        }
+        // Sequence lesson editor: edit all steps and expected outputs directly in F4.
+        // Graph values are used only to seed the first frame; no F1 Apply is required.
+        ImGui::Separator();
+        ImGui::TextUnformatted("Sequence lesson editor");
+        std::vector<int> seqInputIdx, seqOutputIdx;
+        for(const auto& layer : graph.layers)
+        {
+            if(layer.kind == LayerKind::Input)
+                for(int idx : layer.nodeIdx) seqInputIdx.push_back(idx);
+            else if(layer.kind == LayerKind::Output)
+                for(int idx : layer.nodeIdx) seqOutputIdx.push_back(idx);
+        }
+        auto showSequenceFrame = [&](int frame)
+        {
+            UseManualInputs(graph);
+            if(frame < 0) ResetInferenceMemory(graph);
+            else if(!gTrain.active && !PreviewSequenceFrame(graph, frame, true))
+                Logf("Sequence preview failed: invalid frame or network parameters.");
+        };
+        if(ImGui::Button("Add Frame"))
+        {
+            std::vector<float> values;
+            if(!gSequenceDraft.empty()) values = gSequenceDraft.back();
+            else
+                for(int idx : seqInputIdx) values.push_back(graph.nodes[idx].value);
+            values.resize(seqInputIdx.size(), 0.0f);
+            gSequenceDraft.push_back(std::move(values));
+            seqSelectedFrame = (int)gSequenceDraft.size()-1;
+            showSequenceFrame(seqSelectedFrame);
         }
         ImGui::SameLine();
-        if(ImGui::Button("Save sequence lesson"))
+        if(ImGui::Button("Duplicate") && seqSelectedFrame >= 0 && seqSelectedFrame < (int)gSequenceDraft.size())
         {
-            if(sequenceDraft.empty())
+            gSequenceDraft.insert(gSequenceDraft.begin()+seqSelectedFrame+1, gSequenceDraft[seqSelectedFrame]);
+            ++seqSelectedFrame;
+            showSequenceFrame(seqSelectedFrame);
+        }
+        ImGui::SameLine();
+        if(ImGui::Button("Delete Frame") && seqSelectedFrame >= 0 && seqSelectedFrame < (int)gSequenceDraft.size())
+        {
+            gSequenceDraft.erase(gSequenceDraft.begin()+seqSelectedFrame);
+            seqSelectedFrame = gSequenceDraft.empty() ? -1 : std::min(seqSelectedFrame, (int)gSequenceDraft.size()-1);
+            seqPlaying = false;
+            showSequenceFrame(seqSelectedFrame);
+        }
+        ImGui::SameLine();
+        if(ImGui::Button("Move Up") && seqSelectedFrame > 0 && seqSelectedFrame < (int)gSequenceDraft.size())
+        {
+            std::swap(gSequenceDraft[seqSelectedFrame],gSequenceDraft[seqSelectedFrame-1]);
+            --seqSelectedFrame;
+            showSequenceFrame(seqSelectedFrame);
+        }
+        ImGui::SameLine();
+        if(ImGui::Button("Move Down") && seqSelectedFrame >= 0 && seqSelectedFrame+1 < (int)gSequenceDraft.size())
+        {
+            std::swap(gSequenceDraft[seqSelectedFrame],gSequenceDraft[seqSelectedFrame+1]);
+            ++seqSelectedFrame;
+            showSequenceFrame(seqSelectedFrame);
+        }
+        ImGui::SameLine();
+        if(ImGui::Button("Clear Sequence"))
+        {
+            gSequenceDraft.clear(); seqSelectedFrame = -1; seqPlaying = false;
+            showSequenceFrame(-1);
+        }
+        ImGui::Text("Frames: %zu",gSequenceDraft.size());
+        if(ImGui::Button(seqPlaying ? "Stop Playback" : "Play Sequence"))
+        {
+            const bool start = !seqPlaying && !gSequenceDraft.empty();
+            UseManualInputs(graph);
+            seqPlaybackAccumulator = 0.0;
+            seqPlaybackFrame = 0;
+            if(start)
             {
-                Logf("Add at least one sequence frame first.");
+                seqPlaying = PreviewSequenceFrame(graph, 0, true);
+                if(!seqPlaying) Logf("Sequence playback could not start: invalid frame or network parameters.");
             }
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(150.0f);
+        ImGui::SliderFloat("Playback Hz", &seqPlaybackHz, 0.2f, 10.0f, "%.1f");
+        if(!gSequenceDraft.empty())
+        {
+            const int cols = (int)seqInputIdx.size()+1;
+            if(ImGui::BeginTable("sequence_editor",cols,
+                 ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_Resizable|ImGuiTableFlags_ScrollX|ImGuiTableFlags_ScrollY|ImGuiTableFlags_SizingFixedFit,
+                 ImVec2(0.0f, std::min(260.0f, 34.0f+gSequenceDraft.size()*25.0f))))
+            {
+                ImGui::TableSetupColumn("Step",ImGuiTableColumnFlags_WidthFixed,55.0f);
+                for(int idx : seqInputIdx)
+                    ImGui::TableSetupColumn(graph.nodes[idx].label.c_str(),ImGuiTableColumnFlags_WidthFixed,150.0f);
+                ImGui::TableHeadersRow();
+                for(int row=0;row<(int)gSequenceDraft.size();++row)
+                {
+                    auto& frame=gSequenceDraft[row];
+                    frame.resize(seqInputIdx.size(),0.0f);
+                    ImGui::PushID(row);
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    char stepName[32]; std::snprintf(stepName,sizeof(stepName),"t%d",row);
+                    // Only the Step button selects a frame; editing cells must keep mouse focus.
+                    if(ImGui::SmallButton(stepName))
+                    {
+                        seqSelectedFrame=row;
+                        seqPlaying=false;
+                        showSequenceFrame(row);
+                    }
+                    for(int c=0;c<(int)seqInputIdx.size();++c)
+                    {
+                        ImGui::TableSetColumnIndex(c+1);
+                        ImGui::PushID(c);
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        if(ImGui::InputFloat("##input",&frame[c],0.0f,0.0f,"%.3f"))
+                        {
+                            if(!std::isfinite(frame[c])) frame[c]=0.0f;
+                            frame[c]=std::clamp(frame[c],0.0f,1.0f);
+                            showSequenceFrame(seqSelectedFrame >= 0 ? seqSelectedFrame : row);
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+        }
+        ImGui::Separator();
+        ImGui::TextUnformatted("Expected Outputs (final sequence target)");
+        for(int idx : seqOutputIdx)
+        {
+            const Neuron& node = graph.nodes[idx];
+            float target = 0.0f;
+            auto it=gLessonTargets.find(node.id);
+            if(it!=gLessonTargets.end()) target=it->second;
+            ImGui::PushID(node.id);
+            ImGui::SetNextItemWidth(130.0f);
+            if(ImGui::InputFloat("##target",&target,0.0f,0.0f,"%.4f") && std::isfinite(target))
+            {
+                gLessonTargets[node.id]=target;
+                ++gLessonTargetRevision;
+            }
+            ImGui::SameLine(); ImGui::TextUnformatted(node.label.c_str());
+            ImGui::PopID();
+        }
+        if(editingLesson >= 0 && editingLesson < (int)gDataset.size() &&
+           !gDataset[editingLesson].sequence.empty())
+        {
+            ImGui::Text("Editing sequence lesson #%d", editingLesson);
+            ImGui::SetNextItemWidth(340.0f);
+            ImGui::InputText("Description##sequence", lessonEditDescription, sizeof(lessonEditDescription));
+            if(ImGui::Button("Cancel Sequence Edit")) cancelLessonEdit();
+        }
+        ImGui::BeginDisabled(editingLesson >= 0 && editingLesson < (int)gDataset.size() &&
+                             gDataset[editingLesson].sequence.empty());
+        if(ImGui::Button(editingLesson >= 0 && editingLesson < (int)gDataset.size() &&
+                         !gDataset[editingLesson].sequence.empty()
+                         ? "Save Sequence Changes" : "Save Sequence Lesson"))
+        {
+            if(gSequenceDraft.empty()) Logf("Add at least one sequence frame first.");
             else
             {
-                std::vector<float> in, out;
-                CollectIO(graph, in, out);
                 TrainSample sample;
-                sample.sequence = sequenceDraft;
-                sample.in = sequenceDraft.back();
-                sample.out = std::move(out);
-                sample.desc = "Custom sequence";
-                gDataset.push_back(std::move(sample));
-                sequenceDraft.clear();
-                gLessonsCount = (int)gDataset.size();
-                Logf("Sequence lesson saved. Total=%d", gLessonsCount);
+                sample.sequence = gSequenceDraft;
+                sample.in = gSequenceDraft.back();
+                for(int idx : seqOutputIdx)
+                {
+                    auto it=gLessonTargets.find(graph.nodes[idx].id);
+                    sample.out.push_back(it!=gLessonTargets.end()?it->second:0.0f);
+                }
+                const bool updating = editingLesson >= 0 && editingLesson < (int)gDataset.size() &&
+                                      !gDataset[editingLesson].sequence.empty();
+                sample.desc = updating ? std::string(lessonEditDescription) : "Custom sequence";
+                if(updating)
+                {
+                    gDataset[editingLesson] = std::move(sample);
+                    lessonDescriptionSync = editingLesson;
+                }
+                else gDataset.push_back(std::move(sample));
+                cancelLessonEdit();
+                gLessonsCount=(int)gDataset.size();
+                SaveEngineConf("engine.conf");
+                Logf("Sequence lesson saved. Total=%d",gLessonsCount);
             }
         }
-        ImGui::SameLine();
-        if(ImGui::Button("Clear sequence")) sequenceDraft.clear();
-        ImGui::TextDisabled("Sequence draft: %zu frames (set inputs, add frame, repeat, then set outputs and save)",
-                            sequenceDraft.size());
-
-        ImGui::SameLine();
+        ImGui::EndDisabled();
+        ImGui::Separator();
         if(ImGui::Button("Randomize Hidden (X)"))
         {
             NG_RandomizeHidden(graph, 1.0f, 0.5f);
@@ -4674,12 +5646,14 @@ void Engine::render()
         ImGui::SameLine();
         if(ImGui::Button("Delete All Lessons"))
         {
+            cancelLessonEdit();
             gDataset.clear(); gLessonsCount = 0;
             SaveEngineConf("engine.conf");
             Logf("All lessons deleted. forever. it was shit anyway..");
         }
 
-        // Row 4: Save/Load network
+        // Keep randomize, delete, save and load on one row.
+        ImGui::SameLine();
         if(ImGui::Button("Save Network (S)"))
         {
             std::error_code _ec; std::filesystem::create_directories("saved", _ec);
@@ -4709,8 +5683,10 @@ void Engine::render()
         // Lessons table with editable descriptions and actions
         ImGui::Separator();
         static std::vector<std::array<char,256>> lessonDescBuf;
-        if(lessonDescBuf.size() != gDataset.size())
+        static unsigned int descriptionDatasetRevision = 0;
+        if(lessonDescBuf.size() != gDataset.size() || descriptionDatasetRevision != gDatasetRevision)
         {
+            descriptionDatasetRevision = gDatasetRevision;
             lessonDescBuf.resize(gDataset.size());
             for(size_t i=0;i<gDataset.size();++i)
             {
@@ -4718,7 +5694,16 @@ void Engine::render()
             }
         }
 
+        if(lessonDescriptionSync >= 0 && lessonDescriptionSync < (int)gDataset.size() &&
+           lessonDescriptionSync < (int)lessonDescBuf.size())
+        {
+            std::snprintf(lessonDescBuf[lessonDescriptionSync].data(),
+                          lessonDescBuf[lessonDescriptionSync].size(), "%s",
+                          gDataset[lessonDescriptionSync].desc.c_str());
+        }
+        lessonDescriptionSync = -1;
         int pendingDelete = -1;
+        int pendingEdit = -1;
         if(ImGui::BeginTable("lessons_table", 6, ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_Resizable|ImGuiTableFlags_SizingStretchSame))
         {
             ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 40.0f);
@@ -4726,7 +5711,7 @@ void Engine::render()
             ImGui::TableSetupColumn("in");
             ImGui::TableSetupColumn("out");
             ImGui::TableSetupColumn("desc", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("actions", ImGuiTableColumnFlags_WidthFixed, 160.0f);
+            ImGui::TableSetupColumn("actions", ImGuiTableColumnFlags_WidthFixed, 205.0f);
             ImGui::TableHeadersRow();
             int showN = (int)gDataset.size();
             for(int i=0;i<showN;i++)
@@ -4736,7 +5721,20 @@ void Engine::render()
                 ImGui::Text("%d", i);
                 auto& s = gDataset[i];
                 ImGui::TableSetColumnIndex(1);
-                ImGui::Text("%zu", s.sequence.empty() ? size_t(1) : s.sequence.size());
+                const bool hasSequence = !s.sequence.empty();
+                bool sequenceExpanded = false;
+                ImGui::PushID(i + 200000);
+                if(hasSequence)
+                {
+                    // TreeNode keeps expansion state per lesson and clearly marks sequences.
+                    sequenceExpanded = ImGui::TreeNodeEx("sequence", ImGuiTreeNodeFlags_SpanAvailWidth,
+                                                         "SEQ (%zu)", s.sequence.size());
+                    if(ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Click to show/hide saved sequence frames");
+                }
+                else
+                    ImGui::TextDisabled("single");
+                ImGui::PopID();
                 auto vecToStr=[&](const std::vector<float>& v)
                 { 
                     std::string r="["; 
@@ -4770,6 +5768,8 @@ void Engine::render()
                 ImGui::PopID();
                 ImGui::TableSetColumnIndex(5);
                 ImGui::PushID(i+100000);
+                if(ImGui::Button("Edit")) pendingEdit = i;
+                ImGui::SameLine();
                 if(ImGui::Button("Save"))
                 {
                     s.desc = std::string(lessonDescBuf[i].data());
@@ -4781,16 +5781,60 @@ void Engine::render()
                     pendingDelete = i;
                 }
                 ImGui::PopID();
+                if(sequenceExpanded)
+                {
+                    // Detail row directly beneath the owning lesson.
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextDisabled("  ");
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextDisabled("frames");
+                    ImGui::TableSetColumnIndex(2);
+                    for(size_t frameIndex = 0; frameIndex < s.sequence.size(); ++frameIndex)
+                    {
+                        const std::string values = vecToStr(s.sequence[frameIndex]);
+                        ImGui::Text("t%zu: %s", frameIndex + 1, values.c_str());
+                    }
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::TextDisabled("Target:");
+                    ImGui::TextWrapped("%s", vecToStr(s.out).c_str());
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::TextDisabled("Ordered input frames; target applies to final step.");
+                    // TreeNodeEx is closed after rendering its details.
+                    ImGui::TreePop();
+                }
             }
             ImGui::EndTable();
         }
-        if(pendingDelete >= 0 && pendingDelete < (int)gDataset.size())
+        if(pendingEdit >= 0 && pendingEdit < (int)gDataset.size())
         {
+            const auto& sample = gDataset[pendingEdit];
+            editingLesson = pendingEdit;
+            std::snprintf(lessonEditDescription, sizeof(lessonEditDescription), "%s", sample.desc.c_str());
+            singleEditInputs = sample.in;
+            singleEditOutputs = sample.out;
+            gSequenceDraft = sample.sequence;
+            seqSelectedFrame = gSequenceDraft.empty() ? -1 : 0;
+            seqPlaying = false;
+            if(!sample.sequence.empty())
+            {
+                showSequenceFrame(0);
+                for(size_t j = 0; j < seqOutputIdx.size(); ++j)
+                    gLessonTargets[graph.nodes[seqOutputIdx[j]].id] = j < sample.out.size() ? sample.out[j] : 0.0f;
+                ++gLessonTargetRevision;
+            }
+            Logf("Editing lesson %d in F4.", pendingEdit);
+        }
+        if(!gTrain.active && pendingDelete >= 0 && pendingDelete < (int)gDataset.size())
+        {
+            if(editingLesson == pendingDelete) cancelLessonEdit();
+            else if(editingLesson > pendingDelete) --editingLesson;
             gDataset.erase(gDataset.begin() + pendingDelete);
             gLessonsCount = (int)gDataset.size();
             if((int)lessonDescBuf.size() > pendingDelete) lessonDescBuf.erase(lessonDescBuf.begin() + pendingDelete);
             Logf("Lesson %d deleted.", pendingDelete);
         }
+        ImGui::EndDisabled();
 
         ImGui::SameLine();
         if(ImGui::Button("Save network (S)"))
@@ -4823,101 +5867,80 @@ void Engine::render()
         }
     }
 
-    // Load menu (choose a network from 'saved')
+    // Load menu: show JSON networks in saved/ and the working directory,
+    // and allow loading an explicit path from any directory.
     if(gShowLoadMenu)
     {
-        ImGui::SetNextWindowSize(ImVec2(520, 420), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(620, 470), ImGuiCond_FirstUseEver);
         if(ImGui::Begin("Load Network", &gShowLoadMenu, ImGuiWindowFlags_NoCollapse))
         {
-            static std::vector<std::string> files;
+            static std::vector<std::filesystem::path> files;
             static int selected = -1;
-
-            // Refresh list on open: simple heuristic
-            if(ImGui::IsWindowAppearing())
-            {
-                files.clear(); selected = -1;
-                std::error_code ec; std::filesystem::create_directories("saved", ec);
-                for(const auto& de : std::filesystem::directory_iterator("saved", ec))
-                {
-                    if(!de.is_regular_file()) continue;
-                    auto p = de.path();
-                    if(p.extension() == ".json") files.push_back(p.filename().string());
-                }
-                std::sort(files.begin(), files.end());
-            }
-
-            if(ImGui::Button("Refresh"))
+            static char manualPath[1024] = "";
+            auto refresh = [&]()
             {
                 files.clear(); selected = -1;
                 std::error_code ec;
-                for(const auto& de : std::filesystem::directory_iterator("saved", ec))
+                std::filesystem::create_directories("saved", ec);
+                for(const std::filesystem::path& dir : {std::filesystem::path("saved"), std::filesystem::path(".")})
                 {
-                    if(!de.is_regular_file()) continue;
-                    auto p = de.path();
-                    if(p.extension() == ".json") files.push_back(p.filename().string());
+                    ec.clear();
+                    std::filesystem::directory_iterator it(dir, ec), end;
+                    while(!ec && it != end)
+                    {
+                        std::error_code fileError;
+                        if(it->is_regular_file(fileError) && !fileError && it->path().extension() == ".json")
+                            files.push_back(it->path().lexically_normal());
+                        it.increment(ec);
+                    }
+                    if(ec) Logf("Cannot list directory %s: %s", dir.string().c_str(), ec.message().c_str());
                 }
                 std::sort(files.begin(), files.end());
-            }
-
-            ImGui::SameLine();
-            if(ImGui::Button("Cancel"))
+                files.erase(std::unique(files.begin(), files.end()), files.end());
+            };
+            auto load = [&](const std::filesystem::path& path)
             {
-                gShowLoadMenu = false;
-            }
-            ImGui::Separator();
-
-            ImGui::Text("Directory: %s", "saved/");
-            ImVec2 listSize = ImVec2(-1, ImGui::GetTextLineHeightWithSpacing()*14.0f);
-            if(ImGui::BeginListBox("##saved_list", listSize))
-            {
-                for(int i=0;i<(int)files.size();++i)
+                std::string message;
+                if(NG_LoadJson(graph, path.string(), &message))
                 {
-                    bool sel = (i==selected);
-                    if(ImGui::Selectable(files[i].c_str(), sel)) selected = i;
-                    if(sel) ImGui::SetItemDefaultFocus();
-                    if(ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0))
-                    {
-                        // Double-click to load
-                        std::string path = std::string("saved/") + files[i];
-                        std::string msg;
-                        if(NG_LoadJson(graph, path, &msg))
-                        {
-                            gToastMsg = std::string(u8"Network loaded: ") + files[i];
-                            Logf("Network loaded: %s", path.c_str());
-                            gToastT = glfwGetTime();
-                            gShowLoadMenu = false;
-                        } 
-                        else 
-                        {
-                            gToastMsg = std::string(u8"Load failed: ") + msg;
-                            Logf("Load failed: %s", msg.c_str());
-                            gToastT = glfwGetTime();
-                        }
-                    }
+                    gToastMsg = "Network loaded: " + path.string();
+                    Logf("Network loaded: %s", path.string().c_str());
+                    gToastT = glfwGetTime();
+                    gShowLoadMenu = false;
+                }
+                else
+                {
+                    gToastMsg = "Load failed: " + message;
+                    Logf("Load failed (%s): %s", path.string().c_str(), message.c_str());
+                    gToastT = glfwGetTime();
+                }
+            };
+            if(ImGui::IsWindowAppearing()) refresh();
+            if(ImGui::Button("Refresh")) refresh();
+            ImGui::SameLine();
+            if(ImGui::Button("Cancel")) gShowLoadMenu = false;
+            ImGui::Separator();
+            std::error_code cwdError;
+            const auto cwd = std::filesystem::current_path(cwdError);
+            if(!cwdError) ImGui::TextWrapped("Working directory: %s", cwd.string().c_str());
+            ImGui::TextUnformatted("Networks in saved/ and working directory:");
+            if(ImGui::BeginListBox("##saved_list", ImVec2(-1, ImGui::GetTextLineHeightWithSpacing()*12.0f)))
+            {
+                for(int i=0; i<(int)files.size(); ++i)
+                {
+                    const std::string label = files[i].generic_string();
+                    if(ImGui::Selectable(label.c_str(), i==selected)) selected = i;
+                    if(ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) load(files[i]);
                 }
                 ImGui::EndListBox();
             }
-
-            bool canLoad = selected >= 0 && selected < (int)files.size();
-            if(!files.empty()) ImGui::Text("Selected: %s", canLoad ? files[selected].c_str() : "");
-            if(ImGui::Button("Load") && canLoad)
-            {
-                std::string path = std::string("saved/") + files[selected];
-                std::string msg;
-                if(NG_LoadJson(graph, path, &msg))
-                {
-                    gToastMsg = std::string(u8"Network loaded: ") + files[selected];
-                    Logf("Network loaded: %s", path.c_str());
-                    gToastT = glfwGetTime();
-                    gShowLoadMenu = false;
-                } 
-                else 
-                {
-                    gToastMsg = std::string(u8"Load failed: ") + msg;
-                    Logf("Fuck! Load failed: %s", msg.c_str());
-                    gToastT = glfwGetTime();
-                }
-            }
+            if(ImGui::Button("Load selected") && selected>=0 && selected<(int)files.size())
+                load(files[selected]);
+            ImGui::Separator();
+            ImGui::TextUnformatted("Or enter a JSON file path (absolute or relative):");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##network_path", manualPath, IM_ARRAYSIZE(manualPath));
+            if(ImGui::Button("Load path") && manualPath[0]) load(std::filesystem::path(manualPath));
         }
         ImGui::End();
     }
@@ -4952,12 +5975,17 @@ void Engine::render()
                 // ensure .json
                 if(path.size()<5 || path.substr(path.size()-5) != ".json") path += ".json";
                 std::error_code ec; std::filesystem::create_directories("saved", ec);
-                NG_SaveJson(graph, path);
-                SaveEngineConf("engine.conf");
-                gToastMsg = std::string(u8"Shitty Network saved: ") + path;
-                gToastT = glfwGetTime();
-                Logf("Total-shit Network saved: %s", path.c_str());
-                gShowSaveMenu = false;
+                if(NG_SaveJson(graph, path))
+                {
+                    Logf("Network saved: %s", path.c_str());
+                    gShowSaveMenu = false;
+                    if(SaveEngineConf("engine.conf"))
+                    {
+                        gToastMsg = "Network saved: " + path;
+                        gToastT = glfwGetTime();
+                    }
+                    else Logf("Network was saved, but engine.conf could not be saved.");
+                }
             }
         }
         ImGui::End();
@@ -4991,18 +6019,24 @@ void Engine::render()
         ImGui::BulletText("F6                   - Training HUD");
         ImGui::BulletText("[ / ]                - previous / next layer");
         ImGui::BulletText("1..9                 - select layer by index");
+        ImGui::BulletText("Ctrl+N               - new network (keep Input and Output only)");
         ImGui::BulletText("N                    - add neuron to current layer");
-        ImGui::BulletText("A                    - add a hidden layer to the right of current");
+        ImGui::BulletText("A                    - add a hidden layer after Input, Hidden or GRU");
         ImGui::BulletText("D                    - remove last neuron from current layer");
-        ImGui::BulletText("Delete               - remove current hidden layer and reconnect neighbours");
+        ImGui::BulletText("Delete               - remove current hidden/GRU layer and reconnect neighbours");
+        ImGui::BulletText("Topology changes require confirmation to clear existing lessons and sequence drafts");
+        ImGui::BulletText("X                    - randomize hidden-layer weights");
         ImGui::BulletText("S                    - save network (open Save dialog)");
         ImGui::BulletText("O                    - load network (open Load dialog)");
-        ImGui::BulletText("M                    - add a lesson from current IN/OUT values");
+        ImGui::BulletText("M                    - add a lesson from inputs and applied lesson targets");
         ImGui::BulletText("B                    - start training on collected lessons");
         ImGui::BulletText("T                    - train to target (fine-tune until Target MSE)");
         ImGui::BulletText("W                    - toggle live feed wave effect");
         ImGui::BulletText("Q                    - random live feed for all input neurons");
         ImGui::BulletText("TAB                  - toggle live feed on all inputs");
+        ImGui::BulletText("Space                - toggle live feed for selected input");
+        ImGui::BulletText("Home                 - show and re-layout all primary windows");
+        ImGui::BulletText("Esc                  - stop training, or close the application");
         ImGui::BulletText("V / R                - VSync / smooth turbine start-stop");
         ImGui::BulletText("Shift+T              - change MLP theme");
         ImGui::BulletText("Shift+G              - change GRU theme (16 palettes)");
@@ -5012,7 +6046,9 @@ void Engine::render()
         ImGui::BulletText("Use buttons like 'Rabbit Example' in Training parameters for presets");
         ImGui::BulletText("Build manually: add layers (A), neurons (N), edit in Neural Editor");
         ImGui::BulletText("Set labels and descriptions in neuron editor (select neuron)");
-        ImGui::BulletText("Add lessons (M) with current IN/OUT values");
+        ImGui::BulletText("Set Lesson target for each output and Apply; unspecified targets are zero");
+        ImGui::BulletText("Add lessons (M) with current inputs and these targets");
+        ImGui::BulletText("GRU: Reset memory, then set inputs, Apply and Next sample for each step");
         ImGui::BulletText("Train (B or T) after setting parameters");
         ImGui::BulletText("Mouse                - LMB orbit, MMB or Shift+LMB pan, wheel zoom");
         ImGui::Separator();
@@ -5022,6 +6058,8 @@ void Engine::render()
         ImGui::BulletText("L1 - L1 regularization (|w|), encourages sparsity");
         ImGui::BulletText("L2 - L2 regularization (w^2), stabilizes training");
         ImGui::BulletText("Target MSE - early stop threshold; <= 0 disables");
+        ImGui::BulletText("MSE is evaluated on all training lessons after each epoch, with fixed weights");
+        ImGui::BulletText("Sequence targets apply to the final step; GRU memory resets for each lesson");
         ImGui::Separator();
         ImGui::Text("Dataset tips");
         ImGui::BulletText("Normalize inputs/outputs to the 0..1 range");
@@ -5042,6 +6080,51 @@ void Engine::render()
         ImGui::BulletText("Interpretation: baseline IQ 0 like you");
         ImGui::End();
         }
+
+    if(gOpenTopologyPopup)
+    {
+        ImGui::OpenPopup("Topology change###TopologyChange");
+        gOpenTopologyPopup=false;
+    }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),ImGuiCond_Appearing,ImVec2(0.5f,0.5f));
+    if(ImGui::BeginPopupModal("Topology change###TopologyChange",nullptr,ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        if(gPendingTopology)
+        {
+            const bool keepLessons=NG_KeepExistingLessons(graph,*gPendingTopology);
+            if(keepLessons)
+            {
+                ImGui::TextWrapped("Changing hidden-layer topology preserves existing lessons and sequence frames because input and output sizes are unchanged.");
+                ImGui::TextWrapped("The modified network must be retrained for reliable predictions.");
+                ImGui::Text("Preserved lessons: %zu. Draft frames: %zu.",gDataset.size(),gSequenceDraft.size());
+            }
+            else
+            {
+                ImGui::TextWrapped("The input/output interface changes, or a preset replaces the dataset. Existing lessons and draft frames cannot be retained.");
+                ImGui::TextWrapped("Retrain the network after changing topology.");
+                ImGui::Text("Current lessons: %zu. Draft frames: %zu.",gDataset.size(),gSequenceDraft.size());
+                if(!gPendingTopology->replacementLessons.empty())
+                    ImGui::Text("Preset lessons to load: %zu.",gPendingTopology->replacementLessons.size());
+            }
+            ImGui::Separator();
+            if(ImGui::Button(keepLessons ? "Change topology and keep lessons" : "Change topology and replace lessons"))
+            {
+                auto change=std::move(*gPendingTopology);
+                gPendingTopology.reset();
+                NG_CommitTopology(graph,std::move(change));
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if(ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape))
+            {
+                gPendingTopology.reset();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SetItemDefaultFocus();
+        }
+        else ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 
     // Toast overlay
     if(!gToastMsg.empty())
@@ -5064,32 +6147,47 @@ void Engine::render()
         if(gTrain.active)
         {
             double t0 = nowSeconds();
-            gUseManualOverrides = false;
+            gInferenceNeedsReset = true;
             float mse = TrainOneEpoch(graph, gTrain.lr, gTrain.l1, gTrain.l2);
-            gUseManualOverrides = true;
-            gTrain.lastMSE = mse;
-            gTrain.mseHistory.push_back(mse);
-            gTrain.epoch++;
-            double t1 = nowSeconds();
-            double dt = (t1 - t0);
-            gTrain.avgEpochMs = (gTrain.avgEpochMs*0.9 + dt*1000.0*0.1);
-
-            // Early stop on target MSE
-            bool targetReached = (gTrain.targetMSE>0.0f && mse <= gTrain.targetMSE);
-
-            if(gTrain.epoch >= gTrain.totalEpochs || targetReached)
+            if(!std::isfinite(mse))
             {
-                gTrain.active=false; gTrain.done=true;
+                gTrain.active = false;
+                gTrain.done = false;
                 gShowTrainingWindow = false;
                 gHUDHasRect = false;
-                SaveEngineConf("engine.conf");
-                NG_SaveJson(graph, "network_trained.json");
-                Logf("Training finished: epoch=%d, MSE=%.6f%s.",
-                     gTrain.epoch, mse, targetReached?" (target eliminated.)": "");
-                gCelebrationVisible = true;
-                gTrainDoneTime = nowSeconds();
-                gTargetReachedVisual = targetReached;
-                gTrainInterrupted = false;
+                gCelebrationVisible = false;
+                gTargetReachedVisual = false;
+                gToastMsg = "Training stopped: " + gTrainingError;
+                gToastT = nowSeconds();
+                Logf("Training stopped: %s; model was not saved.", gTrainingError.c_str());
+            }
+            else
+            {
+                gTrain.lastMSE = mse;
+                gTrain.mseHistory.push_back(mse);
+                gTrain.epoch++;
+                double t1 = nowSeconds();
+                double dt = (t1 - t0);
+                gTrain.avgEpochMs = (gTrain.avgEpochMs*0.9 + dt*1000.0*0.1);
+
+                // Early stop on target MSE
+                bool targetReached = (gTrain.targetMSE>0.0f && mse <= gTrain.targetMSE);
+
+                if(gTrain.epoch >= gTrain.totalEpochs || targetReached)
+                {
+                    gTrain.active=false; gTrain.done=true;
+                    gShowTrainingWindow = false;
+                    gHUDHasRect = false;
+                    SaveEngineConf("engine.conf");
+                    const bool saved=NG_SaveJson(graph, "network_trained.json");
+                    Logf("Trained model %s", saved ? "saved: network_trained.json" : "could not be saved; it remains in memory.");
+                    Logf("Training finished: epoch=%d, MSE=%.6f%s.",
+                         gTrain.epoch, mse, targetReached?" (target eliminated.)": "");
+                    gCelebrationVisible = true;
+                    gTrainDoneTime = nowSeconds();
+                    gTargetReachedVisual = targetReached;
+                    gTrainInterrupted = false;
+                }
             }
         }
 
@@ -5383,6 +6481,10 @@ void Engine::onScroll(double /*dx*/, double dy)
 void Engine::onKey(int key, int /*scancode*/, int action, int mods)
 {
     bool down = action != 0; if(!down) return;
+#ifdef USE_IMGUI
+    // The modal handles Escape; do not let it close the application or run editor shortcuts.
+    if(gPendingTopology) return;
+#endif
     // If result window is visible, allow closing it with Enter/Space/Esc
 #ifdef USE_IMGUI
     if(gCelebrationVisible)
@@ -5424,9 +6526,9 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
 #ifdef USE_IMGUI
     // Function-key visibility toggles (blocked while editing text)
     if(key==GLFW_KEY_F1){ gShowEditorWindow = !gShowEditorWindow; return; }
-    if(key==GLFW_KEY_F2){ gShowNeuralXPanel = !gShowNeuralXPanel; return; }
+    if(key==GLFW_KEY_F2){ gShowNeuralTPanel = !gShowNeuralTPanel; return; }
     if(key==GLFW_KEY_F3){ gShowLogWindow    = !gShowLogWindow; return; }
-    if(key==GLFW_KEY_F4){ gShowParamsWindow = !gShowParamsWindow; return; }
+    if(key==GLFW_KEY_F4){ gShowParamsWindow = !gShowParamsWindow; if(gShowParamsWindow) gSizeF4FromF1=true; return; }
     if(key==GLFW_KEY_F5){ gShowHelp = !gShowHelp; return; }
     if(key==GLFW_KEY_F6){ gShowTrainingWindow = !gShowTrainingWindow; return; }
     if(key==GLFW_KEY_H){ gShowHelp = !gShowHelp; return; }
@@ -5450,6 +6552,18 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
         return;
     }
 
+    if(key==GLFW_KEY_N && (mods & GLFW_MOD_CONTROL))
+    {
+        if(gTrain.active){ Logf("Stop training before creating a new network."); return; }
+        // Preserve the number of input/output neurons, but discard all hidden/GRU
+        // layers, their weights and state, and rebuild direct Input -> Output edges.
+        const int inputCount = !graph.layers.empty() ? (int)graph.layers.front().nodeIdx.size() : 3;
+        const int outputCount = graph.layers.size() >= 2 ? (int)graph.layers.back().nodeIdx.size() : 3;
+        NeuralGraph candidate;
+        NG_BuildTopology(candidate, std::max(1,inputCount), {}, std::max(1,outputCount));
+        NG_RequestTopology(graph,std::move(candidate));
+        return;
+    }
     if(key==GLFW_KEY_N){ NG_AddNeuron(graph, graph.currentLayer); return; }
     if(key==GLFW_KEY_D){ NG_RemoveLastNeuron(graph, graph.currentLayer); return; }
     if(key==GLFW_KEY_A){ NG_InsertHiddenAfterCurrent(graph); return; }
@@ -5457,6 +6571,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     if(key==GLFW_KEY_TAB)
     {
         graph.liveInputs = !graph.liveInputs;
+        if(graph.liveInputs) UseLiveInputs();
         // Apply to all input neurons
         for(const auto& L : graph.layers)
         {
@@ -5473,11 +6588,18 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     }
 
     // 'S' handled below with save dialog (opens Save window)
-    if(key==GLFW_KEY_X){ NG_RandomizeHidden(graph, 1.0f, 0.5f); Logf("Hidden layers randomized."); return; }
+    if(key==GLFW_KEY_X)
+    {
+        if(gTrain.active) { Logf("Stop training before randomizing weights."); return; }
+        NG_RandomizeHidden(graph, 1.0f, 0.5f);
+        Logf("Hidden layers randomized.");
+        return;
+    }
     if(key==GLFW_KEY_M)
     {
+        if(gTrain.active) { Logf("Stop training before adding lessons."); return; }
         std::vector<float> in,out;
-        CollectIO(graph,in,out);
+        CollectIO(graph,in,out, true);
         TrainSample sample;
         sample.in = std::move(in);
         sample.out = std::move(out);
@@ -5489,21 +6611,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     }
     if(key==GLFW_KEY_B)
     {
-        gShowTrainingWindow = true;
-        if(!gDataset.empty())
-        {
-            // Break symmetry if all weights are equal (freshly built graphs)
-            bool uniform = true; float ref = (!graph.edges.empty()? graph.edges.front().w : 0.0f);
-            for(const auto& e_ : graph.edges){ if(std::fabs(e_.w - ref) > 1e-6f){ uniform=false; break; } }
-            if(uniform) NG_RandomizeHidden(graph, 1.0f, 0.5f);
-            gTrain.active=true; gTrain.done=false; gTrain.epoch=0; gTrain.mseHistory.clear(); gTrain.startTime=nowSeconds(); gTrain.avgEpochMs=0.0;
-            Logf("Training started (hotkey B): epochs=%d, lr=%.6f, L1=%.6f, L2=%.6f, targetMSE=%.6f",
-                 gTrain.totalEpochs, gTrain.lr, gTrain.l1, gTrain.l2, gTrain.targetMSE);
-        } 
-        else 
-        {
-            Logf("Cannot start training: dataset is empty.");
-        }
+        StartTraining(graph, false);
         return;
     }
 #endif
@@ -5548,26 +6656,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
         } 
         else 
         {
-            // Train to target (fine-tune) via keyboard 't'
-            if(!gDataset.empty() && gTrain.targetMSE > 0.0f)
-            {
-                bool uniform = true; float ref = (!graph.edges.empty()? graph.edges.front().w : 0.0f);
-                for(const auto& e_ : graph.edges){ if(std::fabs(e_.w - ref) > 1e-6f){ uniform=false; break; } }
-                if(uniform) NG_RandomizeHidden(graph, 1.0f, 0.5f);
-                gTrain.totalEpochs = std::max(gTrain.totalEpochs, 200000);
-                gTrain.active=true; 
-                gTrain.done=false; 
-                gTrain.epoch=0; 
-                gTrain.mseHistory.clear(); 
-                gTrain.startTime = nowSeconds(); 
-                gTrain.avgEpochMs=0.0;
-                Logf("Train-to-kill-target started (hotkey T): targetMSE=%.6f, epochs=%d, lr=%.6f", gTrain.targetMSE, gTrain.totalEpochs, gTrain.lr);
-            } 
-            else 
-            {
-                if(gDataset.empty()) Logf("Cannot train to target: dataset is empty you idiot.");
-                else Logf("Cannot kill the target: set Target MSE > 0 first. Pussy.");
-            }
+            StartTraining(graph, true);
             return;
         }
     }
@@ -5611,9 +6700,11 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
         gShowSaveMenu = true;
         return;
 #else
-        NG_SaveJson(graph, "network.json"); 
-        SaveEngineConf("engine.conf"); 
-        Logf("Network saved: network.json"); 
+        if(NG_SaveJson(graph, "network.json"))
+        {
+            Logf("Network saved: network.json");
+            SaveEngineConf("engine.conf");
+        }
         return;
 #endif
     }
@@ -5623,7 +6714,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
         // Show all primary windows and re-layout to fit screen
         cfg.showUI = true;
         gShowEditorWindow = true;
-        gShowNeuralXPanel = true;
+        gShowNeuralTPanel = true;
         gShowLogWindow = true;
         gShowParamsWindow = true;
         gForceRelayoutWindows = true;
@@ -5656,6 +6747,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
         gLiveFeedWaveActive = !gLiveFeedWaveActive;
         if(gLiveFeedWaveActive)
         {
+            UseLiveInputs(true);
             gLiveFeedCurrentInput = 0;
             gLiveFeedInputTimer = 0.0f;
             gLiveFeedWavePhase = 0.0f;
@@ -5671,6 +6763,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     if(key==GLFW_KEY_Q)
     {
         gRandomLiveFeedActive = !gRandomLiveFeedActive;
+        if(gRandomLiveFeedActive) UseLiveInputs();
         int inputCount = 0;
         for(const auto& L : graph.layers)
         {

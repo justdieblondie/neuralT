@@ -13,7 +13,7 @@
 // ─────────────────────────────────────────
 // Paths and version
 // ─────────────────────────────────────────
-inline constexpr const char* kAppVersion             = "v4.0";
+inline constexpr const char* kAppVersion             = "v4.1";
 inline constexpr const char* kEngineConfFile         = "engine.conf";
 inline constexpr const char* kLessonsFile            = "lessons.json";
 inline constexpr const char* kNetworkFile            = "network.json";
@@ -214,19 +214,31 @@ struct Neuron
 
 struct Edge{ int a=0, b=0; float w=0; };
 
+struct NeuronGroup
+{
+    std::string name;
+    std::vector<int> ids;
+    bool collapsed = true;
+};
+
 struct NeuralGraph
 {
     std::vector<Neuron> nodes;
     std::vector<Edge> edges;
     std::vector<Layer> layers;
 
+    std::vector<int> multiSelected;
+    std::vector<NeuronGroup> neuronGroups;
+    std::vector<int> ungroupedInputIds; // Explicitly removed from automatic prefix groups
+    std::vector<std::vector<int>> syncGroups;
     int selected=-1;
     int currentLayer=0;
     bool liveInputs=false;
 
     // Canvas presentation. Inputs are grouped by the prefix before '_' (NPC,
-    // Scene, Act, ...); only one group is expanded at a time.
-    std::string expandedInputGroup;
+    // Scene, Act, ...); groups can be expanded independently.
+    std::string expandedInputGroup; // Legacy selection (older configurations)
+    std::vector<std::string> expandedInputGroups; // Independent expansion of automatic groups
     bool collapseHiddenLayers=false;
     char editBuf[256]{};
     float lastCanvasW=0, lastCanvasH=0;
