@@ -3,3 +3,4 @@ imgui.ini
 /AGENTS.md
 neuralT
 compile_linux.txt
+.gitignore
