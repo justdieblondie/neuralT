@@ -3000,6 +3000,7 @@ struct AutoPruneState
     double sum=0, baseline=0, limit=0, mse=0, bestMse=0;
     float tolerance=5.0f;
     bool measuringBaseline=true, evaluating=false, found=false;
+    std::chrono::steady_clock::time_point startedAt{};
     std::string report;
 };
 static AutoPruneState gAutoPrune;
@@ -3055,6 +3056,7 @@ static bool StartAutoPrune(NeuralGraph& graph,float tolerance)
     gAutoPrune=AutoPruneState{};
     auto& p=gAutoPrune;
     p.tolerance=tolerance; p.accepted=graph; p.evaluation=graph; p.lessons=gDataset;
+    p.startedAt=std::chrono::steady_clock::now();
     p.evaluating=true; p.report="Evaluating baseline MSE...";
     seqPlaying=false;
     gCelebrationVisible=false;
@@ -3167,6 +3169,31 @@ static void DrawAutoPrunePanel(NeuralGraph& graph)
         ImGui::Text("Round: %zu | Candidates: %zu / %zu | Removed: ",p.rounds,p.candidate,p.candidates.size());
         ImGui::SameLine(0.0f,0.0f);
         ImGui::TextColored(ImVec4(0.30f,0.90f,0.48f,1.0f),"%zu",p.removed);
+        const auto elapsedSeconds=(unsigned long long)std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now()-p.startedAt).count();
+        const unsigned long long elapsedHours=std::min<unsigned long long>(elapsedSeconds/3600,99);
+        const unsigned long long elapsedMinutes=(elapsedSeconds/60)%60;
+        const unsigned long long elapsedRemainingSeconds=elapsedSeconds%60;
+        char elapsedText[16];
+        std::snprintf(elapsedText,sizeof(elapsedText),"%02llu:%02llu:%02llu",
+                      elapsedHours,elapsedMinutes,elapsedRemainingSeconds);
+        ImGui::TextColored(ImVec4(0.32f,0.65f,1.0f,1.0f),"Elapsed: %s",elapsedText);
+        ImGui::TextDisabled("+-------+-----------------+-----------------+---------+----------+");
+        ImGui::TextDisabled("| Round | Candidates      | Lessons         | Removed | Elapsed  |");
+        ImGui::TextDisabled("+-------+-----------------+-----------------+---------+----------+");
+        const auto fixedNumber=[](size_t value,size_t width)
+        {
+            std::string text=std::to_string(value);
+            if(text.size()>width) text=std::string(width-1,'9')+"+";
+            return std::string(width-text.size(),' ')+text;
+        };
+        const std::string candidates=fixedNumber(p.candidate,6)+" / "+fixedNumber(p.candidates.size(),6);
+        const std::string lessons=fixedNumber(p.lesson,6)+" / "+fixedNumber(p.lessons.size(),6);
+        ImGui::TextDisabled("| %s | %s | %s | %s | %s |",
+                            fixedNumber(p.rounds,5).c_str(),candidates.c_str(),lessons.c_str(),
+                            fixedNumber(p.removed,7).c_str(),elapsedText);
+        ImGui::TextDisabled("+-------+-----------------+-----------------+---------+----------+");
+        ImGui::TextWrapped("Stopping keeps neurons removed in completed accepted rounds.");
         if(p.evaluating && p.lesson<p.lessons.size())
             ImGui::Text("Lesson: %zu / %zu | Sequence step: %zu / %zu",p.lesson+1,p.lessons.size(),
                 p.frame,std::max<size_t>(1,p.lessons[p.lesson].sequence.size()));
