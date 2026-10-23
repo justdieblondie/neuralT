@@ -7,6 +7,8 @@
 #include <filesystem>
 #include "main.h"
 #include <cmath>
+#define STB_IMAGE_IMPLEMENTATION
+#include "third_party/stb_image.h"
 
 // GL & window
 #include <cstdio>
@@ -44,6 +46,7 @@
 #include <cerrno>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <limits>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +70,19 @@ static bool gShowEditorWindow = true;      // F1
 static bool gShowNeuralTPanel = false;      // F2 (mirrors cfg.showUI)
 static bool gShowLogWindow    = false;      // F3
 static bool gShowParamsWindow = false;
+static bool gShowOutputTextureWindow = false; // F6
+static bool gOutputTextureVisible = false;
+static int gOutputTexturePixelScale = 4;
+static int gVideoScreenWidth = 100;
+static int gVideoScreenHeight = 100;
+static float gOutputTextureBaseColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+static constexpr const char* kVideoScreenGroupName = "Video Screen pixels";
+static constexpr size_t kVideoScreenVirtualOutputCount = 100;
+static std::string gVideoScreenMappingMessage = "Mapping has not been run.";
+static bool gVideoScreenMappingSucceeded = false;
+static GLuint gVideoScreenTexture=0;
+static int gVideoScreenTextureWidth=0, gVideoScreenTextureHeight=0;
+static std::vector<unsigned char> gVideoScreenPixels;
 static float gF1WindowWidth=850.0f, gF1WindowHeight=520.0f;
 static ImVec2 gF1WindowPos(10.0f,10.0f);
 static bool gSizeF4FromF1=false;      // F4
@@ -120,9 +136,33 @@ struct TrainSample
     std::vector<float> out;
     std::string desc = "Default";
     std::vector<std::vector<float>> sequence;
+    bool videoScreenLesson=false;
 };
 static std::vector<TrainSample> gDataset;
 static int gLessonsCount = 0;
+
+struct VideoScreenImage { std::string path, name; int width=0, height=0; std::vector<unsigned char> grayscale; };
+static std::vector<VideoScreenImage> gVideoScreenImages;
+static char gVideoScreenImagePath[1024]{};
+static std::string gVideoScreenImageError;
+static std::string gVideoScreenLessonMessage;
+
+static bool LoadVideoScreenImage(const std::string& path, VideoScreenImage& image, std::string& error)
+{
+    int width=0,height=0,channels=0;
+    unsigned char* pixels=stbi_load(path.c_str(),&width,&height,&channels,0);
+    if(!pixels) { error=stbi_failure_reason() ? stbi_failure_reason() : "Unsupported image file."; return false; }
+    if(width<=0 || height<=0 || channels<1) { stbi_image_free(pixels); error="Invalid image dimensions."; return false; }
+    image={}; image.path=path; image.name=std::filesystem::path(path).filename().string(); image.width=width; image.height=height;
+    image.grayscale.resize((size_t)width*height);
+    for(size_t pixel=0;pixel<image.grayscale.size();++pixel)
+    {
+        const unsigned char* source=pixels+pixel*channels;
+        image.grayscale[pixel]=(unsigned char)((299u*source[0]+587u*source[std::min(1,channels-1)]+114u*source[std::min(2,channels-1)]+500u)/1000u);
+    }
+    stbi_image_free(pixels);
+    return true;
+}
 
 static std::vector<std::vector<float>> gSequenceDraft;
 static unsigned int gDatasetRevision = 0;
@@ -140,6 +180,10 @@ struct PendingTopologyChange
 static std::optional<PendingTopologyChange> gPendingTopology;
 static bool gOpenTopologyPopup=false;
 static void TopologyCommitted();
+static void InvalidateGraphCache();
+static void EnsureVideoScreenOutputGroup(NeuralGraph& graph, bool createIfMissing=false);
+static bool AssignVideoScreenPixels(NeuralGraph& graph);
+static bool ClearVideoScreenPixelAssignments(NeuralGraph& graph);
 
 // New: Log window
 static std::vector<std::string> gLogLines;
@@ -274,7 +318,7 @@ static bool gSpeedSineEnabled = false;
 static bool gJitterSineEnabled = false;
 
 // Live feed wave effect variables
-static bool gLiveFeedWaveActive = true;
+static bool gLiveFeedWaveActive = false;
 static float gLiveFeedWavePhase = 0.0f;
 static float gLiveFeedWaveSpeed = 2.0f;
 static int gLiveFeedCurrentInput = 0;
@@ -465,6 +509,20 @@ static void appendMesh(Mesh& dst, const Mesh& src)
     uint32_t base = (uint32_t)dst.vertices.size();
     dst.vertices.insert(dst.vertices.end(), src.vertices.begin(), src.vertices.end());
     for(auto i: src.indices) dst.indices.push_back(base + i);
+}
+
+static Mesh MakeVerticalPanel()
+{
+    Mesh panel;
+    panel.vertices={
+        {{-0.5f,0.0f,0.0f},{0.0f,0.0f,1.0f},{0.0f,1.0f}},
+        {{ 0.5f,0.0f,0.0f},{0.0f,0.0f,1.0f},{1.0f,1.0f}},
+        {{ 0.5f,1.0f,0.0f},{0.0f,0.0f,1.0f},{1.0f,0.0f}},
+        {{-0.5f,1.0f,0.0f},{0.0f,0.0f,1.0f},{0.0f,0.0f}}
+    };
+    panel.indices={0,1,2,0,2,3};
+    panel.upload();
+    return panel;
 }
 
 Mesh Procedural::makeCylinder(float R, float H, int seg, bool capped)
@@ -1108,10 +1166,12 @@ uniform mat4 uMVP;
 uniform mat4 uM;
 out vec3 vN;
 out vec3 vW;
+out vec2 vUV;
 void main(){
     vec4 w = uM * vec4(inPos,1.0);
     vW = w.xyz;
     vN = mat3(uM) * inNrm;
+    vUV = inUV;
     gl_Position = uMVP * vec4(inPos,1.0);
 }
 )GLSL";
@@ -1120,19 +1180,25 @@ static const char* kMeshFS = R"GLSL(
 #version 330 core
 in vec3 vN;
 in vec3 vW;
+in vec2 vUV;
 out vec4 outCol;
 uniform vec3 uColor;
 uniform float uMetallic;
 uniform float uExposure;
+uniform float uOpacity;
+uniform sampler2D uTexture;
+uniform int uUseTexture;
 void main(){
     vec3 N = normalize(vN);
     vec3 L = normalize(vec3(0.4,0.8,0.6));
     vec3 V = normalize(vec3(0.0,0.0,1.0));
     float ndl = max(dot(N,L), 0.0);
     float spec = pow(max(dot(reflect(-L,N),V),0.0), mix(32.0, 96.0, uMetallic));
-    vec3 col = uColor * (0.2 + 0.8*ndl) + vec3(spec)*0.3;
+    vec3 sourceColor=uColor;
+    if(uUseTexture!=0) sourceColor*=texture(uTexture,vUV).rrr;
+    vec3 col = sourceColor * (0.2 + 0.8*ndl) + vec3(spec)*0.3;
     col = vec3(1.0) - exp(-col * uExposure);
-    outCol = vec4(col, 1.0);
+    outCol = vec4(col, uOpacity);
 }
 )GLSL";
 
@@ -1190,7 +1256,8 @@ void Renderer::drawGrid(const Mat4& vp) const
     glBindVertexArray(0);
 }
 
-void Renderer::drawMesh(const Mesh& m, const Mat4& mvp, const Mat4& model, const Vec3& color, float metallic) const 
+void Renderer::drawMesh(const Mesh& m, const Mat4& mvp, const Mat4& model, const Vec3& color, float metallic,
+                        float opacity) const
 {
     meshShader.use();
     glUniformMatrix4fv(meshShader.uniform("uMVP"), 1, false, mvp.m);
@@ -1198,6 +1265,8 @@ void Renderer::drawMesh(const Mesh& m, const Mat4& mvp, const Mat4& model, const
     glUniform3f(meshShader.uniform("uColor"), color.x, color.y, color.z);
     glUniform1f(meshShader.uniform("uMetallic"), metallic);
     glUniform1f(meshShader.uniform("uExposure"), 1.0f);
+    glUniform1f(meshShader.uniform("uOpacity"), std::clamp(opacity,0.0f,1.0f));
+    glUniform1i(meshShader.uniform("uUseTexture"),0);
     m.draw();
 }
 
@@ -1290,6 +1359,7 @@ static void NG_RebuildEdges(NeuralGraph& graph)
             graph.edges.push_back({graph.nodes[a].id,graph.nodes[b].id,RandomRange(-scale,scale)});
     }
     ResetGRUState(graph);
+    InvalidateGraphCache();
 }
 
 static int NG_NextId(const NeuralGraph& graph)
@@ -1419,6 +1489,9 @@ static void NG_CommitTopology(NeuralGraph& destination,PendingTopologyChange cha
 {
     const bool keepLessons=NG_KeepExistingLessons(destination,change);
     destination=std::move(change.graph);
+    InvalidateGraphCache();
+    EnsureVideoScreenOutputGroup(destination);
+    ClearVideoScreenPixelAssignments(destination);
     destination.status=NetworkStatus::NeedsRetraining;
     MarkNetworkDirty();
     destination.trainedMSE=std::numeric_limits<float>::quiet_NaN();
@@ -1445,6 +1518,7 @@ static bool NG_RequestTopology(NeuralGraph& destination,NeuralGraph candidate,
                                std::vector<TrainSample> replacementLessons={},std::function<void()> afterCommit={})
 {
     if(IsTrainingActive() || gPendingTopology) return false;
+    EnsureVideoScreenOutputGroup(candidate);
     std::string error;
     if(!NG_ValidateTopology(candidate,error)) { NG_ReportTopologyError(error); return false; }
     candidate.selected=-1; candidate.currentLayer=std::clamp(candidate.currentLayer,0,(int)candidate.layers.size()-1);
@@ -1488,6 +1562,22 @@ static void NG_EraseNode(NeuralGraph& graph,int index)
 {
     graph.nodes.erase(graph.nodes.begin()+index);
     for(auto& layer:graph.layers) for(int& nodeIndex:layer.nodeIdx) if(nodeIndex>index) --nodeIndex;
+}
+
+static bool NG_ResizeOutputLayerForVideoScreen(const NeuralGraph& source, NeuralGraph& candidate, size_t outputs)
+{
+    if(candidate.layers.empty() || candidate.layers.back().kind!=LayerKind::Output || outputs==0) return false;
+    auto& output=candidate.layers.back();
+    while(output.nodeIdx.size()>outputs)
+    {
+        const int index=output.nodeIdx.back();
+        output.nodeIdx.pop_back();
+        NG_EraseNode(candidate,index);
+    }
+    while(output.nodeIdx.size()<outputs) NG_AppendNeuron(candidate,(int)candidate.layers.size()-1);
+    NG_PreserveTopologyParameters(source,candidate);
+    EnsureVideoScreenOutputGroup(candidate,true);
+    return true;
 }
 
 static void NG_RemoveSelectedNeuron(NeuralGraph& graph, int neuronId)
@@ -1612,6 +1702,8 @@ static void NG_BuildTopology(NeuralGraph& g, int inN, const std::vector<int>& hi
         g.layers.push_back(std::move(L));
     }
     NG_RebuildEdges(g);
+    EnsureVideoScreenOutputGroup(g);
+    ClearVideoScreenPixelAssignments(g);
     g.layoutLayers(g.lastCanvasW>0?g.lastCanvasW:800.0f, g.lastCanvasH>0?g.lastCanvasH:500.0f);
 }
 
@@ -1999,10 +2091,31 @@ static void SyncNeuronProperties(NeuralGraph& g, int sourceId)
             else { n.speed=snapshot.speed; n.amp=snapshot.amp; n.bias=snapshot.bias; }
         }
     }
+    for(const auto& pair:g.oppositePhaseSyncPairs)
+    {
+        if(sourceId!=pair[0] && sourceId!=pair[1]) continue;
+        Neuron* leader=nullptr;
+        Neuron* follower=nullptr;
+        for(auto& neuron:g.nodes)
+        {
+            if(neuron.id==pair[0]) leader=&neuron;
+            else if(neuron.id==pair[1]) follower=&neuron;
+        }
+        if(!leader || !follower || !leader->isInput || !follower->isInput) continue;
+        follower->value=1.0f-std::clamp(leader->value,0.0f,1.0f);
+        follower->speed=leader->speed;
+        follower->amp=leader->amp;
+        follower->live=leader->live;
+        follower->phase=leader->phase+3.1415926535f;
+        follower->bias=leader->bias;
+    }
 }
 static void PruneNeuronCollections(NeuralGraph& g)
 {
-    auto exists=[&](int id){return std::any_of(g.nodes.begin(),g.nodes.end(),[&](const Neuron& n){return n.id==id;});};
+    std::unordered_set<int> existingIds;
+    existingIds.reserve(g.nodes.size());
+    for(const Neuron& node:g.nodes) existingIds.insert(node.id);
+    auto exists=[&](int id){return existingIds.count(id)!=0;};
     auto prune=[&](std::vector<int>& ids){ids.erase(std::remove_if(ids.begin(),ids.end(),[&](int id){return !exists(id);}),ids.end());};
     prune(g.multiSelected);
     prune(g.ungroupedInputIds);
@@ -2010,6 +2123,91 @@ static void PruneNeuronCollections(NeuralGraph& g)
     g.neuronGroups.erase(std::remove_if(g.neuronGroups.begin(),g.neuronGroups.end(),[](const NeuronGroup& group){return group.ids.size()<2;}),g.neuronGroups.end());
     for(auto& group:g.syncGroups) prune(group);
     g.syncGroups.erase(std::remove_if(g.syncGroups.begin(),g.syncGroups.end(),[](const std::vector<int>& group){return group.size()<2;}),g.syncGroups.end());
+    g.oppositePhaseSyncPairs.erase(std::remove_if(g.oppositePhaseSyncPairs.begin(),g.oppositePhaseSyncPairs.end(),
+        [&](const std::array<int,2>& pair){return !exists(pair[0]) || !exists(pair[1]) || pair[0]==pair[1];}),
+        g.oppositePhaseSyncPairs.end());
+}
+
+static std::vector<int> VideoScreenOutputIds(const NeuralGraph& graph)
+{
+    std::vector<int> ids;
+    for(const Layer& layer:graph.layers)
+        if(layer.kind==LayerKind::Output)
+            for(int index:layer.nodeIdx)
+                if(index>=0 && index<(int)graph.nodes.size()) ids.push_back(graph.nodes[index].id);
+    return ids;
+}
+
+static void EnsureVideoScreenOutputGroup(NeuralGraph& graph, bool createIfMissing)
+{
+    const std::vector<int> outputIds=VideoScreenOutputIds(graph);
+    if(outputIds.size()<2) return;
+    NeuronGroup* videoGroup=nullptr;
+    for(auto& group:graph.neuronGroups)
+        if(group.name==kVideoScreenGroupName) { videoGroup=&group; break; }
+    if(!videoGroup)
+    {
+        if(!createIfMissing) return;
+        graph.neuronGroups.push_back({kVideoScreenGroupName,outputIds,true});
+        videoGroup=&graph.neuronGroups.back();
+    }
+    else
+    {
+        videoGroup->ids=outputIds;
+    }
+    if(videoGroup->ids.size()>kVideoScreenVirtualOutputCount) videoGroup->collapsed=true;
+    for(auto& group:graph.neuronGroups)
+    {
+        if(&group==videoGroup) continue;
+        group.ids.erase(std::remove_if(group.ids.begin(),group.ids.end(),[&](int id)
+        {
+            return std::find(outputIds.begin(),outputIds.end(),id)!=outputIds.end();
+        }),group.ids.end());
+    }
+    PruneNeuronCollections(graph);
+}
+
+static bool AssignVideoScreenPixels(NeuralGraph& graph)
+{
+    const size_t required=(size_t)std::max(1,gVideoScreenWidth)*(size_t)std::max(1,gVideoScreenHeight);
+    const std::vector<int> outputIds=VideoScreenOutputIds(graph);
+    std::unordered_map<int,int> assignment;
+    for(size_t i=0;i<outputIds.size() && i<required;++i) assignment[outputIds[i]]=(int)i+1;
+    bool changed=false;
+    for(Neuron& neuron:graph.nodes)
+    {
+        const auto it=assignment.find(neuron.id);
+        const int pixel=it==assignment.end() ? -1 : it->second;
+        if(neuron.videoScreenPixel!=pixel) { neuron.videoScreenPixel=pixel; changed=true; }
+    }
+    return changed;
+}
+
+static bool ClearVideoScreenPixelAssignments(NeuralGraph& graph)
+{
+    bool changed=false;
+    for(Neuron& neuron:graph.nodes)
+        if(neuron.videoScreenPixel!=-1) { neuron.videoScreenPixel=-1; changed=true; }
+    gVideoScreenMappingSucceeded=false;
+    gVideoScreenMappingMessage="Mapping needs to be run for the current Video Screen and topology.";
+    return changed;
+}
+
+static bool HasVideoScreenData(const NeuralGraph& graph, const std::vector<TrainSample>& lessons)
+{
+    const bool hasPixelAssignments=std::any_of(graph.nodes.begin(),graph.nodes.end(),[](const Neuron& neuron)
+    {
+        return neuron.videoScreenPixel>=1;
+    });
+    const bool hasImageLessons=std::any_of(lessons.begin(),lessons.end(),[](const TrainSample& lesson)
+    {
+        return lesson.videoScreenLesson;
+    });
+    const bool hasVideoScreenGroup=std::any_of(graph.neuronGroups.begin(),graph.neuronGroups.end(),[](const NeuronGroup& group)
+    {
+        return group.name==kVideoScreenGroupName;
+    });
+    return hasPixelAssignments || hasImageLessons || hasVideoScreenGroup;
 }
 
 static void DecodeGraph(const Json& document, NeuralGraph& graph, std::vector<TrainSample>& lessons)
@@ -2040,6 +2238,7 @@ static void DecodeGraph(const Json& document, NeuralGraph& graph, std::vector<Tr
         n.speed=JsonField(entry,"speed",n.speed);
         n.bias=JsonField(entry,"bias",n.bias);
         n.amp=JsonField(entry,"amp",n.amp);
+        n.videoScreenPixel=JsonField(entry,"video_screen_pixel",n.videoScreenPixel);
         n.phase=JsonField(entry,"phase",n.phase);
         n.x=JsonField(entry,"x",n.x);
         n.y=JsonField(entry,"y",n.y);
@@ -2062,6 +2261,10 @@ static void DecodeGraph(const Json& document, NeuralGraph& graph, std::vector<Tr
     if(document.contains("sync_groups") && document["sync_groups"].is_array())
         for(const auto& entry:document["sync_groups"])
             if(entry.is_array()) graph.syncGroups.push_back(entry.get<std::vector<int>>());
+    if(document.contains("opposite_phase_sync_pairs") && document["opposite_phase_sync_pairs"].is_array())
+        for(const auto& entry:document["opposite_phase_sync_pairs"])
+            if(entry.is_array() && entry.size()==2 && entry[0].is_number_integer() && entry[1].is_number_integer())
+                graph.oppositePhaseSyncPairs.push_back({entry[0].get<int>(),entry[1].get<int>()});
     if(document.contains("expanded_input_groups") && document["expanded_input_groups"].is_array())
         for(const auto& name:document["expanded_input_groups"])
             if(name.is_string()) graph.expandedInputGroups.push_back(name.get<std::string>());
@@ -2151,6 +2354,7 @@ static void DecodeGraph(const Json& document, NeuralGraph& graph, std::vector<Tr
             sample.in=JsonFloats(entry.at("in"),label+" input");
             sample.out=JsonFloats(entry.at("out"),label+" output");
             sample.desc=JsonField(entry,"desc",sample.desc);
+            sample.videoScreenLesson=JsonField(entry,"video_screen_lesson",false);
             RequireJson(sample.in.size()==inputCount && sample.out.size()==outputCount,label+" dimensions do not match the model");
             int steps=JsonField(entry,"sequence_steps",0);
             RequireJson(steps>=0,label+" has a negative step count");
@@ -2350,6 +2554,8 @@ static bool NG_SaveJson(const NeuralGraph& graph, const std::string& path)
         if(std::isfinite(graph.trainedMSE)) document["trained_mse"]=graph.trainedMSE;
         SavedTrainingParams training; training.write(document);
         SavedDisplaySettings display; display.all_inputs_live=graph.liveInputs; display.write(document);
+        if(HasVideoScreenData(graph,gDataset))
+            document["video_screen"]={{"width",gVideoScreenWidth},{"height",gVideoScreenHeight}};
         document["nodes"]=Json::array(); document["layers"]=Json::array();
         document["edges"]=Json::array(); document["lessons"]=Json::array();
         document["neuron_groups"]=Json::array();
@@ -2357,10 +2563,13 @@ static bool NG_SaveJson(const NeuralGraph& graph, const std::string& path)
             document["neuron_groups"].push_back({{"name",group.name},{"ids",group.ids},{"collapsed",group.collapsed}});
         document["ungrouped_input_ids"]=graph.ungroupedInputIds;
         document["sync_groups"]=graph.syncGroups;
+        document["opposite_phase_sync_pairs"]=Json::array();
+        for(const auto& pair:graph.oppositePhaseSyncPairs)
+            document["opposite_phase_sync_pairs"].push_back({pair[0],pair[1]});
         document["expanded_input_groups"]=graph.expandedInputGroups;
         for(const auto& n:graph.nodes)
             document["nodes"].push_back({{"id",n.id},{"label",n.label},{"desc",n.desc},{"isInput",n.isInput},
-                {"value",n.value},{"speed",n.speed},{"bias",n.bias},{"amp",n.amp},{"live",n.live},
+                {"value",n.value},{"speed",n.speed},{"bias",n.bias},{"amp",n.amp},{"live",n.live},{"video_screen_pixel",n.videoScreenPixel},
                 {"phase",n.phase},{"x",n.x},{"y",n.y}});
         for(const auto& layer:graph.layers)
         {
@@ -2396,7 +2605,7 @@ static bool NG_SaveJson(const NeuralGraph& graph, const std::string& path)
                 RequireJson(frame.size()==sample.in.size(),"Sequence frames have inconsistent dimensions");
                 flat.insert(flat.end(),frame.begin(),frame.end());
             }
-            document["lessons"].push_back({{"in",sample.in},{"out",sample.out},{"desc",sample.desc},
+            document["lessons"].push_back({{"in",sample.in},{"out",sample.out},{"desc",sample.desc},{"video_screen_lesson",sample.videoScreenLesson},
                 {"sequence_steps",sample.sequence.size()},{"sequence_flat",flat}});
         }
         // Validate the same schema we accept on load before touching the existing file.
@@ -2447,6 +2656,40 @@ static bool NG_LoadJson(NeuralGraph& destination, const std::string& path, std::
         SavedTrainingParams training; training.read(document);
         SavedDisplaySettings display; display.all_inputs_live=destination.liveInputs; display.read(document);
         DecodeGraph(document,graph,lessons);
+        const bool hasVideoScreen=HasVideoScreenData(graph,lessons);
+        int videoScreenWidth=100;
+        int videoScreenHeight=100;
+        if(hasVideoScreen && document.contains("video_screen") && document["video_screen"].is_object())
+        {
+            videoScreenWidth=JsonField(document["video_screen"],"width",videoScreenWidth);
+            videoScreenHeight=JsonField(document["video_screen"],"height",videoScreenHeight);
+            RequireJson(videoScreenWidth>=1 && videoScreenWidth<=1000 && videoScreenHeight>=1 && videoScreenHeight<=1000,
+                        "Invalid Video Screen dimensions");
+        }
+        EnsureVideoScreenOutputGroup(graph);
+        if(hasVideoScreen)
+        {
+            gVideoScreenWidth=videoScreenWidth;
+            gVideoScreenHeight=videoScreenHeight;
+            const size_t requiredPixels=(size_t)gVideoScreenWidth*(size_t)gVideoScreenHeight;
+            if(VideoScreenOutputIds(graph).size()>=requiredPixels)
+            {
+                AssignVideoScreenPixels(graph);
+                gVideoScreenMappingSucceeded=true;
+                gVideoScreenMappingMessage="Video Screen mapping restored from the loaded network.";
+                gOutputTextureVisible=true;
+            }
+            else
+            {
+                ClearVideoScreenPixelAssignments(graph);
+                gOutputTextureVisible=false;
+            }
+        }
+        else
+        {
+            ClearVideoScreenPixelAssignments(graph);
+            gOutputTextureVisible=false;
+        }
         graph.liveInputs=display.all_inputs_live;
         graph.lastCanvasW=destination.lastCanvasW; graph.lastCanvasH=destination.lastCanvasH;
         graph.collapseHiddenLayers=destination.collapseHiddenLayers;
@@ -2464,6 +2707,7 @@ static bool NG_LoadJson(NeuralGraph& destination, const std::string& path, std::
             try { rebuilt.rebuild(); } catch(...) { rebuilt.destroy(); throw; }
         }
         destination=std::move(graph);
+        InvalidateGraphCache();
         gDataset=std::move(lessons); gLessonsCount=(int)gDataset.size();
         ++gDatasetRevision;
         seqPlaying=false; seqPlaybackFrame=-1; seqSelectedFrame=-1;
@@ -2505,6 +2749,7 @@ struct TrainState
     std::vector<float> mseHistory;
     double avgEpochMs=0.0;
     double startTime=0.0;
+    size_t sampleCursor=0;
 };
 static TrainState gTrain;
 static bool gPendingWeightRandomization=false;
@@ -2665,6 +2910,30 @@ static GraphCache BuildCache(const NeuralGraph& g)
     return c;
 }
 
+// The model topology is immutable during inference and training. Rebuilding
+// these lookup tables for every frame was prohibitive for Video Screen models.
+static GraphCache gCachedGraphCache;
+static const NeuralGraph* gCachedGraphOwner=nullptr;
+static uint64_t gGraphCacheRevision=1;
+static uint64_t gCachedGraphCacheRevision=0;
+
+static void InvalidateGraphCache()
+{
+    ++gGraphCacheRevision;
+    if(gGraphCacheRevision==0) gGraphCacheRevision=1;
+}
+
+static const GraphCache& CachedGraphCache(const NeuralGraph& graph)
+{
+    if(gCachedGraphOwner!=&graph || gCachedGraphCacheRevision!=gGraphCacheRevision)
+    {
+        gCachedGraphCache=BuildCache(graph);
+        gCachedGraphOwner=&graph;
+        gCachedGraphCacheRevision=gGraphCacheRevision;
+    }
+    return gCachedGraphCache;
+}
+
 static float Sigmoid(float value)
 {
     return 1.0f / (1.0f + std::exp(-std::clamp(value, -30.0f, 30.0f)));
@@ -2761,14 +3030,12 @@ static bool ForwardPass(NeuralGraph& g, bool advanceMemory = true, std::string* 
         }
         return false;
     };
-    std::string error;
-    if(!NG_ValidateTopology(g,error)) return fail(error);
     for(const auto& node : g.nodes)
         if(node.isInput && !std::isfinite(node.value)) return fail("Non-finite input in neuron "+std::to_string(node.id));
     for(const auto& layer : g.layers) if(layer.kind==LayerKind::GRU)
         for(float value : layer.gruState)
             if(!std::isfinite(value)) return fail("Non-finite GRU memory.");
-    GraphCache cache = BuildCache(g);
+    const GraphCache& cache = CachedGraphCache(g);
     for(size_t layerIndex = 0; layerIndex < g.layers.size(); ++layerIndex)
     {
         auto& L = g.layers[layerIndex];
@@ -2898,20 +3165,23 @@ static void UpdateInference(NeuralGraph& graph, double dt)
     if(gPauseLiveInference || !hasLiveInput)
     {
         gInferenceAccumulator = 0.0;
-        ForwardPass(graph, false);
+        // Static manual inputs are evaluated by Next sample, Reset memory, or
+        // the input editor. Do not recompute a 10,000-pixel frame every draw.
         return;
     }
     // Catch up short frame delays, but do not replay a long UI stall as new observations.
     gInferenceAccumulator += std::clamp(dt, 0.0, 0.25);
-    while(gInferenceAccumulator >= kInferenceStepSeconds)
+    const size_t outputCount=graph.layers.empty() ? 0 : graph.layers.back().nodeIdx.size();
+    const double interval=outputCount>kVideoScreenVirtualOutputCount ? 1.0/15.0 : kInferenceStepSeconds;
+    if(gInferenceAccumulator >= interval)
     {
-        gInferenceAccumulator -= kInferenceStepSeconds;
-        graph.tickLiveInputs((float)kInferenceStepSeconds);
+        gInferenceAccumulator-=interval;
+        graph.tickLiveInputs((float)interval);
         if(!ForwardPass(graph))
         {
             gPauseLiveInference = true;
             gInferenceAccumulator = 0.0;
-            break;
+            return;
         }
     }
 }
@@ -2961,10 +3231,10 @@ static bool TrainingForward(NeuralGraph& graph, const std::vector<float>& frame,
 }
 
 // Evaluate a fixed model; a copy keeps evaluation memory and inputs out of the editor.
-static float EvaluateTrainingMSE(const NeuralGraph& graph, std::string& error)
+static float EvaluateTrainingMSE(const NeuralGraph& graph, std::string& error, bool validate=true)
 {
     const float invalid = std::numeric_limits<float>::quiet_NaN();
-    if(!ValidateTrainingData(graph, error)) return invalid;
+    if(validate && !ValidateTrainingData(graph, error)) return invalid;
     NeuralGraph evaluation = graph;
     std::vector<int> outputs;
     for(const auto& layer : evaluation.layers) if(layer.kind == LayerKind::Output)
@@ -3026,6 +3296,7 @@ static void FinishAutoPrune(NeuralGraph& graph,const std::string& reason)
     {
         // Only publish complete, evaluated rounds that satisfy the original limit.
         graph=std::move(p.accepted);
+        InvalidateGraphCache();
         MarkNetworkDirty();
         graph.status=NetworkStatus::NeedsRetraining;
         graph.topologyWarningAcknowledged=true;
@@ -3243,7 +3514,7 @@ static bool StartTraining(NeuralGraph& graph, bool toTarget)
         return false;
     }
     if(toTarget) gTrain.totalEpochs = std::max(gTrain.totalEpochs, 200000);
-    gTrain.active = true; gTrain.done = false; gTrain.epoch = 0;
+    gTrain.active = true; gTrain.done = false; gTrain.epoch = 0; gTrain.sampleCursor=0;
     MarkNetworkDirty();
     if(graph.status==NetworkStatus::Trained) graph.status=NetworkStatus::NeedsRetraining;
     gAnimationNeedsResume=true;
@@ -3274,18 +3545,20 @@ struct GRUGradient {
     std::vector<float> wz, wr, wh, uz, ur, uh, bz, br, bh;
 };
 
-static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
+static float TrainSamples(NeuralGraph& g, float lr, float l1, float l2,
+                          size_t firstSample, size_t sampleCount, bool evaluateAfter)
 {
-    if(!ValidateTrainingData(g, gTrainingError)) return std::numeric_limits<float>::quiet_NaN();
-    const GraphCache cache = BuildCache(g);
+    const GraphCache& cache = CachedGraphCache(g);
     std::vector<int> nodeLayer(g.nodes.size(), -1);
     for(size_t li=0;li<g.layers.size();++li)
         for(int idx:g.layers[li].nodeIdx) nodeLayer[idx]=(int)li;
     std::vector<int> outputs;
     for(const auto& layer:g.layers) if(layer.kind==LayerKind::Output)
         outputs.insert(outputs.end(),layer.nodeIdx.begin(),layer.nodeIdx.end());
-    for(const auto& sample:gDataset)
+    const size_t lastSample=std::min(gDataset.size(),firstSample+sampleCount);
+    for(size_t sampleIndex=firstSample;sampleIndex<lastSample;++sampleIndex)
     {
+        const auto& sample=gDataset[sampleIndex];
         ResetGRUState(g);
         const std::vector<std::vector<float>> fallback={sample.in};
         const auto& sequence=sample.sequence.empty()?fallback:sample.sequence;
@@ -3452,7 +3725,7 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
             apply(L.gruBz,q.bz);apply(L.gruBr,q.br);apply(L.gruBh,q.bh);
         }
     }
-    return EvaluateTrainingMSE(g, gTrainingError);
+    return evaluateAfter ? EvaluateTrainingMSE(g, gTrainingError, false) : 0.0f;
 }
 
 #endif
@@ -3466,16 +3739,48 @@ static float TrainOneEpoch(NeuralGraph& g, float lr, float l1, float l2)
 // Forward declaration of global engine pointer for theme access
 extern Engine* gEngine;
 
+static bool IsVideoScreenGroup(const NeuronGroup& group)
+{
+    return group.name==kVideoScreenGroupName;
+}
+
+static const NeuronGroup* VirtualVideoScreenGroup(const NeuralGraph& graph)
+{
+    for(const auto& group:graph.neuronGroups)
+        if(IsVideoScreenGroup(group) && group.ids.size()>kVideoScreenVirtualOutputCount)
+            return &group;
+    return nullptr;
+}
+
+static bool RequestVideoScreenGroupExpansion(NeuronGroup& group)
+{
+    if(IsVideoScreenGroup(group) && group.ids.size()>kVideoScreenVirtualOutputCount)
+    {
+        // A Video Screen is a virtual output layer: its individual neurons
+        // remain part of the model but are never materialized on the canvas.
+        group.collapsed=true;
+        return false;
+    }
+    group.collapsed=false;
+    MarkNetworkDirty();
+    return true;
+}
+
 // Use exactly the same visibility rules as the canvas renderer. Hidden input
 // groups keep stale coordinates, so searching all nodes selects wrong neurons.
 static bool IsVisibleInput(const NeuralGraph& graph, int nodeIndex);
 Neuron* NeuralGraph::findAt(float mx, float my)
 {
+    const NeuronGroup* virtualScreen=VirtualVideoScreenGroup(*this);
+    const int virtualHubId=(virtualScreen && !virtualScreen->ids.empty()) ? virtualScreen->ids.front() : -1;
+    std::unordered_set<int> virtualOutputIds;
+    if(virtualScreen) virtualOutputIds.insert(virtualScreen->ids.begin(),virtualScreen->ids.end());
     Neuron* closest = nullptr;
     float bestDistanceSquared = std::numeric_limits<float>::max();
     for(size_t i=0; i<nodes.size(); ++i)
     {
         Neuron& n = nodes[i];
+        if(!virtualOutputIds.empty() && virtualOutputIds.count(n.id) && n.id!=virtualHubId) continue;
         if(!IsVisibleInput(*this, static_cast<int>(i)) || (!n.isInput && GroupMemberHidden(*this,n.id))) continue;
         if(collapseHiddenLayers)
         {
@@ -3516,6 +3821,7 @@ static std::vector<std::pair<std::string, std::vector<int>>> InputGroups(const N
     // members, so both kinds use exactly the same layout and hit testing.
     for(const auto& custom : graph.neuronGroups)
     {
+        if(IsVideoScreenGroup(custom)) continue;
         std::vector<int> members;
         for(const Layer& layer : graph.layers)
             if(layer.kind == LayerKind::Input)
@@ -3629,6 +3935,8 @@ void NeuralGraph::buildDemo()
 
 void NeuralGraph::layoutLayers(float W, float H)
 {
+    const NeuronGroup* virtualScreen=VirtualVideoScreenGroup(*this);
+    const int virtualHubId=(virtualScreen && !virtualScreen->ids.empty()) ? virtualScreen->ids.front() : -1;
     const float marginX = 40.f, marginY = 40.f;
     const float colGap  = (W - 2*marginX);
     const size_t expandedColumns = std::max<size_t>(1, layers.size());
@@ -3644,7 +3952,8 @@ void NeuralGraph::layoutLayers(float W, float H)
     float minSpacingY = 1e9f;
     for(const auto& Lchk : layers)
     {
-        int N = Lchk.kind == LayerKind::Input ? InputDisplaySlotCount(*this) : (int)Lchk.nodeIdx.size();
+        int N = Lchk.kind == LayerKind::Input ? InputDisplaySlotCount(*this)
+            : ((Lchk.kind==LayerKind::Output && virtualScreen) ? 1 : (int)Lchk.nodeIdx.size());
         if(N>1)
         {
             float span = (y1g - y0g);
@@ -3685,7 +3994,8 @@ void NeuralGraph::layoutLayers(float W, float H)
 
         std::vector<int> visible;
         for(int idx : L.nodeIdx)
-            if(L.kind != LayerKind::Input || IsVisibleInput(*this, idx)) visible.push_back(idx);
+            if((L.kind != LayerKind::Input || IsVisibleInput(*this, idx)) &&
+               !(L.kind==LayerKind::Output && virtualScreen && nodes[idx].id!=virtualHubId)) visible.push_back(idx);
         int N = L.kind == LayerKind::Input ? InputDisplaySlotCount(*this) : (int)visible.size();
         float y0 = y0g;
         float y1 = y1g;
@@ -3791,10 +4101,20 @@ void NeuralGraph::tickLiveInputs(float dt)
     // A synchronized live input follows the first member of its synchronization group.
     for(const auto& group:syncGroups)
         if(!group.empty()) SyncNeuronProperties(*this,group.front());
+    for(const auto& pair:oppositePhaseSyncPairs)
+        SyncNeuronProperties(*this,pair[0]);
 }
 
 void NeuralGraph::stepLayout(float dt, float W, float H)
 {
+    const NeuronGroup* virtualScreen=VirtualVideoScreenGroup(*this);
+    std::unordered_set<int> virtualOutputIds;
+    int virtualHubId=-1;
+    if(virtualScreen)
+    {
+        virtualOutputIds.insert(virtualScreen->ids.begin(),virtualScreen->ids.end());
+        virtualHubId=virtualScreen->ids.front();
+    }
     const float headerH=3.0f*ImGui::GetTextLineHeightWithSpacing()+6.0f;
     const float y0=40.0f+headerH;
     const float y1=H-40.0f;
@@ -3802,6 +4122,11 @@ void NeuralGraph::stepLayout(float dt, float W, float H)
     for(size_t idxA=0; idxA<nodes.size(); ++idxA)
     {
         auto& a = nodes[idxA];
+        if(!virtualOutputIds.empty() && virtualOutputIds.count(a.id) && a.id!=virtualHubId)
+        {
+            a.vx=0.0f; a.vy=0.0f;
+            continue;
+        }
         // Input rows are deliberately static.  With many inputs the force layout
         // used to push them apart immediately after loading, which also made
         // their labels overlap.  Their evenly-spaced positions are assigned by
@@ -3821,8 +4146,9 @@ void NeuralGraph::stepLayout(float dt, float W, float H)
             if(pos!=L.nodeIdx.end())
             {
                 targetX = (L.x0 + L.x1)*0.5f;
-                const int count=(int)L.nodeIdx.size();
-                const int order=(int)std::distance(L.nodeIdx.begin(),pos);
+                const bool virtualOutput=L.kind==LayerKind::Output && virtualScreen && a.id==virtualHubId;
+                const int count=virtualOutput ? 1 : (int)L.nodeIdx.size();
+                const int order=virtualOutput ? 0 : (int)std::distance(L.nodeIdx.begin(),pos);
                 targetY=CompactNeuronSlotY(order,count,y0,y1,a.radius,L.kind);
                 break;
             }
@@ -3855,7 +4181,6 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         gF1WindowWidth=ImGui::GetWindowSize().x;
         gF1WindowHeight=ImGui::GetWindowSize().y;
         gF1WindowPos=ImGui::GetWindowPos();
-        PruneNeuronCollections(*this);
         // Block shortcuts while editing labels; reset per frame and set when inputs are focused
         gEditingLabel = false;
         // Split: top=canvas, optional bottom=live feed.  Keep the preference
@@ -3868,6 +4193,10 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         if(avail.y < 140) avail.y = 140;
 
         const auto inputGroups = InputGroups(*this);
+        const NeuronGroup* virtualScreen=VirtualVideoScreenGroup(*this);
+        const int virtualHubId=(virtualScreen && !virtualScreen->ids.empty()) ? virtualScreen->ids.front() : -1;
+        std::unordered_set<int> virtualOutputIds;
+        if(virtualScreen) virtualOutputIds.insert(virtualScreen->ids.begin(),virtualScreen->ids.end());
         // Keep each group's visibility independent; do not auto-expand another group.
 
         ImGui::BeginDisabled(gTrain.active || gPendingTopology.has_value());
@@ -3891,11 +4220,18 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::Checkbox("Live Feed", &showLiveFeed);
-        ImGui::SameLine();
-        if(ImGui::Button(collapseHiddenLayers ? "Show hidden layers" : "Hide hidden layers"))
+        const bool hasHiddenLayers = std::any_of(layers.begin(), layers.end(), [](const Layer& layer)
         {
-            collapseHiddenLayers = !collapseHiddenLayers;
-            layoutLayers(lastCanvasW > 0 ? lastCanvasW : 800.0f, lastCanvasH > 0 ? lastCanvasH : 500.0f);
+            return layer.kind == LayerKind::Hidden || layer.kind == LayerKind::GRU;
+        });
+        if(hasHiddenLayers)
+        {
+            ImGui::SameLine();
+            if(ImGui::Button(collapseHiddenLayers ? "Show hidden layers" : "Hide hidden layers"))
+            {
+                collapseHiddenLayers = !collapseHiddenLayers;
+                layoutLayers(lastCanvasW > 0 ? lastCanvasW : 800.0f, lastCanvasH > 0 ? lastCanvasH : 500.0f);
+            }
         }
         ImGui::SameLine();
         ImGui::TextDisabled("(?)");
@@ -4139,6 +4475,10 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         const UITheme& _theme = (gEngine ? gEngine->renderer.theme : UITheme::Cyberpunk());
         for(auto& e: edges)
         {
+            // The Video Screen can contain thousands of virtual output
+            // neurons. Hide only its dense incoming edges; connections
+            // between the visible Input and Hidden layers must remain drawn.
+            if(virtualScreen && (virtualOutputIds.count(e.a) || virtualOutputIds.count(e.b))) continue;
             Neuron* A = findById(e.a);
             Neuron* B = findById(e.b);
             if(!A||!B) continue;
@@ -4258,6 +4598,35 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             }
         }
 
+        // A large Video Screen output layer is deliberately virtual on the
+        // canvas.  Its dense weights still exist for inference and training,
+        // but the editor draws one aggregate flow instead of every edge.
+        if(virtualScreen && virtualHubId>=0)
+        {
+            Neuron* hub=findById(virtualHubId);
+            const Layer* sourceLayer=nullptr;
+            for(auto it=layers.rbegin();it!=layers.rend();++it)
+                if(it->kind!=LayerKind::Output && !it->nodeIdx.empty()) { sourceLayer=&*it; break; }
+            if(hub && sourceLayer)
+            {
+                ImVec2 source(0,0); int visibleCount=0;
+                for(int idx:sourceLayer->nodeIdx)
+                {
+                    if(idx<0 || idx>=(int)nodes.size()) continue;
+                    source.x+=nodes[idx].x; source.y+=nodes[idx].y; ++visibleCount;
+                }
+                if(visibleCount>0)
+                {
+                    source.x=origin.x+source.x/(float)visibleCount;
+                    source.y=origin.y+source.y/(float)visibleCount;
+                    ImVec2 target(origin.x+hub->x,origin.y+hub->y);
+                    dl->AddBezierCubic(source,ImVec2(source.x+55.0f,source.y),
+                        ImVec2(target.x-55.0f,target.y),target,
+                        ImGui::GetColorU32(ImVec4(.25f,.95f,.82f,.70f)),2.0f);
+                }
+            }
+        }
+
         // A loop around every GRU column visualizes recurrent flow h(t-1) -> h(t).
         if(!collapseHiddenLayers)
         {
@@ -4288,6 +4657,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 
             for(const Layer& layer: layers) if(layer.kind==LayerKind::Output) for(int idx:layer.nodeIdx)
             {
+                if(!virtualOutputIds.empty() && virtualOutputIds.count(nodes[idx].id) && nodes[idx].id!=virtualHubId) continue;
                 ImVec2 p(origin.x+nodes[idx].x, origin.y+nodes[idx].y);
                 dl->AddBezierCubic(hiddenHub, ImVec2(hiddenHub.x+65,hiddenHub.y), ImVec2(p.x-50,p.y), p, flowGlow, 5.0f);
                 dl->AddBezierCubic(hiddenHub, ImVec2(hiddenHub.x+65,hiddenHub.y), ImVec2(p.x-50,p.y), p, flow, 1.2f);
@@ -4328,6 +4698,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         for(auto& n: nodes)
         {
             const int visibleIdx = int(&n - nodes.data());
+            if(!virtualOutputIds.empty() && virtualOutputIds.count(n.id) && n.id!=virtualHubId) continue;
             if(!IsVisibleInput(*this, visibleIdx) || (!n.isInput && GroupMemberHidden(*this,n.id))) continue;
             if(collapseHiddenLayers)
             {
@@ -4552,7 +4923,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 {
                     for(auto& group:neuronGroups)
                         if(group.collapsed && !group.ids.empty() && group.ids.front()==hit->id)
-                        { group.collapsed=false; break; }
+                        { RequestVideoScreenGroupExpansion(group); break; }
                 }
                 else if(ImGui::GetIO().KeyCtrl)
                 {
@@ -4678,23 +5049,37 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         ImGui::Separator();
         ImGui::TextUnformatted("Neuron groups");
         const auto visibleGroups = InputGroups(*this);
-        struct GroupTableRow { std::string name; std::vector<int> ids; int customIndex; bool isInput; };
+        struct GroupTableRow { std::string name; std::vector<int> ids; const std::vector<int>* sourceIds=nullptr; int customIndex=-1; bool isInput=false; };
         std::vector<GroupTableRow> rows;
         for(const auto& entry : visibleGroups)
         {
-            GroupTableRow row{entry.first, {}, -1, true};
+            GroupTableRow row{entry.first, {}, nullptr, -1, true};
             for(int idx : entry.second) if(idx >= 0 && idx < (int)nodes.size()) row.ids.push_back(nodes[idx].id);
             for(int i=0;i<(int)neuronGroups.size();++i)
                 if(neuronGroups[i].name == row.name) { row.customIndex=i; break; }
             rows.push_back(std::move(row));
         }
+        std::unordered_map<int,bool> inputById;
+        inputById.reserve(nodes.size());
+        for(const Neuron& node:nodes) inputById.emplace(node.id,node.isInput);
         for(int i=0;i<(int)neuronGroups.size();++i)
         {
             const NeuronGroup& group=neuronGroups[i];
             bool hasNonInput=false;
-            for(int id : group.ids)
-                for(const auto& n : nodes) if(n.id==id && !n.isInput) hasNonInput=true;
-            if(hasNonInput && std::none_of(rows.begin(),rows.end(),[&](const GroupTableRow& row){return row.customIndex==i;})) rows.push_back({group.name, group.ids, i, false});
+            // A Video Screen can contain tens of thousands of output IDs.
+            // The group itself is sufficient evidence that it is non-input;
+            // never scan the whole node array once per pixel.
+            if(IsVideoScreenGroup(group)) hasNonInput=true;
+            else
+            {
+                for(int id : group.ids)
+                {
+                    auto node=inputById.find(id);
+                    if(node!=inputById.end() && !node->second) { hasNonInput=true; break; }
+                }
+            }
+            if(hasNonInput && std::none_of(rows.begin(),rows.end(),[&](const GroupTableRow& row){return row.customIndex==i;}))
+                rows.push_back({group.name, {}, &group.ids, i, false});
         }
         static std::string renameGroupKey;
         static char renameGroupBuf[128] = {};
@@ -4711,13 +5096,17 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             for(int i=0;i<(int)rows.size();++i)
             {
                 const GroupTableRow& row=rows[i];
+                const std::vector<int>& rowIds=row.sourceIds ? *row.sourceIds : row.ids;
+                const bool virtualVideoGroup=row.customIndex>=0 &&
+                    VirtualVideoScreenGroup(*this)==&neuronGroups[row.customIndex];
                 const bool expanded=row.isInput ? InputGroupExpanded(*this,row.name)
                     : (row.customIndex>=0 && !neuronGroups[row.customIndex].collapsed);
                 ImGui::PushID(i);
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(row.name.c_str());
-                ImGui::TableSetColumnIndex(1); ImGui::Text("%zu",row.ids.size());
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%zu",rowIds.size());
                 ImGui::TableSetColumnIndex(2);
+                if(virtualVideoGroup) ImGui::BeginDisabled();
                 if(ImGui::SmallButton(expanded ? "Collapse" : "Expand"))
                 {
                     if(row.isInput)
@@ -4726,25 +5115,30 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                         layoutLayers(canvasSize.x, canvasSize.y);
                     }
                     else if(row.customIndex>=0)
-                        neuronGroups[row.customIndex].collapsed = expanded;
-                    MarkNetworkDirty();
+                    {
+                        NeuronGroup& group=neuronGroups[row.customIndex];
+                        if(expanded) { group.collapsed=true; MarkNetworkDirty(); }
+                        else RequestVideoScreenGroupExpansion(group);
+                    }
+                    if(!row.isInput || expanded) MarkNetworkDirty();
                     multiSelected.clear(); selected=-1;
                 }
+                if(virtualVideoGroup) { ImGui::EndDisabled(); ImGui::SameLine(); ImGui::TextDisabled("Virtual"); }
                 ImGui::TableSetColumnIndex(3);
-                if(ImGui::SmallButton("Edit"))
+                if(!virtualVideoGroup && ImGui::SmallButton("Edit"))
                 {
                     renameGroupKey=row.name;
                     renameGroupCustomIndex=row.customIndex;
-                    renameGroupIds=row.ids;
+                    renameGroupIds=rowIds;
                     std::snprintf(renameGroupBuf,sizeof(renameGroupBuf),"%s",row.name.c_str());
                     ImGui::OpenPopup("Rename group");
                 }
-                ImGui::SameLine();
-                if(ImGui::SmallButton("Delete"))
+                if(!virtualVideoGroup) ImGui::SameLine();
+                if(!virtualVideoGroup && ImGui::SmallButton("Delete"))
                 {
                     // Deleting a group removes only its presentation membership,
                     // never the neurons or their connections.
-                    for(int id : row.ids)
+                    for(int id : rowIds)
                         if(std::find(ungroupedInputIds.begin(),ungroupedInputIds.end(),id)==ungroupedInputIds.end())
                             ungroupedInputIds.push_back(id);
                     if(row.customIndex>=0 && row.customIndex<(int)neuronGroups.size())
@@ -4815,28 +5209,74 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 ImGui::OpenPopup("Name neuron group");
             }
             ImGui::SameLine();
+            bool exactlyTwoInputs=multiSelected.size()==2;
+            Neuron* firstInput=nullptr;
+            Neuron* secondInput=nullptr;
+            if(exactlyTwoInputs)
+            {
+                for(int id:multiSelected)
+                    for(auto& neuron:nodes) if(neuron.id==id)
+                    {
+                        if(!neuron.isInput) exactlyTwoInputs=false;
+                        else if(!firstInput) firstInput=&neuron;
+                        else secondInput=&neuron;
+                        break;
+                    }
+                if(!firstInput || !secondInput) exactlyTwoInputs=false;
+            }
+            static bool oppositePhase=false;
+            if(exactlyTwoInputs)
+            {
+                ImGui::Checkbox("Opposite phase",&oppositePhase);
+                ImGui::SameLine();
+            }
             if(ImGui::Button("Synchronize"))
             {
-                // Merge overlapping synchronization sets into a single component.
-                std::vector<int> merged=multiSelected;
-                bool changed=true;
-                while(changed)
+                if(exactlyTwoInputs && oppositePhase)
                 {
-                    changed=false;
-                    for(auto it=syncGroups.begin();it!=syncGroups.end();)
+                    Neuron* leader=firstInput;
+                    Neuron* follower=secondInput;
+                    if(secondInput->y<firstInput->y ||
+                       (secondInput->y==firstInput->y && secondInput->id<firstInput->id))
+                        std::swap(leader,follower);
+                    const int leaderId=leader->id, followerId=follower->id;
+                    for(auto& group:syncGroups)
                     {
-                        bool overlap=false;
-                        for(int id:*it) if(std::find(merged.begin(),merged.end(),id)!=merged.end()) {overlap=true;break;}
-                        if(overlap)
-                        {
-                            for(int id:*it) if(std::find(merged.begin(),merged.end(),id)==merged.end()) merged.push_back(id);
-                            it=syncGroups.erase(it); changed=true;
-                        }
-                        else ++it;
+                        group.erase(std::remove_if(group.begin(),group.end(),[&](int id)
+                            {return id==leaderId || id==followerId;}),group.end());
                     }
+                    syncGroups.erase(std::remove_if(syncGroups.begin(),syncGroups.end(),
+                        [](const std::vector<int>& group){return group.size()<2;}),syncGroups.end());
+                    oppositePhaseSyncPairs.erase(std::remove_if(oppositePhaseSyncPairs.begin(),oppositePhaseSyncPairs.end(),
+                        [&](const std::array<int,2>& pair)
+                        {return pair[0]==leaderId || pair[0]==followerId || pair[1]==leaderId || pair[1]==followerId;}),
+                        oppositePhaseSyncPairs.end());
+                    oppositePhaseSyncPairs.push_back({leaderId,followerId});
+                    SyncNeuronProperties(*this,leaderId);
                 }
-                syncGroups.push_back(merged);
-                SyncNeuronProperties(*this,selected);
+                else
+                {
+                    // Merge overlapping synchronization sets into a single component.
+                    std::vector<int> merged=multiSelected;
+                    bool changed=true;
+                    while(changed)
+                    {
+                        changed=false;
+                        for(auto it=syncGroups.begin();it!=syncGroups.end();)
+                        {
+                            bool overlap=false;
+                            for(int id:*it) if(std::find(merged.begin(),merged.end(),id)!=merged.end()) {overlap=true;break;}
+                            if(overlap)
+                            {
+                                for(int id:*it) if(std::find(merged.begin(),merged.end(),id)==merged.end()) merged.push_back(id);
+                                it=syncGroups.erase(it); changed=true;
+                            }
+                            else ++it;
+                        }
+                    }
+                    syncGroups.push_back(merged);
+                    SyncNeuronProperties(*this,selected);
+                }
                 MarkNetworkDirty();
             }
             ImGui::TextDisabled("Ctrl+click to add or remove neurons.");
@@ -4869,9 +5309,10 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                             if(idx>=0 && idx<(int)nodes.size() &&
                                std::find(multiSelected.begin(),multiSelected.end(),nodes[idx].id)!=multiSelected.end())
                                 orderedIds.push_back(nodes[idx].id);
-                    // Newly created groups start collapsed, regardless of neuron type.
+                    // User-created groups are initially expanded. The only
+                    // forced collapsed presentation is the virtual Video Screen.
                     for(int id:orderedIds) ungroupedInputIds.erase(std::remove(ungroupedInputIds.begin(),ungroupedInputIds.end(),id),ungroupedInputIds.end());
-                    neuronGroups.push_back({groupName,orderedIds,true});
+                    neuronGroups.push_back({groupName,orderedIds,false});
                     if(inputOnly)
                     {
                         layoutLayers(lastCanvasW > 0.0f ? lastCanvasW : 800.0f,
@@ -5115,6 +5556,8 @@ bool Engine::init(const AppConfig& cfgIn)
     turbine.params.rpm = 444.0f;
     turbine.params.current_rpm = 0.0f;
     turbine.rebuild();
+    backWall=MakeVerticalPanel();
+    outputTexturePlane=MakeVerticalPanel();
 
     srand((unsigned int)time(NULL));
     gWindStrengthPhase = (rand() / (float)RAND_MAX) * 2.f * 3.14159f;
@@ -5216,6 +5659,29 @@ Mat4 Engine::proj() const
 Mat4 Engine::view() const { return cam.view(); }
 
 #ifdef USE_IMGUI
+static void UpdateVideoScreenTexture(const NeuralGraph& graph)
+{
+    if(!gVideoScreenMappingSucceeded || gVideoScreenWidth<1 || gVideoScreenHeight<1) return;
+    const size_t count=(size_t)gVideoScreenWidth*gVideoScreenHeight;
+    gVideoScreenPixels.assign(count,0);
+    for(const Neuron& neuron:graph.nodes)
+        if(neuron.videoScreenPixel>=1 && (size_t)neuron.videoScreenPixel<=count)
+            gVideoScreenPixels[(size_t)neuron.videoScreenPixel-1]=(unsigned char)std::lround(std::clamp(neuron.value,0.0f,1.0f)*255.0f);
+    if(!gVideoScreenTexture) glGenTextures(1,&gVideoScreenTexture);
+    glBindTexture(GL_TEXTURE_2D,gVideoScreenTexture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+    if(gVideoScreenTextureWidth!=gVideoScreenWidth || gVideoScreenTextureHeight!=gVideoScreenHeight)
+    {
+        glTexImage2D(GL_TEXTURE_2D,0,GL_R8,gVideoScreenWidth,gVideoScreenHeight,0,GL_RED,GL_UNSIGNED_BYTE,gVideoScreenPixels.data());
+        gVideoScreenTextureWidth=gVideoScreenWidth; gVideoScreenTextureHeight=gVideoScreenHeight;
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+    }
+    else glTexSubImage2D(GL_TEXTURE_2D,0,0,0,gVideoScreenWidth,gVideoScreenHeight,GL_RED,GL_UNSIGNED_BYTE,gVideoScreenPixels.data());
+}
+#endif
+
+#ifdef USE_IMGUI
 // Keep track of HUD rectangle for overlay hole
 static ImVec2 gHUDMin(0,0), gHUDMax(0,0);
 static bool gHUDHasRect = false;
@@ -5240,11 +5706,19 @@ static void DrawTrainingHUD()
     ImGui::Separator();
     float last = gTrain.mseHistory.empty()? 0.0f : gTrain.mseHistory.back();
     ImGui::Text("Epoch: %d / %d", gTrain.epoch, gTrain.totalEpochs);
+    ImGui::Text("Lesson: %zu / %zu", std::min(gTrain.sampleCursor+1,gDataset.size()), gDataset.size());
     ImGui::Text("MSE:   %.6f  (target: %s)", last, gTrain.targetMSE>0?std::to_string(gTrain.targetMSE).c_str():"-");
     ImGui::TextColored(ImVec4(1.0f,0.84f,0.16f,1.0f),"Accuracy: %.2f%%", AccuracyFromMSE(last));
     ImGui::Text("Avg epoch time: %.2f ms", gTrain.avgEpochMs);
-    double elapsed = (gTrain.startTime>0.0) ? (nowSeconds()-gTrain.startTime) : 0.0;
-    ImGui::Text("Elapsed: %.1f s", elapsed);
+    const unsigned long long elapsedSeconds=(unsigned long long)std::max(0.0,
+        gTrain.startTime>0.0 ? nowSeconds()-gTrain.startTime : 0.0);
+    const unsigned long long elapsedHours=elapsedSeconds/3600;
+    const unsigned long long elapsedMinutes=(elapsedSeconds/60)%60;
+    const unsigned long long elapsedRemainingSeconds=elapsedSeconds%60;
+    char elapsedText[32];
+    std::snprintf(elapsedText,sizeof(elapsedText),"%02llu:%02llu:%02llu",
+                  elapsedHours,elapsedMinutes,elapsedRemainingSeconds);
+    ImGui::Text("Elapsed: %s", elapsedText);
     ImGui::Spacing();
     ImGui::PlotLines("MSE", gTrain.mseHistory.data(), (int)gTrain.mseHistory.size(), 0, nullptr, FLT_MAX, FLT_MAX, ImVec2(-1,200));
             // Axes and ticks for MSE plot
@@ -5309,6 +5783,41 @@ void Engine::render()
     Mat4 VP = P * V;
 
     renderer.drawGrid(VP);
+
+#ifdef USE_IMGUI
+    if(gOutputTextureVisible)
+    {
+        // The rear wall belongs to Video Screen and is hidden with it.
+        Mat4 MbackWall=Mat4::translate({0.0f,0.0f,-3.60f})*Mat4::scale({12.0f,6.0f,1.0f});
+        renderer.drawMesh(backWall,VP*MbackWall,MbackWall,{0.055f,0.065f,0.080f},0.10f);
+        UpdateVideoScreenTexture(graph);
+        // One output pixel maps to 0.01 world units at scale 1; a 100 x 100
+        // bitmap therefore becomes a 4 x 4 canvas at the default scale of 4.
+        const float canvasWidth=0.01f*(float)gVideoScreenWidth*(float)gOutputTexturePixelScale;
+        const float canvasHeight=0.01f*(float)gVideoScreenHeight*(float)gOutputTexturePixelScale;
+        Mat4 MoutputScreenBacking=Mat4::translate({0.0f,0.0f,-3.58f})*
+            Mat4::scale({canvasWidth+0.14f,canvasHeight+0.14f,1.0f});
+        renderer.drawMesh(outputTexturePlane,VP*MoutputScreenBacking,MoutputScreenBacking,{0.0f,0.0f,0.0f},0.0f,1.0f);
+        Mat4 MoutputTexture=Mat4::translate({0.0f,0.0f,-3.56f})*
+                            Mat4::scale({canvasWidth,canvasHeight,1.0f});
+        if(gVideoScreenTexture && gVideoScreenMappingSucceeded)
+        {
+            renderer.meshShader.use();
+            glUniformMatrix4fv(renderer.meshShader.uniform("uMVP"),1,false,(VP*MoutputTexture).m);
+            glUniformMatrix4fv(renderer.meshShader.uniform("uM"),1,false,MoutputTexture.m);
+            glUniform3f(renderer.meshShader.uniform("uColor"),gOutputTextureBaseColor[0],gOutputTextureBaseColor[1],gOutputTextureBaseColor[2]);
+            glUniform1f(renderer.meshShader.uniform("uMetallic"),0.02f);
+            glUniform1f(renderer.meshShader.uniform("uExposure"),1.0f);
+            glUniform1f(renderer.meshShader.uniform("uOpacity"),gOutputTextureBaseColor[3]);
+            glUniform1i(renderer.meshShader.uniform("uUseTexture"),1);
+            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,gVideoScreenTexture);
+            glUniform1i(renderer.meshShader.uniform("uTexture"),0);
+            outputTexturePlane.draw();
+        }
+        else renderer.drawMesh(outputTexturePlane,VP*MoutputTexture,MoutputTexture,
+                               {gOutputTextureBaseColor[0],gOutputTextureBaseColor[1],gOutputTextureBaseColor[2]},0.02f,gOutputTextureBaseColor[3]);
+    }
+#endif
 
     // Fixed industrial materials: these deliberately do not follow UI themes.
     const Vec3 shaftSteel{0.34f, 0.38f, 0.41f};
@@ -5565,6 +6074,134 @@ void Engine::render()
             ImGui::End();
         }
 
+        if(gShowOutputTextureWindow)
+        {
+            ImGui::SetNextWindowSize(ImVec2(350.0f, 230.0f), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowPos(ImVec2(disp.x - 370.0f, 290.0f), ImGuiCond_FirstUseEver);
+            if(ImGui::Begin("Video Screen##F6", &gShowOutputTextureWindow,
+                            ImGuiWindowFlags_NoCollapse))
+            {
+                EnsureVideoScreenOutputGroup(graph);
+                ImGui::TextWrapped("Configure the Video Screen mounted on the rear wall of the 3D scene.");
+                ImGui::Separator();
+                ImGui::Checkbox("Show Video Screen", &gOutputTextureVisible);
+                ImGui::BeginDisabled(!gOutputTextureVisible);
+                const bool resolutionChanged=ImGui::InputInt("Screen width", &gVideoScreenWidth) |
+                    ImGui::InputInt("Screen height", &gVideoScreenHeight);
+                gVideoScreenWidth=std::clamp(gVideoScreenWidth,1,1000);
+                gVideoScreenHeight=std::clamp(gVideoScreenHeight,1,1000);
+                if(resolutionChanged && ClearVideoScreenPixelAssignments(graph)) MarkNetworkDirty();
+                ImGui::SliderInt("Pixel scale", &gOutputTexturePixelScale, 1, 32, "%d x");
+                ImGui::ColorEdit4("Base color", gOutputTextureBaseColor,
+                                  ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_DisplayRGB);
+                ImGui::EndDisabled();
+                ImGui::Separator();
+                const size_t requiredPixels=(size_t)gVideoScreenWidth*(size_t)gVideoScreenHeight;
+                const std::vector<int> outputIds=VideoScreenOutputIds(graph);
+                if(ImGui::Button("Map outputs to Video Screen"))
+                {
+                    if(outputIds.size()>=requiredPixels)
+                    {
+                        EnsureVideoScreenOutputGroup(graph,true);
+                        if(AssignVideoScreenPixels(graph)) MarkNetworkDirty();
+                        gVideoScreenMappingSucceeded=true;
+                        gVideoScreenMappingMessage="Mapped pixels 1-"+std::to_string(requiredPixels)+
+                            " from the first "+std::to_string(requiredPixels)+" output neurons.";
+                    }
+                    else
+                    {
+                        if(ClearVideoScreenPixelAssignments(graph)) MarkNetworkDirty();
+                        gVideoScreenMappingMessage="Video Screen needs "+std::to_string(requiredPixels)+
+                            " outputs; this network has "+std::to_string(outputIds.size())+".";
+                    }
+                }
+                ImGui::TextColored(gVideoScreenMappingSucceeded ? ImVec4(0.30f,0.90f,0.48f,1.0f) : ImVec4(1.0f,0.67f,0.20f,1.0f),
+                                   "%s",gVideoScreenMappingMessage.c_str());
+                ImGui::Text("Outputs: %zu | Required: %zu",outputIds.size(),requiredPixels);
+                const float screenWidth=0.01f*(float)gVideoScreenWidth*(float)gOutputTexturePixelScale;
+                const float screenHeight=0.01f*(float)gVideoScreenHeight*(float)gOutputTexturePixelScale;
+                ImGui::Text("Video Screen: %d x %d pixels | %.1f x %.1f world units",
+                            gVideoScreenWidth,gVideoScreenHeight,screenWidth,screenHeight);
+                ImGui::TextDisabled("The first required output neurons map to pixels in row-major order.");
+                ImGui::Separator();
+                ImGui::TextUnformatted("Video Screen image lessons");
+                ImGui::InputText("Image path",gVideoScreenImagePath,IM_ARRAYSIZE(gVideoScreenImagePath));
+                ImGui::SameLine();
+                if(ImGui::Button("Load image"))
+                {
+                    if(!gVideoScreenImagePath[0]) gVideoScreenImageError="Enter an image path first.";
+                    else
+                    {
+                        VideoScreenImage image; std::string error;
+                        if(LoadVideoScreenImage(gVideoScreenImagePath,image,error))
+                        {
+                            if(!gVideoScreenImages.empty() && (image.width!=gVideoScreenImages.front().width || image.height!=gVideoScreenImages.front().height))
+                                gVideoScreenImageError="Image dimensions must match the first loaded image.";
+                            else { if(gVideoScreenImages.empty()) { gVideoScreenWidth=image.width; gVideoScreenHeight=image.height; ClearVideoScreenPixelAssignments(graph); } gVideoScreenImages.push_back(std::move(image)); gVideoScreenImageError.clear(); }
+                        }
+                        else gVideoScreenImageError="Cannot load image: "+error;
+                    }
+                }
+                ImGui::TextDisabled("Enter an absolute path, e.g. /home/user/image.png");
+                if(!gVideoScreenImageError.empty()) ImGui::TextColored(ImVec4(1,0.55f,0.2f,1),"%s",gVideoScreenImageError.c_str());
+                for(size_t i=0;i<gVideoScreenImages.size();++i)
+                {
+                    ImGui::Text("%zu. %s (%d x %d)",i+1,gVideoScreenImages[i].name.c_str(),gVideoScreenImages[i].width,gVideoScreenImages[i].height);
+                    ImGui::SameLine(); ImGui::PushID((int)i); if(ImGui::SmallButton("Remove")) { gVideoScreenImages.erase(gVideoScreenImages.begin()+i); ImGui::PopID(); break; } ImGui::PopID();
+                }
+                if(!gVideoScreenImages.empty())
+                {
+                    ImGui::BeginDisabled(gTrain.active || gAutoPruneActive || gPendingTopology.has_value());
+                    if(ImGui::Button("Generate Lessons"))
+                    {
+                        const size_t pixels=(size_t)gVideoScreenWidth*(size_t)gVideoScreenHeight;
+                        std::vector<int> inputIndices;
+                        for(const Layer& layer:graph.layers) if(layer.kind==LayerKind::Input)
+                            inputIndices.insert(inputIndices.end(),layer.nodeIdx.begin(),layer.nodeIdx.end());
+                        std::vector<TrainSample> lessons;
+                        lessons.reserve(gVideoScreenImages.size());
+                        for(const VideoScreenImage& image:gVideoScreenImages)
+                        {
+                            TrainSample lesson;
+                            lesson.in.assign(inputIndices.size(),0.0f);
+                            lesson.out.resize(pixels);
+                            for(size_t pixel=0;pixel<pixels;++pixel) lesson.out[pixel]=(float)image.grayscale[pixel]/255.0f;
+                            lesson.desc="Video Screen: "+image.name;
+                            lesson.videoScreenLesson=true;
+                            lessons.push_back(std::move(lesson));
+                        }
+                        if(outputIds.size()==pixels)
+                        {
+                            gDataset=std::move(lessons);
+                            gLessonsCount=(int)gDataset.size();
+                            ++gDatasetRevision;
+                            gSequenceDraft.clear(); seqSelectedFrame=-1; seqPlaying=false;
+                            ClearLessonTargets();
+                            MarkNetworkDirty();
+                            gVideoScreenImageError.clear();
+                            gVideoScreenLessonMessage="Generated "+std::to_string(gLessonsCount)+" Video Screen lessons.";
+                        }
+                        else
+                        {
+                            NeuralGraph candidate=graph;
+                            if(!NG_ResizeOutputLayerForVideoScreen(graph,candidate,pixels))
+                                gVideoScreenImageError="Cannot create the required Output layer.";
+                            else
+                            {
+                                NG_RequestTopology(graph,std::move(candidate),std::move(lessons));
+                                gVideoScreenImageError.clear();
+                                gVideoScreenLessonMessage="Lessons will be generated when the topology change is accepted.";
+                            }
+                        }
+                    }
+                    ImGui::EndDisabled();
+                }
+                if(!gVideoScreenLessonMessage.empty())
+                    ImGui::TextColored(ImVec4(0.30f,0.90f,0.48f,1.0f),"%s",gVideoScreenLessonMessage.c_str());
+            }
+            ImGui::End();
+        }
+
         // Right-bottom: Training parameters
         float paramsW = disp.x - (10.0f + logW) - 20.0f;
         if(paramsW < 850.0f) paramsW = 850.0f;
@@ -5787,14 +6424,18 @@ void Engine::render()
         if(editingLesson >= 0 && editingLesson < (int)gDataset.size() &&
            gDataset[editingLesson].sequence.empty())
         {
+            const bool videoScreenLesson=gDataset[editingLesson].videoScreenLesson;
             ImGui::Separator();
             ImGui::Text("Edit single lesson #%d", editingLesson);
             ImGui::SetNextItemWidth(340.0f);
             ImGui::InputText("Description##single", lessonEditDescription, sizeof(lessonEditDescription));
+            if(videoScreenLesson)
+                ImGui::TextDisabled("Expected outputs: [Pixel mapping] (stored from the source image)");
             int inputPos = 0, outputPos = 0;
             for(const auto& layer : graph.layers)
             {
                 if(layer.kind != LayerKind::Input && layer.kind != LayerKind::Output) continue;
+                if(layer.kind==LayerKind::Output && videoScreenLesson) continue;
                 for(int idx : layer.nodeIdx)
                 {
                     const bool input = layer.kind == LayerKind::Input;
@@ -5817,7 +6458,7 @@ void Engine::render()
             {
                 auto& sample = gDataset[editingLesson];
                 sample.in = singleEditInputs;
-                sample.out = singleEditOutputs;
+                if(!sample.videoScreenLesson) sample.out = singleEditOutputs;
                 sample.desc = lessonEditDescription;
                 MarkNetworkDirty();
                 lessonDescriptionSync = editingLesson;
@@ -5840,6 +6481,7 @@ void Engine::render()
             else if(layer.kind == LayerKind::Output)
                 for(int idx : layer.nodeIdx) seqOutputIdx.push_back(idx);
         }
+        const bool hideVideoScreenExpectedOutputs=VirtualVideoScreenGroup(graph)!=nullptr;
         auto showSequenceFrame = [&](int frame)
         {
             UseManualInputs(graph);
@@ -5955,7 +6597,11 @@ void Engine::render()
         }
         ImGui::Separator();
         ImGui::TextUnformatted("Expected Outputs (final sequence target)");
-        for(int idx : seqOutputIdx)
+        if(hideVideoScreenExpectedOutputs)
+        {
+            ImGui::TextDisabled("[Pixel mapping] Expected outputs are hidden for Video Screen.");
+        }
+        else for(int idx : seqOutputIdx)
         {
             const Neuron& node = graph.nodes[idx];
             float target = 0.0f;
@@ -6138,8 +6784,8 @@ void Engine::render()
 
                 ImGui::TableSetColumnIndex(3);
                 {
-                    std::string outs= vecToStr(s.out); 
-                    ImGui::TextUnformatted(outs.c_str()); 
+                    if(s.videoScreenLesson) ImGui::TextUnformatted("[Pixel mapping]");
+                    else { std::string outs=vecToStr(s.out); ImGui::TextUnformatted(outs.c_str()); }
                 }
 
                 ImGui::TableSetColumnIndex(4);
@@ -6411,7 +7057,7 @@ void Engine::render()
         ImGui::BulletText("F3                   - Log window");
         ImGui::BulletText("F4                   - Training parameters");
         ImGui::BulletText("F5                   - Help");
-        ImGui::BulletText("F6                   - Training HUD");
+        ImGui::BulletText("F6                   - Video Screen settings");
         ImGui::BulletText("[ / ]                - previous / next layer");
         ImGui::BulletText("1..9                 - select layer by index");
         ImGui::BulletText("Ctrl+N               - new network (keep Input and Output only)");
@@ -6431,6 +7077,8 @@ void Engine::render()
         ImGui::BulletText("Q                    - random live feed for all input neurons");
         ImGui::BulletText("TAB                  - toggle live feed on all inputs");
         ImGui::BulletText("Space                - toggle live feed for selected input");
+        ImGui::BulletText("Ctrl + click         - add or remove an input neuron from the current selection");
+        ImGui::BulletText("2 selected inputs    - Synchronize; Opposite phase makes the lower input mirror the upper one");
         ImGui::BulletText("Home                 - show and re-layout all primary windows");
         ImGui::BulletText("Esc                  - stop training, or close the application");
         ImGui::BulletText("V / R                - VSync / smooth turbine start-stop");
@@ -6576,13 +7224,15 @@ void Engine::render()
     // Training step & result banner (state is file-scope globals)
     if(gTrain.active || gShowTrainingWindow)
     {
-        // run one epoch per frame while active
+        // Process one lesson per frame. Large Video Screen lessons therefore
+        // return to the event loop between updates, keeping ESC responsive.
         if(gTrain.active)
         {
             double t0 = nowSeconds();
             gInferenceNeedsReset = true;
+            const bool lastLesson=gTrain.sampleCursor+1>=gDataset.size();
             float mse = ApplyPendingWeightRandomization(graph)
-                ? TrainOneEpoch(graph, gTrain.lr, gTrain.l1, gTrain.l2)
+                ? TrainSamples(graph,gTrain.lr,gTrain.l1,gTrain.l2,gTrain.sampleCursor,1,lastLesson)
                 : std::numeric_limits<float>::quiet_NaN();
             if(!std::isfinite(mse))
             {
@@ -6596,8 +7246,9 @@ void Engine::render()
                 gToastT = nowSeconds();
                 Logf("Training stopped: %s; model was not saved.", gTrainingError.c_str());
             }
-            else
+            else if(lastLesson)
             {
+                gTrain.sampleCursor=0;
                 gTrain.lastMSE = mse;
                 gTrain.mseHistory.push_back(mse);
                 gTrain.epoch++;
@@ -6627,6 +7278,7 @@ void Engine::render()
                     gTrainInterrupted = false;
                 }
             }
+            else ++gTrain.sampleCursor;
         }
 
         // draw center HUD (MSE plot etc.)
@@ -6869,6 +7521,9 @@ void Engine::shutdown()
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
 #endif
+    if(gVideoScreenTexture) { glDeleteTextures(1,&gVideoScreenTexture); gVideoScreenTexture=0; }
+    outputTexturePlane.destroy();
+    backWall.destroy();
     renderer.destroy();
     turbine.destroy();
     if(window){ glfwDestroyWindow((GLFWwindow*)window); window=nullptr; }
@@ -6926,6 +7581,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     {
         if(key==GLFW_KEY_ESCAPE) FinishAutoPrune(graph,"Stopped. Last accepted round retained.");
         else if(key==GLFW_KEY_F4 && action==GLFW_PRESS) gShowParamsWindow=!gShowParamsWindow;
+        else if(key==GLFW_KEY_F6 && action==GLFW_PRESS) gShowOutputTextureWindow=!gShowOutputTextureWindow;
         return;
     }
     // The modal handles Escape; do not let it close the application or run editor shortcuts.
@@ -6979,7 +7635,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     if(key==GLFW_KEY_F3){ gShowLogWindow    = !gShowLogWindow; return; }
     if(key==GLFW_KEY_F4){ gShowParamsWindow = !gShowParamsWindow; if(gShowParamsWindow) gSizeF4FromF1=true; return; }
     if(key==GLFW_KEY_F5){ gShowHelp = !gShowHelp; return; }
-    if(key==GLFW_KEY_F6){ gShowTrainingWindow = !gShowTrainingWindow; return; }
+    if(key==GLFW_KEY_F6){ gShowOutputTextureWindow = !gShowOutputTextureWindow; return; }
     if(key==GLFW_KEY_H){ gShowHelp = !gShowHelp; return; }
 
     if(key==GLFW_KEY_LEFT_BRACKET)

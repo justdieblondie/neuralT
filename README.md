@@ -15,6 +15,10 @@ Supported Neuro type: MLP / GRU / MLP+GRU
 
 The project also requires an `imgui/` directory containing ImGui sources and the GLFW/OpenGL3 backends.
 
+## Bundled image decoder
+
+`third_party/stb_image.h` is bundled with NeuralT to provide portable PNG and JPG decoding for Video Screen image lessons. It is public-domain/MIT licensed and requires no additional linker flags on Linux or Windows.
+
 ## Build
 
 Run the following command from the project directory:

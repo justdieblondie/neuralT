@@ -14,7 +14,7 @@
 // ─────────────────────────────────────────
 // Paths and version
 // ─────────────────────────────────────────
-inline constexpr const char* kAppVersion             = "v4.2";
+inline constexpr const char* kAppVersion             = "v4.3";
 inline constexpr const char* kEngineConfFile         = "engine.conf";
 inline constexpr const char* kLessonsFile            = "lessons.json";
 inline constexpr const char* kNetworkFile            = "network.json";
@@ -208,6 +208,7 @@ struct Neuron
     float value=0, speed=0, bias=0, radius=14;
     float amp=1.0f; // amplitude for live feed (0..1)
     bool live=false; // per-input live feed toggle
+    int videoScreenPixel=-1; // 1-based pixel number on the Video Screen, -1 when unused
     float x=0, y=0;
     float vx=0, vy=0;
     float phase=0;
@@ -237,6 +238,8 @@ struct NeuralGraph
     std::vector<NeuronGroup> neuronGroups;
     std::vector<int> ungroupedInputIds; // Explicitly removed from automatic prefix groups
     std::vector<std::vector<int>> syncGroups;
+    // {source, follower}; follower always mirrors 1-source for opposite phase.
+    std::vector<std::array<int,2>> oppositePhaseSyncPairs;
     int selected=-1;
     int currentLayer=0;
     bool liveInputs=false;
@@ -268,7 +271,8 @@ struct Renderer
     unsigned int gridVao=0, gridVbo=0;
     bool init(const UITheme& t);
     void drawGrid(const Mat4& vp) const;
-    void drawMesh(const Mesh& m, const Mat4& mvp, const Mat4& model, const Vec3& color, float metallic) const;
+    void drawMesh(const Mesh& m, const Mat4& mvp, const Mat4& model, const Vec3& color, float metallic,
+                  float opacity=1.0f) const;
     void drawLines(const Mesh& lineList, const Mat4& mvp, const Vec3& color, float thickness) const;
     void destroy();
 };
@@ -294,6 +298,7 @@ struct Engine
     void* window = nullptr;
     Renderer renderer;
     TurbineModel turbine;
+    Mesh backWall, outputTexturePlane;
     OrbitCamera cam;
     Timer timer;
     AppConfig cfg;
