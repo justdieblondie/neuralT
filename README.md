@@ -2,6 +2,8 @@
 
 NeuralT is a neural-network editor with an ImGui-based graphical interface.
 
+Supported Neuro type: MLP / GRU / MLP+GRU
+
 ## Requirements (Linux)
 
 - `g++` compiler with C++17 support;
@@ -33,4 +35,4 @@ After a successful build, start the application with:
 ./neuralT
 ```
 
-Press 'o' to load Neuro NPC example and F5 for more info. 
+Press 'o' to load Neuro example and F5 for more info. 
