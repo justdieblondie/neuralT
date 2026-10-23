@@ -74,6 +74,11 @@ static bool gShowLoadMenu     = false;      // 'O' key or button
 static bool gForceRelayoutWindows = false;  // 'Home' key re-arrangement
 static bool gShowSaveMenu     = false;      // 'S' key or button
 static char gSaveName[256]    = "saved/network.json";
+static bool gNetworkDirty=true;
+static bool gExitRequested=false;
+static bool gAllowExit=false;
+
+static void MarkNetworkDirty() { gNetworkDirty=true; }
 
 // Lesson targets never replace network predictions.
 static std::unordered_map<int, float> gLessonTargets;
@@ -1415,6 +1420,7 @@ static void NG_CommitTopology(NeuralGraph& destination,PendingTopologyChange cha
     const bool keepLessons=NG_KeepExistingLessons(destination,change);
     destination=std::move(change.graph);
     destination.status=NetworkStatus::NeedsRetraining;
+    MarkNetworkDirty();
     destination.trainedMSE=std::numeric_limits<float>::quiet_NaN();
     destination.topologyWarningAcknowledged=true;
     if(!keepLessons)
@@ -1698,6 +1704,7 @@ static void NG_RandomizeHidden(NeuralGraph& g, float wRange=1.0f, float bRange=0
 {
     if(IsTrainingActive() && !betweenTrainingEpochs) { Logf("Stop training before changing the model or lessons."); return; }
     g.status=NetworkStatus::NotTrained;
+    MarkNetworkDirty();
     g.trainedMSE=std::numeric_limits<float>::quiet_NaN();
     for(size_t li=0; li<g.layers.size(); ++li)
     {
@@ -2402,6 +2409,32 @@ static bool NG_SaveJson(const NeuralGraph& graph, const std::string& path)
     catch(const std::exception& error) { ReportFileError("Save failed ("+path+")",error); return false; }
 }
 
+static bool SaveNetworkManually(const NeuralGraph& graph,const std::string& path)
+{
+    if(!NG_SaveJson(graph,path)) return false;
+    gNetworkDirty=false;
+    std::error_code error;
+    std::filesystem::remove("network_trained.json",error);
+    if(error) Logf("Network saved, but automatic training file could not be removed: %s",error.message().c_str());
+    return true;
+}
+
+static bool SaveNetworkForExit(const NeuralGraph& graph)
+{
+    std::error_code error;
+    std::filesystem::create_directories("saved",error);
+    if(error) { Logf("Cannot create saved directory: %s",error.message().c_str()); return false; }
+    std::time_t now=std::time(nullptr); std::tm local{};
+#if defined(_WIN32)
+    localtime_s(&local,&now);
+#else
+    localtime_r(&now,&local);
+#endif
+    char path[128];
+    std::strftime(path,sizeof(path),"saved/network_%Y%m%d_%H%M%S.json",&local);
+    return SaveNetworkManually(graph,path);
+}
+
 static bool NG_LoadJson(NeuralGraph& destination, const std::string& path, std::string* message)
 {
     if(IsTrainingActive() || gPendingTopology)
@@ -2445,6 +2478,7 @@ static bool NG_LoadJson(NeuralGraph& destination, const std::string& path, std::
             rebuilt.destroy();
         }
         ClearLessonTargets(); gSequenceDraft.clear(); gInferenceAccumulator=0; gInferenceNeedsReset=true;
+        gNetworkDirty=false;
         if(message) message->clear();
         return true;
     }
@@ -2991,6 +3025,7 @@ static void FinishAutoPrune(NeuralGraph& graph,const std::string& reason)
     {
         // Only publish complete, evaluated rounds that satisfy the original limit.
         graph=std::move(p.accepted);
+        MarkNetworkDirty();
         graph.status=NetworkStatus::NeedsRetraining;
         graph.topologyWarningAcknowledged=true;
         graph.trainedMSE=std::numeric_limits<float>::quiet_NaN();
@@ -3107,7 +3142,7 @@ static void UpdateAutoPrune(NeuralGraph& graph)
 
 static void DrawAutoPrunePanel(NeuralGraph& graph)
 {
-    ImGui::TextWrapped("Repeatedly remove the least harmful hidden or GRU neuron, evaluating all lessons and sequence steps. Input and output neurons are preserved.");
+    ImGui::TextWrapped("Auto Prune repeatedly tests removing one hidden or GRU neuron. Each candidate is evaluated against every lesson and sequence step; it is retained only when its MSE stays within the limit below. Input and output neurons are never removed.");
     ImGui::BeginDisabled(gAutoPruneActive || gTrain.active || gPendingTopology.has_value());
     ImGui::SetNextItemWidth(160);
     ImGui::InputFloat("Maximum MSE increase (%)",&gAutoPruneTolerance,0.5f,5.0f,"%.2f");
@@ -3129,7 +3164,9 @@ static void DrawAutoPrunePanel(NeuralGraph& graph)
         const float progress=p.measuringBaseline?(float)lessonProgress:
             p.candidates.empty()?0.0f:(float)((p.candidate+(p.evaluating?lessonProgress:0.0))/p.candidates.size());
         ImGui::ProgressBar(progress,ImVec2(-1,0),p.measuringBaseline?"Baseline evaluation":"Current round");
-        ImGui::Text("Round: %zu | Candidates: %zu / %zu | Removed: %zu",p.rounds,p.candidate,p.candidates.size(),p.removed);
+        ImGui::Text("Round: %zu | Candidates: %zu / %zu | Removed: ",p.rounds,p.candidate,p.candidates.size());
+        ImGui::SameLine(0.0f,0.0f);
+        ImGui::TextColored(ImVec4(0.30f,0.90f,0.48f,1.0f),"%zu",p.removed);
         if(p.evaluating && p.lesson<p.lessons.size())
             ImGui::Text("Lesson: %zu / %zu | Sequence step: %zu / %zu",p.lesson+1,p.lessons.size(),
                 p.frame,std::max<size_t>(1,p.lessons[p.lesson].sequence.size()));
@@ -3180,6 +3217,7 @@ static bool StartTraining(NeuralGraph& graph, bool toTarget)
     }
     if(toTarget) gTrain.totalEpochs = std::max(gTrain.totalEpochs, 200000);
     gTrain.active = true; gTrain.done = false; gTrain.epoch = 0;
+    MarkNetworkDirty();
     if(graph.status==NetworkStatus::Trained) graph.status=NetworkStatus::NeedsRetraining;
     gAnimationNeedsResume=true;
     gAnimationDelta=0.0f;
@@ -4662,6 +4700,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                     }
                     else if(row.customIndex>=0)
                         neuronGroups[row.customIndex].collapsed = expanded;
+                    MarkNetworkDirty();
                     multiSelected.clear(); selected=-1;
                 }
                 ImGui::TableSetColumnIndex(3);
@@ -4684,6 +4723,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                     if(row.customIndex>=0 && row.customIndex<(int)neuronGroups.size())
                         neuronGroups.erase(neuronGroups.begin()+row.customIndex);
                     expandedInputGroups.erase(std::remove(expandedInputGroups.begin(),expandedInputGroups.end(),row.name),expandedInputGroups.end());
+                    MarkNetworkDirty();
                     multiSelected.clear(); selected=-1;
                     layoutLayers(lastCanvasW>0?lastCanvasW:800.0f,lastCanvasH>0?lastCanvasH:500.0f);
                     ImGui::PopID();
@@ -4707,6 +4747,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                             auto oldIt=std::find(expandedInputGroups.begin(),expandedInputGroups.end(),renameGroupKey);
                             if(oldIt!=expandedInputGroups.end()) *oldIt=newName;
                             layoutLayers(canvasSize.x,canvasSize.y);
+                            MarkNetworkDirty();
                             ImGui::CloseCurrentPopup();
                         }
                     }
@@ -4720,6 +4761,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                         if(renameGroupCustomIndex>=0 && renameGroupCustomIndex<(int)neuronGroups.size())
                             neuronGroups.erase(neuronGroups.begin()+renameGroupCustomIndex);
                         expandedInputGroups.erase(std::remove(expandedInputGroups.begin(),expandedInputGroups.end(),renameGroupKey),expandedInputGroups.end());
+                        MarkNetworkDirty();
                         multiSelected.clear(); selected=-1;
                         layoutLayers(lastCanvasW>0?lastCanvasW:800.0f,lastCanvasH>0?lastCanvasH:500.0f);
                         ImGui::CloseCurrentPopup();
@@ -4768,6 +4810,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 }
                 syncGroups.push_back(merged);
                 SyncNeuronProperties(*this,selected);
+                MarkNetworkDirty();
             }
             ImGui::TextDisabled("Ctrl+click to add or remove neurons.");
             static char groupName[128]="";
@@ -4808,6 +4851,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                                      lastCanvasH > 0.0f ? lastCanvasH : 500.0f);
                     }
                     multiSelected.clear(); selected=-1;
+                    MarkNetworkDirty();
                     groupName[0]='\0'; ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
@@ -4933,6 +4977,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 const bool propertiesChanged = beforeProperties.value!=sel->value || beforeProperties.speed!=sel->speed ||
                     beforeProperties.amp!=sel->amp || beforeProperties.live!=sel->live || beforeProperties.bias!=sel->bias;
                 if(propertiesChanged) SyncNeuronProperties(*this,sel->id);
+                if(propertiesChanged || beforeProperties.label!=sel->label || beforeProperties.desc!=sel->desc)
+                    MarkNetworkDirty();
                 if(ImGui::Button("Delete neuron"))
                 {
                     const int deleteId=sel->id;
@@ -4958,6 +5004,12 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 Engine* gEngine = nullptr;
 
 static void cbFramebufferSize(GLFWwindow*, int w, int h){ if(gEngine) gEngine->onResize(w,h); }
+static void cbWindowClose(GLFWwindow* window)
+{
+    if(gAllowExit) return;
+    glfwSetWindowShouldClose(window,GLFW_FALSE);
+    gExitRequested=true;
+}
 static void cbMouseButton(GLFWwindow*, int b, int a, int m){ if(gEngine) gEngine->onMouseButton(b,a,m); }
 static void cbCursorPos(GLFWwindow*, double x, double y){ if(gEngine) gEngine->onCursorPos(x,y); }
 static void cbScroll(GLFWwindow*, double dx, double dy){ if(gEngine) gEngine->onScroll(dx,dy); }
@@ -5018,6 +5070,7 @@ bool Engine::init(const AppConfig& cfgIn)
 
     gEngine = this;
     glfwSetFramebufferSizeCallback(win, cbFramebufferSize);
+    glfwSetWindowCloseCallback(win, cbWindowClose);
     glfwSetMouseButtonCallback(win, cbMouseButton);
     glfwSetCursorPosCallback(win, cbCursorPos);
     glfwSetScrollCallback(win, cbScroll);
@@ -5698,6 +5751,7 @@ void Engine::render()
             sample.in = std::move(in);
             sample.out = std::move(out);
             gDataset.push_back(std::move(sample));
+            MarkNetworkDirty();
             gLessonsCount=(int)gDataset.size();
             SaveEngineConf("engine.conf");
             Logf("Lesson added. Total=%d", gLessonsCount);
@@ -5738,6 +5792,7 @@ void Engine::render()
                 sample.in = singleEditInputs;
                 sample.out = singleEditOutputs;
                 sample.desc = lessonEditDescription;
+                MarkNetworkDirty();
                 lessonDescriptionSync = editingLesson;
                 SaveEngineConf("engine.conf");
                 Logf("Lesson %d updated.", editingLesson);
@@ -5920,9 +5975,10 @@ void Engine::render()
                 if(updating)
                 {
                     gDataset[editingLesson] = std::move(sample);
+                    MarkNetworkDirty();
                     lessonDescriptionSync = editingLesson;
                 }
-                else gDataset.push_back(std::move(sample));
+                else { gDataset.push_back(std::move(sample)); MarkNetworkDirty(); }
                 cancelLessonEdit();
                 gLessonsCount=(int)gDataset.size();
                 SaveEngineConf("engine.conf");
@@ -5943,6 +5999,7 @@ void Engine::render()
         {
             cancelLessonEdit();
             gDataset.clear(); gLessonsCount = 0;
+            MarkNetworkDirty();
             SaveEngineConf("engine.conf");
             Logf("All lessons deleted. forever. it was shit anyway..");
         }
@@ -6070,6 +6127,7 @@ void Engine::render()
                 if(ImGui::Button("Save"))
                 {
                     s.desc = std::string(lessonDescBuf[i].data());
+                    MarkNetworkDirty();
                     Logf("Lesson %d description saved.", i);
                 }
                 ImGui::SameLine();
@@ -6129,6 +6187,7 @@ void Engine::render()
             if(editingLesson == pendingDelete) cancelLessonEdit();
             else if(editingLesson > pendingDelete) --editingLesson;
             gDataset.erase(gDataset.begin() + pendingDelete);
+            MarkNetworkDirty();
             gLessonsCount = (int)gDataset.size();
             if((int)lessonDescBuf.size() > pendingDelete) lessonDescBuf.erase(lessonDescBuf.begin() + pendingDelete);
             Logf("Lesson %d deleted.", pendingDelete);
@@ -6284,7 +6343,7 @@ void Engine::render()
                 // ensure .json
                 if(path.size()<5 || path.substr(path.size()-5) != ".json") path += ".json";
                 std::error_code ec; std::filesystem::create_directories("saved", ec);
-                if(NG_SaveJson(graph, path))
+                if(SaveNetworkManually(graph, path))
                 {
                     Logf("Network saved: %s", path.c_str());
                     gShowSaveMenu = false;
@@ -6390,6 +6449,42 @@ void Engine::render()
         ImGui::BulletText("Interpretation: baseline IQ 0 like you");
         ImGui::End();
         }
+
+    if(gExitRequested && gNetworkDirty) ImGui::OpenPopup("Save before exit###SaveBeforeExit");
+    if(ImGui::BeginPopupModal("Save before exit###SaveBeforeExit",nullptr,ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::TextUnformatted("Save the current network before exiting?");
+        ImGui::TextDisabled("Save creates a timestamped JSON file in saved/.");
+        ImGui::Separator();
+        if(ImGui::Button("Save and Exit"))
+        {
+            if(SaveNetworkForExit(graph))
+            {
+                gAllowExit=true;
+                glfwSetWindowShouldClose((GLFWwindow*)window,GLFW_TRUE);
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if(ImGui::Button("Exit without saving"))
+        {
+            gAllowExit=true;
+            glfwSetWindowShouldClose((GLFWwindow*)window,GLFW_TRUE);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if(ImGui::Button("Cancel"))
+        {
+            gExitRequested=false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    else if(gExitRequested && !gNetworkDirty)
+    {
+        gAllowExit=true;
+        glfwSetWindowShouldClose((GLFWwindow*)window,GLFW_TRUE);
+    }
 
     if(gOpenTopologyPopup)
     {
@@ -6837,10 +6932,10 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
             Logf("Training interrupted (ESC) at epoch %d, MSE=%.6f", gTrain.epoch, gTrain.lastMSE);
             return;
         } 
-        else 
+        else
         {
             // If no result overlay, allow closing app
-            if(!gCelebrationVisible){ glfwSetWindowShouldClose((GLFWwindow*)window, 1); }
+            if(!gCelebrationVisible) gExitRequested=true;
             return;
         }
     }
@@ -6937,6 +7032,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
         sample.in = std::move(in);
         sample.out = std::move(out);
         gDataset.push_back(std::move(sample));
+        MarkNetworkDirty();
         gLessonsCount=(int)gDataset.size();
         SaveEngineConf("engine.conf");
         Logf("Lesson added. Total=%d", gLessonsCount);
@@ -7033,7 +7129,7 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
         gShowSaveMenu = true;
         return;
 #else
-        if(NG_SaveJson(graph, "network.json"))
+        if(SaveNetworkManually(graph, "network.json"))
         {
             Logf("Network saved: network.json");
             SaveEngineConf("engine.conf");
