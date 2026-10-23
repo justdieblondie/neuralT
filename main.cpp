@@ -86,6 +86,22 @@ static constexpr double kInferenceStepSeconds = 1.0 / 30.0;
 static double gAnimationTime=0.0;
 static float gAnimationDelta=0.0f;
 static bool gAnimationNeedsResume=false;
+static bool gAutoPruneActive=false;
+
+static const char* NetworkStatusName(NetworkStatus status)
+{
+    switch(status)
+    {
+        case NetworkStatus::Trained: return "Trained";
+        case NetworkStatus::NeedsRetraining: return "Need Re-Training";
+        default: return "Not Trained";
+    }
+}
+
+static float AccuracyFromMSE(float mse)
+{
+    return std::isfinite(mse) ? 100.0f*std::clamp(1.0f-mse,0.0f,1.0f) : 0.0f;
+}
 
 static void ClearLessonTargets()
 {
@@ -1398,6 +1414,9 @@ static void NG_CommitTopology(NeuralGraph& destination,PendingTopologyChange cha
 {
     const bool keepLessons=NG_KeepExistingLessons(destination,change);
     destination=std::move(change.graph);
+    destination.status=NetworkStatus::NeedsRetraining;
+    destination.trainedMSE=std::numeric_limits<float>::quiet_NaN();
+    destination.topologyWarningAcknowledged=true;
     if(!keepLessons)
     {
         gDataset=std::move(change.replacementLessons);
@@ -1427,7 +1446,7 @@ static bool NG_RequestTopology(NeuralGraph& destination,NeuralGraph candidate,
     candidate.layoutLayers(destination.lastCanvasW>0 ? destination.lastCanvasW : 800.0f,
                            destination.lastCanvasH>0 ? destination.lastCanvasH : 500.0f);
     PendingTopologyChange change{std::move(candidate),std::move(replacementLessons),std::move(afterCommit)};
-    if(!gDataset.empty() || !gSequenceDraft.empty())
+    if(!destination.topologyWarningAcknowledged)
     {
         gPendingTopology=std::move(change);
         gOpenTopologyPopup=true;
@@ -1555,6 +1574,9 @@ static void NG_BuildTopology(NeuralGraph& g, int inN, const std::vector<int>& hi
 {
     if(IsTrainingActive()) { Logf("Stop training before changing the model or lessons."); return; }
     g.nodes.clear(); g.edges.clear(); g.layers.clear();
+    g.status=NetworkStatus::NotTrained;
+    g.trainedMSE=std::numeric_limits<float>::quiet_NaN();
+    g.topologyWarningAcknowledged=false;
     g.selected = -1; std::memset(g.editBuf,0,sizeof(g.editBuf));
     g.currentLayer = 0; g.liveInputs = false;
     int id = 0;
@@ -1606,6 +1628,9 @@ static void NG_BuildDinosaur(NeuralGraph& g)
 static void NG_BuildDeepGRUTopology(NeuralGraph& graph)
 {
     if(IsTrainingActive()) { Logf("Stop training before changing the model or lessons."); return; }
+    graph.status=NetworkStatus::NotTrained;
+    graph.trainedMSE=std::numeric_limits<float>::quiet_NaN();
+    graph.topologyWarningAcknowledged=false;
     graph.nodes.clear();
     graph.edges.clear();
     graph.layers.clear();
@@ -1672,6 +1697,8 @@ static void NG_RandomizeHidden(NeuralGraph& g, float wRange=1.0f, float bRange=0
                                bool betweenTrainingEpochs=false)
 {
     if(IsTrainingActive() && !betweenTrainingEpochs) { Logf("Stop training before changing the model or lessons."); return; }
+    g.status=NetworkStatus::NotTrained;
+    g.trainedMSE=std::numeric_limits<float>::quiet_NaN();
     for(size_t li=0; li<g.layers.size(); ++li)
     {
         auto& L=g.layers[li];
@@ -1980,6 +2007,15 @@ static void PruneNeuronCollections(NeuralGraph& g)
 
 static void DecodeGraph(const Json& document, NeuralGraph& graph, std::vector<TrainSample>& lessons)
 {
+    const std::string status=JsonField(document,"network_status",std::string("Not Trained"));
+    RequireJson(status=="Not Trained" || status=="Trained" || status=="Need Re-Training","Invalid network status");
+    graph.status=status=="Trained" ? NetworkStatus::Trained : status=="Need Re-Training"
+        ? NetworkStatus::NeedsRetraining : NetworkStatus::NotTrained;
+    graph.topologyWarningAcknowledged=JsonField(document,"topology_warning_acknowledged",
+        graph.status==NetworkStatus::NeedsRetraining);
+    graph.trainedMSE=JsonField(document,"trained_mse",std::numeric_limits<float>::quiet_NaN());
+    RequireJson(!std::isfinite(graph.trainedMSE) || graph.trainedMSE>=0.0f,"Invalid trained MSE");
+    if(graph.status!=NetworkStatus::Trained) graph.trainedMSE=std::numeric_limits<float>::quiet_NaN();
     const std::string version=JsonField(document,"version",std::string("neuro-graph-1"));
     RequireJson(version=="neuro-graph-1" || version=="neuro-graph-2", "Unsupported network version: " + version);
     const auto& nodes=document.at("nodes"); const auto& layers=document.at("layers");
@@ -2302,6 +2338,9 @@ static bool NG_SaveJson(const NeuralGraph& graph, const std::string& path)
     try
     {
         Json document={{"version","neuro-graph-2"}};
+        document["network_status"]=NetworkStatusName(graph.status);
+        document["topology_warning_acknowledged"]=graph.topologyWarningAcknowledged;
+        if(std::isfinite(graph.trainedMSE)) document["trained_mse"]=graph.trainedMSE;
         SavedTrainingParams training; training.write(document);
         SavedDisplaySettings display; display.all_inputs_live=graph.liveInputs; display.write(document);
         document["nodes"]=Json::array(); document["layers"]=Json::array();
@@ -2435,7 +2474,7 @@ struct TrainState
 };
 static TrainState gTrain;
 static bool gPendingWeightRandomization=false;
-static bool IsTrainingActive() { return gTrain.active; }
+static bool IsTrainingActive() { return gTrain.active || gAutoPruneActive; }
 static std::string gTrainingError;
 
 static void TopologyCommitted()
@@ -2791,6 +2830,7 @@ static bool PreviewSequenceFrame(NeuralGraph& graph, int frame, bool seek)
 
 static void UpdateInference(NeuralGraph& graph, double dt)
 {
+    if(gAutoPruneActive) return;
     if(gPendingTopology) return;
     if(gTrain.active)
     {
@@ -2917,6 +2957,189 @@ static float EvaluateTrainingMSE(const NeuralGraph& graph, std::string& error)
     return (float)mse;
 }
 
+struct AutoPruneState
+{
+    NeuralGraph accepted, evaluation, best;
+    std::vector<TrainSample> lessons;
+    std::vector<int> candidates;
+    size_t candidate=0, lesson=0, frame=0, removed=0, rounds=0;
+    double sum=0, baseline=0, limit=0, mse=0, bestMse=0;
+    float tolerance=5.0f;
+    bool measuringBaseline=true, evaluating=false, found=false;
+    std::string report;
+};
+static AutoPruneState gAutoPrune;
+static float gAutoPruneTolerance=5.0f;
+
+static void PreparePruneRound()
+{
+    auto& p=gAutoPrune;
+    p.candidates.clear(); p.candidate=0; p.found=false;
+    p.bestMse=std::numeric_limits<double>::infinity();
+    for(size_t li=1;li+1<p.accepted.layers.size();++li)
+        if(p.accepted.layers[li].nodeIdx.size()>1)
+            for(int index:p.accepted.layers[li].nodeIdx)
+                p.candidates.push_back(p.accepted.nodes[index].id);
+    ++p.rounds;
+}
+
+static void FinishAutoPrune(NeuralGraph& graph,const std::string& reason)
+{
+    auto& p=gAutoPrune;
+    gAutoPruneActive=false;
+    if(p.removed)
+    {
+        // Only publish complete, evaluated rounds that satisfy the original limit.
+        graph=std::move(p.accepted);
+        graph.status=NetworkStatus::NeedsRetraining;
+        graph.topologyWarningAcknowledged=true;
+        graph.trainedMSE=std::numeric_limits<float>::quiet_NaN();
+        graph.selected=-1; graph.multiSelected.clear();
+        PruneNeuronCollections(graph);
+        graph.layoutLayers(graph.lastCanvasW>0?graph.lastCanvasW:800,
+                           graph.lastCanvasH>0?graph.lastCanvasH:500);
+        TopologyCommitted();
+        gInferenceNeedsReset=true;
+    }
+    p.report=reason+" Removed neurons: "+std::to_string(p.removed)+
+        ". MSE: "+std::to_string(p.baseline)+" -> "+std::to_string(p.mse);
+    Logf("%s",p.report.c_str());
+    p.evaluation=NeuralGraph{}; p.best=NeuralGraph{}; p.accepted=NeuralGraph{};
+    p.lessons.clear();
+}
+
+static bool StartAutoPrune(NeuralGraph& graph,float tolerance)
+{
+    if(IsTrainingActive() || gPendingTopology) return false;
+    std::string error;
+    if(!std::isfinite(tolerance) || tolerance<0 || !ValidateTrainingData(graph,error))
+    {
+        gAutoPrune.report="Cannot start Auto Prune: "+(error.empty()?std::string("invalid tolerance"):error);
+        return false;
+    }
+    gAutoPrune=AutoPruneState{};
+    auto& p=gAutoPrune;
+    p.tolerance=tolerance; p.accepted=graph; p.evaluation=graph; p.lessons=gDataset;
+    p.evaluating=true; p.report="Evaluating baseline MSE...";
+    seqPlaying=false;
+    gCelebrationVisible=false;
+    gShowTrainingWindow=false;
+    gAnimationDelta=0.0f;
+    gAnimationNeedsResume=true;
+    gAutoPruneActive=true;
+    return true;
+}
+
+static void UpdateAutoPrune(NeuralGraph& graph)
+{
+    if(!gAutoPruneActive) return;
+    auto& p=gAutoPrune;
+    // Yield after a few milliseconds, including between frames of long sequences.
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(4);
+    do
+    {
+        if(!p.evaluating)
+        {
+            if(p.candidate==p.candidates.size())
+            {
+                if(!p.found)
+                {
+                    FinishAutoPrune(graph,p.candidates.empty()?"No further neurons can be removed.":
+                        "No further reduction satisfies the MSE limit.");
+                    return;
+                }
+                p.accepted=std::move(p.best); p.mse=p.bestMse; ++p.removed;
+                PreparePruneRound();
+                continue;
+            }
+            p.evaluation=p.accepted;
+            const int id=p.candidates[p.candidate];
+            int index=-1;
+            for(size_t i=0;i<p.evaluation.nodes.size();++i)
+                if(p.evaluation.nodes[i].id==id) {index=(int)i;break;}
+            if(index<0) {FinishAutoPrune(graph,"Pruning stopped: candidate neuron is missing.");return;}
+            for(auto& layer:p.evaluation.layers)
+                layer.nodeIdx.erase(std::remove(layer.nodeIdx.begin(),layer.nodeIdx.end(),index),layer.nodeIdx.end());
+            NG_EraseNode(p.evaluation,index);
+            NG_PreserveTopologyParameters(p.accepted,p.evaluation);
+            std::string error;
+            if(!NG_ValidateTopology(p.evaluation,error)) {++p.candidate;continue;}
+            p.lesson=0; p.frame=0; p.sum=0; p.evaluating=true;
+        }
+        const auto& lesson=p.lessons[p.lesson];
+        if(p.frame==0) ResetGRUState(p.evaluation);
+        const auto& values=lesson.sequence.empty()?lesson.in:lesson.sequence[p.frame];
+        std::string error;
+        if(!TrainingForward(p.evaluation,values,error))
+        {
+            if(p.measuringBaseline) {FinishAutoPrune(graph,"Baseline failed: "+error);return;}
+            p.evaluating=false; ++p.candidate; continue;
+        }
+        ++p.frame;
+        if(p.frame<std::max<size_t>(1,lesson.sequence.size())) continue;
+        const auto& outputs=p.evaluation.layers.back().nodeIdx;
+        for(size_t i=0;i<outputs.size();++i)
+        {
+            const double d=(double)p.evaluation.nodes[outputs[i]].value-lesson.out[i];
+            p.sum+=d*d;
+        }
+        p.frame=0; ++p.lesson;
+        if(p.lesson<p.lessons.size()) continue;
+        const double mse=p.sum/((double)p.lessons.size()*outputs.size());
+        p.evaluating=false;
+        if(p.measuringBaseline)
+        {
+            if(!std::isfinite(mse)) {FinishAutoPrune(graph,"Non-finite baseline MSE.");return;}
+            p.baseline=mse; p.mse=mse; p.limit=mse*(1.0+p.tolerance/100.0);
+            p.measuringBaseline=false; p.report="Pruning...";
+            PreparePruneRound();
+        }
+        else
+        {
+            if(std::isfinite(mse) && mse<=p.limit && mse<p.bestMse)
+            {
+                p.best=std::move(p.evaluation); p.bestMse=mse; p.found=true;
+            }
+            ++p.candidate;
+        }
+    } while(std::chrono::steady_clock::now()<deadline);
+}
+
+static void DrawAutoPrunePanel(NeuralGraph& graph)
+{
+    ImGui::TextWrapped("Repeatedly remove the least harmful hidden or GRU neuron, evaluating all lessons and sequence steps. Input and output neurons are preserved.");
+    ImGui::BeginDisabled(gAutoPruneActive || gTrain.active || gPendingTopology.has_value());
+    ImGui::SetNextItemWidth(160);
+    ImGui::InputFloat("Maximum MSE increase (%)",&gAutoPruneTolerance,0.5f,5.0f,"%.2f");
+    ImGui::TextWrapped("The limit always uses the MSE at the start of this operation, not the previous round. At zero baseline MSE, only zero-MSE reductions are accepted.");
+    if(ImGui::Button("Start Auto Prune")) StartAutoPrune(graph,gAutoPruneTolerance);
+    ImGui::EndDisabled();
+    auto& p=gAutoPrune;
+    if(gAutoPruneActive)
+    {
+        ImGui::SameLine();
+        if(ImGui::Button("Stop Auto Prune")) FinishAutoPrune(graph,"Stopped. Last accepted round retained.");
+    }
+    if(gAutoPruneActive)
+    {
+        double frameProgress=0.0;
+        if(p.lesson<p.lessons.size())
+            frameProgress=(double)p.frame/std::max<size_t>(1,p.lessons[p.lesson].sequence.size());
+        const double lessonProgress=p.lessons.empty()?0.0:std::min(1.0,(p.lesson+frameProgress)/p.lessons.size());
+        const float progress=p.measuringBaseline?(float)lessonProgress:
+            p.candidates.empty()?0.0f:(float)((p.candidate+(p.evaluating?lessonProgress:0.0))/p.candidates.size());
+        ImGui::ProgressBar(progress,ImVec2(-1,0),p.measuringBaseline?"Baseline evaluation":"Current round");
+        ImGui::Text("Round: %zu | Candidates: %zu / %zu | Removed: %zu",p.rounds,p.candidate,p.candidates.size(),p.removed);
+        if(p.evaluating && p.lesson<p.lessons.size())
+            ImGui::Text("Lesson: %zu / %zu | Sequence step: %zu / %zu",p.lesson+1,p.lessons.size(),
+                p.frame,std::max<size_t>(1,p.lessons[p.lesson].sequence.size()));
+        ImGui::TextUnformatted("Work continues when this tab is hidden. Escape stops pruning.");
+    }
+    if(!p.measuringBaseline)
+        ImGui::Text("Baseline MSE: %.9g | Limit: %.9g | Accepted MSE: %.9g",p.baseline,p.limit,p.mse);
+    ImGui::TextWrapped("%s",p.report.c_str());
+}
+
 static bool ApplyPendingWeightRandomization(NeuralGraph& graph)
 {
     if(!gPendingWeightRandomization) return true;
@@ -2935,6 +3158,7 @@ static bool ApplyPendingWeightRandomization(NeuralGraph& graph)
 
 static bool StartTraining(NeuralGraph& graph, bool toTarget)
 {
+    if(gAutoPruneActive) { Logf("Stop Auto Prune before training."); return false; }
     if(gPendingTopology) { Logf("Resolve the topology change first."); return false; }
     if(gTrain.active) { Logf("Training is already running."); return false; }
     gTrainingError.clear();
@@ -2956,6 +3180,7 @@ static bool StartTraining(NeuralGraph& graph, bool toTarget)
     }
     if(toTarget) gTrain.totalEpochs = std::max(gTrain.totalEpochs, 200000);
     gTrain.active = true; gTrain.done = false; gTrain.epoch = 0;
+    if(graph.status==NetworkStatus::Trained) graph.status=NetworkStatus::NeedsRetraining;
     gAnimationNeedsResume=true;
     gAnimationDelta=0.0f;
     gPendingWeightRandomization=false;
@@ -3561,6 +3786,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
     std::snprintf(editorTitle, sizeof(editorTitle), "Neural Network (Neurons: %zu)###Neural Editor", nodes.size());
     if(ImGui::Begin(editorTitle, &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus))
     {
+        ImGui::BeginDisabled(gAutoPruneActive);
         gF1WindowWidth=ImGui::GetWindowSize().x;
         gF1WindowHeight=ImGui::GetWindowSize().y;
         gF1WindowPos=ImGui::GetWindowPos();
@@ -3697,7 +3923,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
 
             ImVec2 actMin = actPos;
             ImVec2 actMax = ImVec2(b.x - 8.0f, actPos.y + lh);
-            if(!gTrain.active && !gPendingTopology && !isGRULayer && ImGui::IsMouseHoveringRect(actMin, actMax) &&
+            if(!IsTrainingActive() && !gPendingTopology && !isGRULayer && ImGui::IsMouseHoveringRect(actMin, actMax) &&
                ImGui::IsMouseClicked(ImGuiMouseButton_Left))
             {
                 L.act = NextAct(L.act);
@@ -4352,6 +4578,24 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             ImGui::EndChild();
         }
 
+        // A fixed stamp belongs to the canvas, not the application viewport.
+        std::string statusText=NetworkStatusName(status);
+        if(status==NetworkStatus::Trained && std::isfinite(trainedMSE))
+        {
+            char accuracy[32];
+            std::snprintf(accuracy,sizeof(accuracy)," %.2f%%",AccuracyFromMSE(trainedMSE));
+            statusText+=accuracy;
+        }
+        const ImVec2 textSize=ImGui::CalcTextSize(statusText.c_str());
+        const ImU32 stampColor=status==NetworkStatus::Trained ? IM_COL32(70,220,140,255) : IM_COL32(255,205,55,255);
+        const ImVec2 stampMax(canvasMax.x-12,canvasMax.y-12);
+        const ImVec2 stampMin(stampMax.x-textSize.x-24,stampMax.y-textSize.y-16);
+        dl->PushClipRect(origin,canvasMax,true);
+        dl->AddRectFilled(stampMin,stampMax,IM_COL32(20,24,30,235),4);
+        dl->AddRect(stampMin,stampMax,stampColor,4,0,2);
+        dl->AddText(ImVec2(stampMin.x+12,stampMin.y+8),stampColor,statusText.c_str());
+        dl->PopClipRect();
+
         // Local actions panel
         ImGui::Separator();
         if(ImGui::Checkbox("Live inputs (sin)", &liveInputs) && liveInputs) UseLiveInputs();
@@ -4487,11 +4731,11 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             }
             ImGui::EndTable();
         }
-
+        ImGui::EndDisabled();
     }
     ImGui::End();
     // Selection actions are separate from the neuron properties window.
-    if(multiSelected.size()>1)
+    if(multiSelected.size()>1 && !gAutoPruneActive)
     {
         ImGui::SetNextWindowSize(ImVec2(340,130),ImGuiCond_FirstUseEver);
         if(ImGui::Begin("Neuron selection##F1",nullptr,ImGuiWindowFlags_NoCollapse))
@@ -4574,7 +4818,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         ImGui::End();
     }
     // Independent editor. A two-column layout keeps every label visible.
-    if(selected != -1)
+    if(selected != -1 && !gAutoPruneActive)
     {
         // Enforce usable width even when an older narrow size was saved in imgui.ini.
         // Avoid AlwaysAutoResize: stretch columns cannot determine a sensible width from it.
@@ -4827,12 +5071,13 @@ void Engine::update()
     const float animationDt=(float)std::clamp(timer.dt,0.0,0.1);
     processCamera();
 #ifdef USE_IMGUI
+    UpdateAutoPrune(graph);
     UpdateInference(graph, timer.dt);
     gAnimationDelta=0.0f;
-    if(gTrain.active || gAnimationNeedsResume)
+    if(gTrain.active || gAutoPruneActive || gAnimationNeedsResume)
     {
         // Still update the real clock and input, but never accumulate paused time.
-        gAnimationNeedsResume=gTrain.active;
+        gAnimationNeedsResume=gTrain.active || gAutoPruneActive;
         return;
     }
     gAnimationDelta=animationDt;
@@ -4911,11 +5156,12 @@ static void DrawTrainingHUD()
     ImVec2 pos = ImGui::GetWindowPos();
     ImVec2 siz = ImGui::GetWindowSize();
     gHUDMin = pos; gHUDMax = ImVec2(pos.x+siz.x, pos.y+siz.y); gHUDHasRect = true;
-    ImGui::TextColored(ImVec4(0.9f,0.95f,1.0f,1), "Training in progress");
+    ImGui::TextColored(ImVec4(0.9f,0.95f,1.0f,1), "Training in progress - ESC to Stop at current level / X when no progress");
     ImGui::Separator();
     float last = gTrain.mseHistory.empty()? 0.0f : gTrain.mseHistory.back();
     ImGui::Text("Epoch: %d / %d", gTrain.epoch, gTrain.totalEpochs);
     ImGui::Text("MSE:   %.6f  (target: %s)", last, gTrain.targetMSE>0?std::to_string(gTrain.targetMSE).c_str():"-");
+    ImGui::TextColored(ImVec4(1.0f,0.84f,0.16f,1.0f),"Accuracy: %.2f%%", AccuracyFromMSE(last));
     ImGui::Text("Avg epoch time: %.2f ms", gTrain.avgEpochMs);
     double elapsed = (gTrain.startTime>0.0) ? (nowSeconds()-gTrain.startTime) : 0.0;
     ImGui::Text("Elapsed: %.1f s", elapsed);
@@ -5039,7 +5285,8 @@ void Engine::render()
         ImGui::SetNextWindowSize(ImVec2(350.0f, 270.0f), layCond);
         if(cfg.showUI && gShowNeuralTPanel)
         {
-            ImGui::Begin("Steam Punk Uber Crap Turbine", nullptr, ImGuiWindowFlags_NoCollapse);
+            ImGui::Begin("Turbine/Wind Control", nullptr, ImGuiWindowFlags_NoCollapse);
+            ImGui::BeginDisabled(gAutoPruneActive);
             char title[128];
             std::snprintf(title, sizeof(title), "NeuralT %s | dt: %.3f ms", kAppVersion, timer.dt*1000.0);
             ImGui::TextUnformatted(title);
@@ -5213,7 +5460,7 @@ void Engine::render()
                 ResetInferenceMemory(graph);
                 Logf("All %d input neurons set to zero and live feeds disabled", inputCount);
             }
-
+            ImGui::EndDisabled();
             ImGui::End();
         }
 
@@ -5253,6 +5500,11 @@ void Engine::render()
         }
         else ImGui::SetNextWindowSize(ImVec2(paramsW, paramsH), layCond);
             ImGui::Begin("Training parameters", nullptr, ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoSavedSettings);
+        if(ImGui::BeginTabBar("F4Tabs"))
+        {
+        if(ImGui::BeginTabItem("Training & Lessons"))
+        {
+        ImGui::BeginDisabled(gAutoPruneActive);
         if(!gTrain.active)
         {
             ImGui::BeginDisabled(gPendingTopology.has_value());
@@ -5760,6 +6012,8 @@ void Engine::render()
             for(int i=0;i<showN;i++)
             {
                 ImGui::TableNextRow();
+                if(i==editingLesson)
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,IM_COL32(45,130,190,110));
                 ImGui::TableSetColumnIndex(0); 
                 ImGui::Text("%d", i);
                 auto& s = gDataset[i];
@@ -5828,6 +6082,8 @@ void Engine::render()
                 {
                     // Detail row directly beneath the owning lesson.
                     ImGui::TableNextRow();
+                    if(i==editingLesson)
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,IM_COL32(45,130,190,110));
                     ImGui::TableSetColumnIndex(0);
                     ImGui::TextDisabled("  ");
                     ImGui::TableSetColumnIndex(1);
@@ -5905,6 +6161,16 @@ void Engine::render()
             std::error_code _ec; 
             std::filesystem::create_directories("saved", _ec);
             gShowLoadMenu = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::EndTabItem();
+        }
+        if(ImGui::BeginTabItem("Auto Prune"))
+        {
+            DrawAutoPrunePanel(graph);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
         }
             ImGui::End();
         }
@@ -6067,7 +6333,8 @@ void Engine::render()
         ImGui::BulletText("A                    - add a hidden layer after Input, Hidden or GRU");
         ImGui::BulletText("D                    - remove last neuron from current layer");
         ImGui::BulletText("Delete               - remove current hidden/GRU layer and reconnect neighbours");
-        ImGui::BulletText("Topology changes require confirmation to clear existing lessons and sequence drafts");
+        ImGui::BulletText("Topology changes show one warning until training completes; the canvas stamp tracks the network status");
+        ImGui::BulletText("F4 / Auto Prune - repeated structural pruning with an MSE limit, progress and Stop");
         ImGui::BulletText("X                    - randomize network parameters; during training, continue with the existing MSE history");
         ImGui::BulletText("S                    - save network (open Save dialog)");
         ImGui::BulletText("O                    - load network (open Load dialog)");
@@ -6149,6 +6416,7 @@ void Engine::render()
                 if(!gPendingTopology->replacementLessons.empty())
                     ImGui::Text("Preset lessons to load: %zu.",gPendingTopology->replacementLessons.size());
             }
+            ImGui::TextWrapped("After confirmation, the canvas status will be Need Re-Training. Further topology changes will not repeat this warning until training completes. Incompatible lessons will still be cleared.");
             ImGui::Separator();
             if(ImGui::Button(keepLessons ? "Change topology and keep lessons" : "Change topology and replace lessons"))
             {
@@ -6220,6 +6488,9 @@ void Engine::render()
 
                 if(gTrain.epoch >= gTrain.totalEpochs || targetReached)
                 {
+                    graph.status=NetworkStatus::Trained;
+                    graph.trainedMSE=gTrain.lastMSE;
+                    graph.topologyWarningAcknowledged=false;
                     gTrain.active=false; gTrain.done=true;
                     gShowTrainingWindow = false;
                     gHUDHasRect = false;
@@ -6296,6 +6567,7 @@ void Engine::render()
                 // Summary
                 ImGui::Text("Epoch: %d / %d", gTrain.epoch, gTrain.totalEpochs);
                 ImGui::Text("Final MSE: %.6f  Target: %s", gTrain.lastMSE, gTrain.targetMSE>0?std::to_string(gTrain.targetMSE).c_str():"-");
+                ImGui::Text("Accuracy: %.2f%%", AccuracyFromMSE(gTrain.lastMSE));
                 ImGui::Spacing();
                 // Final MSE plot with axes and legend
                 ImVec2 plotSize(std::max(400.0f, winSz.x - 80.0f), 160.0f);
@@ -6374,7 +6646,7 @@ void Engine::render()
         ImGui::SetCursorPosX((winSz.x - ts.x)*0.5f);
         ImGui::TextUnformatted(titleTop);
         ImGui::SetWindowFontScale(1.4f);
-        const char* status = gTrainInterrupted ? "EMERGENCY PUSSY-BUTTON PRESSED!!!" : (gTargetReachedVisual ? "Target Reached" : "Target Not Reached");
+        const char* status = gTrainInterrupted ? "EMERGENCY STOP - ESC BUTTON PRESSED!" : (gTargetReachedVisual ? "Target Reached" : "Target Not Reached");
         ImVec2 st = ImGui::CalcTextSize(status);
         ImGui::SetCursorPosX((winSz.x - st.x)*0.5f);
         ImGui::TextUnformatted(status);
@@ -6399,6 +6671,7 @@ void Engine::render()
         // Summary
         ImGui::Text("Epoch: %d / %d", gTrain.epoch, gTrain.totalEpochs);
         ImGui::Text("Final MSE: %.6f  Target: %s", gTrain.lastMSE, gTrain.targetMSE>0?std::to_string(gTrain.targetMSE).c_str():"-");
+        ImGui::Text("Accuracy: %.2f%%", AccuracyFromMSE(gTrain.lastMSE));
         ImGui::Spacing();
 
         // Final MSE plot with axes and legend
@@ -6527,6 +6800,12 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
 {
     bool down = action != 0; if(!down) return;
 #ifdef USE_IMGUI
+    if(gAutoPruneActive)
+    {
+        if(key==GLFW_KEY_ESCAPE) FinishAutoPrune(graph,"Stopped. Last accepted round retained.");
+        else if(key==GLFW_KEY_F4 && action==GLFW_PRESS) gShowParamsWindow=!gShowParamsWindow;
+        return;
+    }
     // The modal handles Escape; do not let it close the application or run editor shortcuts.
     if(gPendingTopology) return;
 #endif
@@ -6545,6 +6824,9 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
         if(gTrain.active)
         {
             gTrain.active = false;
+            graph.status=NetworkStatus::Trained;
+            graph.trainedMSE=gTrain.lastMSE;
+            graph.topologyWarningAcknowledged=false;
             gShowTrainingWindow = false;
             gHUDHasRect = false;
             gTrain.done = true;

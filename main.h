@@ -8,12 +8,13 @@
 #include <vector>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <cstdio>
 
 // ─────────────────────────────────────────
 // Paths and version
 // ─────────────────────────────────────────
-inline constexpr const char* kAppVersion             = "v4.1";
+inline constexpr const char* kAppVersion             = "v4.2";
 inline constexpr const char* kEngineConfFile         = "engine.conf";
 inline constexpr const char* kLessonsFile            = "lessons.json";
 inline constexpr const char* kNetworkFile            = "network.json";
@@ -221,8 +222,13 @@ struct NeuronGroup
     bool collapsed = true;
 };
 
+enum class NetworkStatus { NotTrained, Trained, NeedsRetraining };
+
 struct NeuralGraph
 {
+    NetworkStatus status=NetworkStatus::NotTrained;
+    bool topologyWarningAcknowledged=false;
+    float trainedMSE=std::numeric_limits<float>::quiet_NaN();
     std::vector<Neuron> nodes;
     std::vector<Edge> edges;
     std::vector<Layer> layers;
