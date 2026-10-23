@@ -82,6 +82,10 @@ static bool gPauseLiveInference = false;
 static double gInferenceAccumulator = 0.0;
 static bool gInferenceNeedsReset = false;
 static constexpr double kInferenceStepSeconds = 1.0 / 30.0;
+// Decorative animation time excludes training and the first frame after it ends.
+static double gAnimationTime=0.0;
+static float gAnimationDelta=0.0f;
+static bool gAnimationNeedsResume=false;
 
 static void ClearLessonTargets()
 {
@@ -1664,11 +1668,18 @@ template<typename T>
 auto ng_set_bias(T& n, float v) -> decltype(n.bias = v, void()) { n.bias = v; }
 [[maybe_unused]] static void ng_set_bias(...) { /* no bias present */ }
 
-static void NG_RandomizeHidden(NeuralGraph& g, float wRange=1.0f, float bRange=0.5f)
+static void NG_RandomizeHidden(NeuralGraph& g, float wRange=1.0f, float bRange=0.5f,
+                               bool betweenTrainingEpochs=false)
 {
-    if(IsTrainingActive()) { Logf("Stop training before changing the model or lessons."); return; }
-    for(const auto& L : g.layers)
+    if(IsTrainingActive() && !betweenTrainingEpochs) { Logf("Stop training before changing the model or lessons."); return; }
+    for(size_t li=0; li<g.layers.size(); ++li)
     {
+        auto& L=g.layers[li];
+        if(L.kind==LayerKind::GRU)
+        {
+            if(li>0) InitializeGRU(L,(int)g.layers[li-1].nodeIdx.size());
+            continue;
+        }
         if(L.kind != LayerKind::Hidden && L.kind != LayerKind::Output) continue;
         for(int idxN : L.nodeIdx)
         {
@@ -1684,6 +1695,7 @@ static void NG_RandomizeHidden(NeuralGraph& g, float wRange=1.0f, float bRange=0
             }
         }
     }
+    ResetGRUState(g);
 }
 
 const char* ActName(Act a)
@@ -2422,6 +2434,7 @@ struct TrainState
     double startTime=0.0;
 };
 static TrainState gTrain;
+static bool gPendingWeightRandomization=false;
 static bool IsTrainingActive() { return gTrain.active; }
 static std::string gTrainingError;
 
@@ -2904,6 +2917,22 @@ static float EvaluateTrainingMSE(const NeuralGraph& graph, std::string& error)
     return (float)mse;
 }
 
+static bool ApplyPendingWeightRandomization(NeuralGraph& graph)
+{
+    if(!gPendingWeightRandomization) return true;
+    gPendingWeightRandomization=false;
+    if(!gTrain.active) return true;
+    NG_RandomizeHidden(graph,1.0f,0.5f,true);
+    const float mse=EvaluateTrainingMSE(graph,gTrainingError);
+    if(!std::isfinite(mse)) return false;
+    gTrain.lastMSE=mse;
+    // Keep the complete curve and show the jump before the next parameter update.
+    gTrain.mseHistory.push_back(mse);
+    gInferenceNeedsReset=true;
+    Logf("Parameters randomized after epoch %d (X). MSE=%.6f. Training continues.",gTrain.epoch,mse);
+    return true;
+}
+
 static bool StartTraining(NeuralGraph& graph, bool toTarget)
 {
     if(gPendingTopology) { Logf("Resolve the topology change first."); return false; }
@@ -2927,6 +2956,9 @@ static bool StartTraining(NeuralGraph& graph, bool toTarget)
     }
     if(toTarget) gTrain.totalEpochs = std::max(gTrain.totalEpochs, 200000);
     gTrain.active = true; gTrain.done = false; gTrain.epoch = 0;
+    gAnimationNeedsResume=true;
+    gAnimationDelta=0.0f;
+    gPendingWeightRandomization=false;
     gTrain.lastMSE = initialMSE;
     gTrain.mseHistory = {initialMSE};
     gTrain.startTime = nowSeconds(); gTrain.avgEpochMs = 0.0;
@@ -3617,8 +3649,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         float mx = mouse.x - origin.x, my = mouse.y - origin.y;
 
         // layout tick + animation
-        float dt = ImGui::GetIO().DeltaTime;
-        stepLayout(std::max(0.0f, dt), canvasSize.x, canvasSize.y);
+        if(!gTrain.active && gAnimationDelta>0.0f)
+            stepLayout(gAnimationDelta, canvasSize.x, canvasSize.y);
 
         // layer backgrounds + multi‑line headers + click activation
         for(size_t li=0; li<layers.size(); ++li)
@@ -3749,7 +3781,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 ++hiddenLayerCount; hiddenNeuronCount += (int)layer.nodeIdx.size();
             }
 
-            const float pulse = 0.5f + 0.5f*std::sin((float)ImGui::GetTime()*2.0f);
+            const float pulse = 0.5f + 0.5f*std::sin((float)gAnimationTime*2.0f);
             dl->AddCircleFilled(hiddenHub, 37.0f + pulse*3.0f, ImGui::GetColorU32(ImVec4(.18f,.75f,.72f,.12f)), 40);
             dl->AddCircleFilled(hiddenHub, 29.0f, ImGui::GetColorU32(ImVec4(.10f,.16f,.22f,1.0f)), 40);
             dl->AddCircle(hiddenHub, 29.0f, ImGui::GetColorU32(ImVec4(.25f,.95f,.85f,1.0f)), 40, 3.0f);
@@ -3856,7 +3888,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                     1.60f);
 
                 // Pulsing glow
-                float time = (float)ImGui::GetTime();
+                float time = (float)gAnimationTime;
                 float pulse = 0.5f + 0.5f*std::sin(time*2.0f + 0.15f*(float)(A->id + B->id));
                 ImU32 glowCol = ImGui::GetColorU32(ImVec4(r,g,b, 0.18f * pulse));
                 float w1 = std::min(thick * (2.5f + 2.0f*pulse), 3.00f);
@@ -4792,8 +4824,19 @@ bool Engine::init(const AppConfig& cfgIn)
 void Engine::update()
 {
     double t = glfwGetTime(); timer.update(t);
+    const float animationDt=(float)std::clamp(timer.dt,0.0,0.1);
+    processCamera();
 #ifdef USE_IMGUI
     UpdateInference(graph, timer.dt);
+    gAnimationDelta=0.0f;
+    if(gTrain.active || gAnimationNeedsResume)
+    {
+        // Still update the real clock and input, but never accumulate paused time.
+        gAnimationNeedsResume=gTrain.active;
+        return;
+    }
+    gAnimationDelta=animationDt;
+    gAnimationTime+=animationDt;
 #endif
 
     const float targetRpm = cfg.rotate ? turbine.params.rpm : 0.0f;
@@ -4801,7 +4844,7 @@ void Engine::update()
         ? std::max(0.1f, turbine.params.startupTime)
         : std::max(0.1f, turbine.params.shutdownTime);
     const float rpmReference = std::max({1.0f, turbine.params.rpm, turbine.params.current_rpm});
-    const float maxRpmStep = rpmReference * (float)timer.dt / transitionTime;
+    const float maxRpmStep = rpmReference * animationDt / transitionTime;
     const float rpmDifference = targetRpm - turbine.params.current_rpm;
     turbine.params.current_rpm += std::clamp(rpmDifference, -maxRpmStep, maxRpmStep);
     if(std::fabs(rpmDifference) <= maxRpmStep) turbine.params.current_rpm = targetRpm;
@@ -4811,9 +4854,9 @@ void Engine::update()
         : 0.0f;
 
     // Update wind parameter phases for oscillation
-    gWindStrengthPhase += 0.5f * (float)timer.dt;
-    gWindSpeedPhase += 0.4f * (float)timer.dt;
-    gWindJitterPhase += 0.6f * (float)timer.dt;
+    gWindStrengthPhase += 0.5f * animationDt;
+    gWindSpeedPhase += 0.4f * animationDt;
+    gWindJitterPhase += 0.6f * animationDt;
 
     if (gStrengthSineEnabled) 
     {
@@ -4834,9 +4877,8 @@ void Engine::update()
     {
         float rps = turbine.params.current_rpm / 60.0f;
         float radps = rps * 6.28318530718f;
-        rotorAngle += (float)(radps * timer.dt);
+        rotorAngle += radps * animationDt;
     }
-    processCamera();
 }
 
 Mat4 Engine::proj() const 
@@ -5637,10 +5679,11 @@ void Engine::render()
         }
         ImGui::EndDisabled();
         ImGui::Separator();
-        if(ImGui::Button("Randomize Hidden (X)"))
+        if(ImGui::Button("Randomize Parameters (X)"))
         {
             NG_RandomizeHidden(graph, 1.0f, 0.5f);
-            Logf("Hidden layers randomized.");
+            ResetInferenceMemory(graph);
+            Logf("Network parameters randomized.");
         }
 
         ImGui::SameLine();
@@ -6025,7 +6068,7 @@ void Engine::render()
         ImGui::BulletText("D                    - remove last neuron from current layer");
         ImGui::BulletText("Delete               - remove current hidden/GRU layer and reconnect neighbours");
         ImGui::BulletText("Topology changes require confirmation to clear existing lessons and sequence drafts");
-        ImGui::BulletText("X                    - randomize hidden-layer weights");
+        ImGui::BulletText("X                    - randomize network parameters; during training, continue with the existing MSE history");
         ImGui::BulletText("S                    - save network (open Save dialog)");
         ImGui::BulletText("O                    - load network (open Load dialog)");
         ImGui::BulletText("M                    - add a lesson from inputs and applied lesson targets");
@@ -6148,7 +6191,9 @@ void Engine::render()
         {
             double t0 = nowSeconds();
             gInferenceNeedsReset = true;
-            float mse = TrainOneEpoch(graph, gTrain.lr, gTrain.l1, gTrain.l2);
+            float mse = ApplyPendingWeightRandomization(graph)
+                ? TrainOneEpoch(graph, gTrain.lr, gTrain.l1, gTrain.l2)
+                : std::numeric_limits<float>::quiet_NaN();
             if(!std::isfinite(mse))
             {
                 gTrain.active = false;
@@ -6590,9 +6635,15 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     // 'S' handled below with save dialog (opens Save window)
     if(key==GLFW_KEY_X)
     {
-        if(gTrain.active) { Logf("Stop training before randomizing weights."); return; }
+        if(action!=GLFW_PRESS) return;
+        if(gTrain.active)
+        {
+            gPendingWeightRandomization=true;
+            return;
+        }
         NG_RandomizeHidden(graph, 1.0f, 0.5f);
-        Logf("Hidden layers randomized.");
+        ResetInferenceMemory(graph);
+        Logf("Network parameters randomized.");
         return;
     }
     if(key==GLFW_KEY_M)
