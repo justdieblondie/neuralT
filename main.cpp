@@ -4306,7 +4306,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             dl->AddRectFilled(a, b, colBg, 8.0f);
             dl->AddRect(a, b, ImGui::GetColorU32(isGRULayer
                 ? ImVec4(gGRUTheme.unitBorder.x,gGRUTheme.unitBorder.y,gGRUTheme.unitBorder.z,0.95f)
-                : ImVec4(0.35f,0.35f,0.40f,0.9f)), 8.0f, 0, isGRULayer ? 3.0f : 2.0f);
+                : ImVec4(0.35f,0.35f,0.40f,0.9f)), 8.0f, ImDrawFlags_None, isGRULayer ? 3.0f : 2.0f);
 
             // --- 3 header lines:
             float lh = ImGui::GetTextLineHeightWithSpacing();
@@ -4794,7 +4794,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 ImU32 bg = ImGui::GetColorU32(ImVec4(1.0f,0.95f,0.30f,0.90f));
                 ImU32 bd = ImGui::GetColorU32(ImVec4(0.85f,0.75f,0.10f,0.95f));
                 dl->AddRectFilled(r0, r1, bg, 3.0f);
-                dl->AddRect(r0, r1, bd, 3.0f, 0, 1.0f);
+                dl->AddRect(r0, r1, bd, 3.0f, ImDrawFlags_None, 1.0f);
             }
 
             {
@@ -4858,7 +4858,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                 }
 
                 dl->AddRectFilled(pp0, pp1, plotBg, 3.0f);
-                dl->AddRect(pp0, pp1, ImGui::GetColorU32(ImVec4(0.35f,0.35f,0.40f,1.0f)), 3.0f, 0, 1.0f);
+                dl->AddRect(pp0, pp1, ImGui::GetColorU32(ImVec4(0.35f,0.35f,0.40f,1.0f)), 3.0f, ImDrawFlags_None, 1.0f);
                 // Show a flat line at the current input value when live feed is off.
                 // The sequential wave mode animates only its currently active input.
                 const bool waveThisInput = gLiveFeedWaveActive &&
@@ -5008,7 +5008,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         const ImVec2 stampMin(stampMax.x-textSize.x-24,stampMax.y-textSize.y-16);
         dl->PushClipRect(origin,canvasMax,true);
         dl->AddRectFilled(stampMin,stampMax,IM_COL32(20,24,30,235),4);
-        dl->AddRect(stampMin,stampMax,stampColor,4,0,2);
+        dl->AddRect(stampMin, stampMax, stampColor, 4.0f, ImDrawFlags_None, 2.0f);
         dl->AddText(ImVec2(stampMin.x+12,stampMin.y+8),stampColor,statusText.c_str());
         dl->PopClipRect();
 
