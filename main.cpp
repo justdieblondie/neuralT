@@ -1089,10 +1089,6 @@ void TurbineModel::rebuild()
             const Vec3 end{side*bodyR*0.88f,y*0.45f,-bodyR*0.34f};
             addTube(CubicPipe(start,{side*manifoldX,y,0},{side*bodyR*1.45f,end.y,-bodyR*0.65f},end,18),pipeRadius);
         }
-        const Vec3 returnStart{side*manifoldX,-bodyH*1.15f,-manifoldZ};
-        const Vec3 returnEnd{side*bodyR*0.62f,-bodyH*0.34f,bodyR*0.72f};
-        addTube(CubicPipe(returnStart,{side*bodyR*2.7f,-bodyH*1.35f,bodyR*1.1f},
-                               {side*bodyR*1.2f,-bodyH*0.55f,bodyR*1.25f},returnEnd,22),pipeRadius*0.82f);
     }
     addTube(CubicPipe({-manifoldX,bodyH*1.30f,-manifoldZ},{-bodyR*1.8f,bodyH*2.15f,-bodyR*0.4f},
                        {bodyR*1.8f,bodyH*2.15f,-bodyR*0.4f},{manifoldX,bodyH*1.30f,-manifoldZ},26),pipeRadius*0.90f);
@@ -1122,22 +1118,6 @@ void TurbineModel::rebuild()
     }
     pipes.upload();
 
-    // Permanent fine steam traces remain decorative; the old technical-mode
-    // duplicate rendering has been removed.
-    std::vector<Vec3> steamPoints;
-    std::vector<uint32_t> steamIndices;
-    for(int side : {-1,1})
-    {
-        const uint32_t base = (uint32_t)steamPoints.size();
-        for(int i=0;i<=18;++i)
-        {
-            const float t=(float)i/18.0f;
-            steamPoints.push_back({side*(manifoldX+pipeRadius*1.4f),bodyH*(0.4f+1.4f*t),
-                                   -manifoldZ+0.06f*std::sin(t*12.0f)});
-            if(i>0){ steamIndices.push_back(base+i-1); steamIndices.push_back(base+i); }
-        }
-    }
-    schematicLines = Procedural::makeLineList(steamPoints, steamIndices);
 }
 
 void TurbineModel::destroy()
@@ -2788,6 +2768,9 @@ struct EngineConf
     // Camera on Turbinoes 
     float cam_yaw=0.7f, cam_pitch=0.35f, cam_distance=4.0f;
     float cam_tx=0.0f, cam_ty=0.0f, cam_tz=0.0f;
+    float turbine_x=0.0f, turbine_y=0.0f, turbine_z=0.0f;
+    float turbine_pitch=0.0f, turbine_yaw=0.0f;
+    bool show_turbine=true;
 };
 static EngineConf gConf;
 
@@ -2805,11 +2788,27 @@ static bool SaveEngineConf(const char* path)
         document["cam_yaw"]=camera.yaw; document["cam_pitch"]=camera.pitch;
         document["cam_distance"]=camera.distance;
         document["cam_tx"]=camera.target.x; document["cam_ty"]=camera.target.y; document["cam_tz"]=camera.target.z;
+        document["turbine_x"]=gConf.turbine_x; document["turbine_y"]=gConf.turbine_y; document["turbine_z"]=gConf.turbine_z;
+        document["turbine_pitch"]=gConf.turbine_pitch; document["turbine_yaw"]=gConf.turbine_yaw;
+        document["show_turbine"]=gConf.show_turbine;
         RequireJson(camera.distance>0,"Camera distance must be positive");
         WriteJsonAtomic(path,document);
         return true;
     }
     catch(const std::exception& error) { ReportFileError("Config save failed",error); return false; }
+}
+
+static bool SaveTrainingDefaults(const char* path)
+{
+    try
+    {
+        Json document=std::filesystem::exists(path) ? ReadJson(path) : Json{{"engine_version",kAppVersion}};
+        SavedTrainingParams training;
+        training.write(document);
+        WriteJsonAtomic(path,document);
+        return true;
+    }
+    catch(const std::exception& error) { ReportFileError("Training defaults save failed",error); return false; }
 }
 
 static void LoadEngineConf(const char* path)
@@ -2827,7 +2826,15 @@ static void LoadEngineConf(const char* path)
         config.cam_tx=JsonField(document,"cam_tx",config.cam_tx);
         config.cam_ty=JsonField(document,"cam_ty",config.cam_ty);
         config.cam_tz=JsonField(document,"cam_tz",config.cam_tz);
+        config.turbine_x=JsonField(document,"turbine_x",config.turbine_x);
+        config.turbine_y=JsonField(document,"turbine_y",config.turbine_y);
+        config.turbine_z=JsonField(document,"turbine_z",config.turbine_z);
+        config.turbine_pitch=JsonField(document,"turbine_pitch",config.turbine_pitch);
+        config.turbine_yaw=JsonField(document,"turbine_yaw",config.turbine_yaw);
+        config.show_turbine=JsonField(document,"show_turbine",config.show_turbine);
         RequireJson(config.cam_distance>0,"Camera distance must be positive");
+        RequireJson(std::isfinite(config.turbine_x) && std::isfinite(config.turbine_y) && std::isfinite(config.turbine_z) &&
+                    std::isfinite(config.turbine_pitch) && std::isfinite(config.turbine_yaw),"Turbine transform must be finite");
         config.lr=training.lr; config.l1=training.l1; config.l2=training.l2; config.epochs=training.epochs;
         gConf=std::move(config); training.apply();
         if(gEngine)
@@ -4476,9 +4483,10 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         for(auto& e: edges)
         {
             // The Video Screen can contain thousands of virtual output
-            // neurons. Hide only its dense incoming edges; connections
-            // between the visible Input and Hidden layers must remain drawn.
-            if(virtualScreen && (virtualOutputIds.count(e.a) || virtualOutputIds.count(e.b))) continue;
+            // neurons. Draw the actual weights entering its representative
+            // hub, but hide the dense edges leading to the other pixels.
+            if(virtualScreen && (virtualOutputIds.count(e.a) ||
+                                 (virtualOutputIds.count(e.b) && e.b!=virtualHubId))) continue;
             Neuron* A = findById(e.a);
             Neuron* B = findById(e.b);
             if(!A||!B) continue;
@@ -4488,7 +4496,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             if(collapseHiddenLayers) continue;
             const Layer* layerA = findLayerForNode(ai);
             const Layer* layerB = findLayerForNode(bi);
-            if(layerA && layerB)
+            const bool videoScreenHubEdge=virtualScreen && e.b==virtualHubId;
+            if(layerA && layerB && !videoScreenHubEdge)
             {
                 const size_t connectionCount = layerA->nodeIdx.size() * layerB->nodeIdx.size();
                 const size_t visualStride = std::max<size_t>(1, connectionCount / 600);
@@ -4594,35 +4603,6 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                         inv*inv*inv*p1.y + 3*inv*inv*flow*c1.y + 3*inv*flow*flow*c2.y + flow*flow*flow*p2.y);
                     dl->AddCircleFilled(particle, 2.8f, ImGui::GetColorU32(ImVec4(
                         gGRUTheme.particle.x,gGRUTheme.particle.y,gGRUTheme.particle.z,0.95f)), 10);
-                }
-            }
-        }
-
-        // A large Video Screen output layer is deliberately virtual on the
-        // canvas.  Its dense weights still exist for inference and training,
-        // but the editor draws one aggregate flow instead of every edge.
-        if(virtualScreen && virtualHubId>=0)
-        {
-            Neuron* hub=findById(virtualHubId);
-            const Layer* sourceLayer=nullptr;
-            for(auto it=layers.rbegin();it!=layers.rend();++it)
-                if(it->kind!=LayerKind::Output && !it->nodeIdx.empty()) { sourceLayer=&*it; break; }
-            if(hub && sourceLayer)
-            {
-                ImVec2 source(0,0); int visibleCount=0;
-                for(int idx:sourceLayer->nodeIdx)
-                {
-                    if(idx<0 || idx>=(int)nodes.size()) continue;
-                    source.x+=nodes[idx].x; source.y+=nodes[idx].y; ++visibleCount;
-                }
-                if(visibleCount>0)
-                {
-                    source.x=origin.x+source.x/(float)visibleCount;
-                    source.y=origin.y+source.y/(float)visibleCount;
-                    ImVec2 target(origin.x+hub->x,origin.y+hub->y);
-                    dl->AddBezierCubic(source,ImVec2(source.x+55.0f,source.y),
-                        ImVec2(target.x-55.0f,target.y),target,
-                        ImGui::GetColorU32(ImVec4(.25f,.95f,.82f,.70f)),2.0f);
                 }
             }
         }
@@ -5036,8 +5016,6 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         ImGui::Separator();
         if(ImGui::Checkbox("Live inputs (sin)", &liveInputs) && liveInputs) UseLiveInputs();
         ImGui::SameLine();
-        if(ImGui::Button("Relayout")){ layoutLayers(canvasSize.x, canvasSize.y); }
-        ImGui::SameLine();
         ImGui::BeginDisabled(gTrain.active || gPendingTopology.has_value());
         if(ImGui::Button("Add GRU layer")){ NG_InsertGRUAfterCurrent(*this); }
         ImGui::SameLine();
@@ -5414,7 +5392,12 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                         {
                             sel->value = pendingVal;
                             UseManualInputs(*this);
-                            if(!gTrain.active) ForwardPass(*this, false);
+                            if(!gTrain.active)
+                            {
+                                ResetGRUState(*this);
+                                gInferenceNeedsReset=false;
+                                ForwardPass(*this, true);
+                            }
                         }
                         nextField("Speed (Hz)");
                         if(ImGui::SliderFloat("##neuron_speed", &pendingSpeed, 0.0f, 1.0f, "%.3f"))
@@ -5824,31 +5807,32 @@ void Engine::render()
     const Vec3 rotorBronze{0.58f, 0.34f, 0.14f};
     const Vec3 pipeCopper{0.55f, 0.25f, 0.10f};
     const Vec3 gearSteel{0.28f, 0.31f, 0.33f};
-    const Vec3 steamColor{0.72f, 0.84f, 0.88f};
 
-    Mat4 Mshaft = Mat4::translate({0,0,0});
+    const Mat4 Mturbine = Mat4::translate({gConf.turbine_x,gConf.turbine_y,gConf.turbine_z}) *
+                          Mat4::rotateY(gConf.turbine_yaw) * Mat4::rotateX(gConf.turbine_pitch);
+    if(gConf.show_turbine)
+    {
+    Mat4 Mshaft = Mturbine;
     renderer.drawMesh(turbine.shaft, VP*Mshaft, Mshaft, shaftSteel, 0.32f);
 
     // Draw full rotor as one rotating assembly around Y axis at origin
-    Mat4 Mrotor = Mat4::rotateY(rotorAngle);
+    Mat4 Mrotor = Mturbine * Mat4::rotateY(rotorAngle);
     renderer.drawMesh(turbine.rotor, VP*Mrotor, Mrotor, rotorBronze, 0.52f);
 
     // Draw static pipes
-    Mat4 Mpipes = Mat4::translate({0,0,0});
+    Mat4 Mpipes = Mturbine;
     renderer.drawMesh(turbine.pipes, VP*Mpipes, Mpipes, pipeCopper, 0.42f);
-
-    // Steam lines (stylized) - always visible
-    renderer.drawLines(turbine.schematicLines, VP, steamColor, 2.0f);
 
     // Draw meshing outer gears (counter-rotating), translated on X (left and right)
     float ratioL = (turbine.outerTeeth>0)? (turbine.rotorTeeth / (float)turbine.outerTeeth) : 1.0f;
     const float meshPhaseL = 3.1415926535f / std::max(1, turbine.outerTeeth);
-    Mat4 MouterL = Mat4::translate({turbine.outerGearOffset, 0, 0}) * Mat4::rotateY(-rotorAngle*ratioL + meshPhaseL);
+    Mat4 MouterL = Mturbine * Mat4::translate({turbine.outerGearOffset, 0, 0}) * Mat4::rotateY(-rotorAngle*ratioL + meshPhaseL);
     renderer.drawMesh(turbine.outerGear, VP*MouterL, MouterL, gearSteel, 0.58f);
     float ratioR = (turbine.outerTeethR>0)? (turbine.rotorTeeth / (float)turbine.outerTeethR) : 1.0f;
     const float meshPhaseR = 3.1415926535f / std::max(1, turbine.outerTeethR);
-    Mat4 MouterR = Mat4::translate({turbine.outerGearOffsetR, 0, 0}) * Mat4::rotateY(-rotorAngle*ratioR + meshPhaseR);
+    Mat4 MouterR = Mturbine * Mat4::translate({turbine.outerGearOffsetR, 0, 0}) * Mat4::rotateY(-rotorAngle*ratioR + meshPhaseR);
     renderer.drawMesh(turbine.outerGearR, VP*MouterR, MouterR, gearSteel, 0.58f);
+    }
 
 #ifdef USE_IMGUI
     ImGui_ImplOpenGL3_NewFrame();
@@ -5871,7 +5855,7 @@ void Engine::render()
         // Top-right: NeuralT control panel
         ImGuiCond layCond = gForceRelayoutWindows ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
         ImGui::SetNextWindowPos(ImVec2(disp.x - 360.0f, 10.0f), layCond);
-        ImGui::SetNextWindowSize(ImVec2(350.0f, 270.0f), layCond);
+        ImGui::SetNextWindowSize(ImVec2(350.0f, 390.0f), layCond);
         if(cfg.showUI && gShowNeuralTPanel)
         {
             ImGui::Begin("Turbine/Wind Control", nullptr, ImGuiWindowFlags_NoCollapse);
@@ -5888,6 +5872,15 @@ void Engine::render()
             ImGui::Text("Current RPM: %.1f", turbine.params.current_rpm);
             int blades = turbine.params.blades;
             if(ImGui::SliderInt("Blades", &blades, 1, 10)){ turbine.params.blades = blades; turbine.rebuild(); }
+            ImGui::Separator();
+            ImGui::TextUnformatted("Turbine transform");
+            ImGui::SliderFloat("Position X", &gConf.turbine_x, -10.0f, 10.0f, "%.2f");
+            ImGui::SliderFloat("Position Y", &gConf.turbine_y, -10.0f, 10.0f, "%.2f");
+            ImGui::SliderFloat("Position Z", &gConf.turbine_z, -10.0f, 10.0f, "%.2f");
+            ImGui::SliderAngle("Pitch", &gConf.turbine_pitch, -180.0f, 180.0f);
+            ImGui::SliderAngle("Yaw", &gConf.turbine_yaw, -180.0f, 180.0f);
+            ImGui::Checkbox("Show turbine", &gConf.show_turbine);
+            if(ImGui::Button("Save Config") && SaveEngineConf("engine.conf")) Logf("Config saved: engine.conf");
             ImGui::Separator();
             ImGui::Text("Wind Effect");
 
@@ -6353,7 +6346,8 @@ void Engine::render()
             if(ImGui::Button("Train To Target (T)")) StartTraining(graph, true);
 
             ImGui::SameLine();
-            if(ImGui::Button("Save Config") && SaveEngineConf("engine.conf")) Logf("Config saved: engine.conf");
+            if(ImGui::Button("Save as default settings") && SaveTrainingDefaults("engine.conf"))
+                Logf("Training defaults saved: engine.conf");
             ImGui::EndDisabled();
         }
         else
@@ -7060,7 +7054,7 @@ void Engine::render()
         ImGui::BulletText("F6                   - Video Screen settings");
         ImGui::BulletText("[ / ]                - previous / next layer");
         ImGui::BulletText("1..9                 - select layer by index");
-        ImGui::BulletText("Ctrl+N               - new network (keep Input and Output only)");
+        ImGui::BulletText("Ctrl+N               - new empty canvas (Input and Output layers only)");
         ImGui::BulletText("N                    - add neuron to current layer");
         ImGui::BulletText("A                    - add a hidden layer after Input, Hidden or GRU");
         ImGui::BulletText("D                    - remove last neuron from current layer");
@@ -7660,13 +7654,15 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     if(key==GLFW_KEY_N && (mods & GLFW_MOD_CONTROL))
     {
         if(gTrain.active){ Logf("Stop training before creating a new network."); return; }
-        // Preserve the number of input/output neurons, but discard all hidden/GRU
-        // layers, their weights and state, and rebuild direct Input -> Output edges.
-        const int inputCount = !graph.layers.empty() ? (int)graph.layers.front().nodeIdx.size() : 3;
-        const int outputCount = graph.layers.size() >= 2 ? (int)graph.layers.back().nodeIdx.size() : 3;
+        // Keep only the empty Input and Output layer shells required by the editor.
         NeuralGraph candidate;
-        NG_BuildTopology(candidate, std::max(1,inputCount), {}, std::max(1,outputCount));
-        NG_RequestTopology(graph,std::move(candidate));
+        NG_BuildTopology(candidate, 0, {}, 0);
+        NG_RequestTopology(graph,std::move(candidate),{},[]()
+        {
+            gDataset.clear(); gLessonsCount=0; gSequenceDraft.clear();
+            ++gDatasetRevision; ClearLessonTargets();
+            gVideoScreenLessonMessage.clear();
+        });
         return;
     }
     if(key==GLFW_KEY_N){ NG_AddNeuron(graph, graph.currentLayer); return; }
