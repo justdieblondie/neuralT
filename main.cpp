@@ -5163,7 +5163,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
                     ImGui::PopID();
                     break;
                 }
-                if(ImGui::BeginPopupModal("Rename group",nullptr,ImGuiWindowFlags_AlwaysAutoResize))
+                bool renameOpen=true;
+                if(ImGui::BeginPopupModal("Rename group",&renameOpen,ImGuiWindowFlags_AlwaysAutoResize))
                 {
                     ImGui::InputText("Name",renameGroupBuf,IM_ARRAYSIZE(renameGroupBuf));
                     if(ImGui::Button("Save") && renameGroupBuf[0])
@@ -5214,7 +5215,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
     if(multiSelected.size()>1 && !gAutoPruneActive)
     {
         ImGui::SetNextWindowSize(ImVec2(340,130),ImGuiCond_FirstUseEver);
-        if(ImGui::Begin("Neuron selection##F1",nullptr,ImGuiWindowFlags_NoCollapse))
+        bool selectionOpen=true;
+        if(ImGui::Begin("Neuron selection##F1",&selectionOpen,ImGuiWindowFlags_NoCollapse))
         {
             ImGui::Text("Selected neurons: %zu",multiSelected.size());
             if(ImGui::Button("Group"))
@@ -5294,7 +5296,8 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             }
             ImGui::TextDisabled("Ctrl+click to add or remove neurons.");
             static char groupName[128]="";
-            if(ImGui::BeginPopupModal("Name neuron group",nullptr,ImGuiWindowFlags_AlwaysAutoResize))
+            bool groupNameOpen=true;
+            if(ImGui::BeginPopupModal("Name neuron group",&groupNameOpen,ImGuiWindowFlags_AlwaysAutoResize))
             {
                 if(ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
                 const bool confirmGroupName = ImGui::InputText("Group name",groupName,IM_ARRAYSIZE(groupName),ImGuiInputTextFlags_EnterReturnsTrue);
@@ -5341,6 +5344,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
             }
         }
         ImGui::End();
+        if(!selectionOpen) { multiSelected.clear(); selected=-1; }
     }
     // Independent editor. A two-column layout keeps every label visible.
     if(selected != -1 && !gAutoPruneActive)
@@ -5709,19 +5713,20 @@ static bool gHUDHasRect = false;
 // Overlay training HUD in the center while training
 static void DrawTrainingHUD()
 {
-    if(!gTrain.active) return;
+    gHUDHasRect=false;
+    if(!gTrain.active || !gShowTrainingWindow) return;
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 sz = io.DisplaySize;
     ImVec2 winSz(640, std::min(520.0f,ImGui::GetMainViewport()->WorkSize.y));
     ImGui::SetNextWindowPos(ImVec2((sz.x-winSz.x)*0.5f, (sz.y-winSz.y)*0.5f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(winSz, ImGuiCond_Always);
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
-    ImGui::Begin("Training HUD", nullptr, flags);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::Begin("Training HUD", &gShowTrainingWindow, flags);
 
     // capture rect for overlay hole
     ImVec2 pos = ImGui::GetWindowPos();
     ImVec2 siz = ImGui::GetWindowSize();
-    gHUDMin = pos; gHUDMax = ImVec2(pos.x+siz.x, pos.y+siz.y); gHUDHasRect = true;
+    gHUDMin = pos; gHUDMax = ImVec2(pos.x+siz.x, pos.y+siz.y); gHUDHasRect = gShowTrainingWindow;
     ImGui::TextColored(ImVec4(0.9f,0.95f,1.0f,1), "Training in progress - ESC to Stop at current level / X when no progress");
     ImGui::Separator();
     float last = gTrain.mseHistory.empty()? 0.0f : gTrain.mseHistory.back();
@@ -5888,8 +5893,7 @@ void Engine::render()
         float neH = std::max(300.0f, disp.y * 0.62f);
         if(gShowEditorWindow)
         {
-            bool openNe = true;
-            graph.drawCanvas(openNe, neW - 20.0f, neH - 20.0f);
+            graph.drawCanvas(gShowEditorWindow, neW - 20.0f, neH - 20.0f);
         }
 
         // Top-right: NeuralT control panel
@@ -5898,7 +5902,7 @@ void Engine::render()
         ImGui::SetNextWindowSize(ImVec2(350.0f, 390.0f), layCond);
         if(cfg.showUI && gShowNeuralTPanel)
         {
-            ImGui::Begin("Turbine/Wind Control", nullptr, ImGuiWindowFlags_NoCollapse);
+            ImGui::Begin("Turbine/Wind Control", &gShowNeuralTPanel, ImGuiWindowFlags_NoCollapse);
             ImGui::BeginDisabled(gAutoPruneActive);
             char title[128];
             std::snprintf(title, sizeof(title), "NeuralT %s | dt: %.3f ms", kAppVersion, timer.dt*1000.0);
@@ -6094,7 +6098,7 @@ void Engine::render()
         {
         ImGui::SetNextWindowPos(ImVec2(10.0f, neH), layCond);
         ImGui::SetNextWindowSize(ImVec2(logW, logH), layCond);
-            ImGui::Begin("Log", nullptr, ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoSavedSettings);
+            ImGui::Begin("Log", &gShowLogWindow, ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoSavedSettings);
             ImGui::Text("Lessons: %d", gLessonsCount);
             ImGui::Separator();
             ImGui::BeginChild("log_scroller", ImVec2(0, -28), true, ImGuiWindowFlags_HorizontalScrollbar);
@@ -6249,7 +6253,7 @@ void Engine::render()
             gSizeF4FromF1=false;
         }
         else ImGui::SetNextWindowSize(ImVec2(paramsW, paramsH), layCond);
-            ImGui::Begin("Training parameters", nullptr, ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoSavedSettings);
+            ImGui::Begin("Training parameters", &gShowParamsWindow, ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoSavedSettings);
         if(ImGui::BeginTabBar("F4Tabs"))
         {
         if(ImGui::BeginTabItem("Training & Lessons"))
@@ -6400,6 +6404,7 @@ void Engine::render()
         else
         {
             ImGui::TextDisabled("Training in progress...");
+            if(!gShowTrainingWindow && ImGui::Button("Show training window")) gShowTrainingWindow=true;
             if(ImGui::Button("Stop"))
             {
                 InterruptTraining(graph);
@@ -7231,7 +7236,8 @@ Add varied middle steps and lengths; check unseen sequences.
         }
 
     if(gExitRequested && gNetworkDirty) ImGui::OpenPopup("Save before exit###SaveBeforeExit");
-    if(ImGui::BeginPopupModal("Save before exit###SaveBeforeExit",nullptr,ImGuiWindowFlags_AlwaysAutoResize))
+    bool saveBeforeExitOpen=true;
+    if(ImGui::BeginPopupModal("Save before exit###SaveBeforeExit",&saveBeforeExitOpen,ImGuiWindowFlags_AlwaysAutoResize))
     {
         ImGui::TextUnformatted("Save the current network before exiting?");
         ImGui::TextDisabled("Save creates a timestamped JSON file in saved/.");
@@ -7266,13 +7272,16 @@ Add varied middle steps and lengths; check unseen sequences.
         glfwSetWindowShouldClose((GLFWwindow*)window,GLFW_TRUE);
     }
 
+    if(!saveBeforeExitOpen) gExitRequested=false;
+
     if(gOpenTopologyPopup)
     {
         ImGui::OpenPopup("Topology change###TopologyChange");
         gOpenTopologyPopup=false;
     }
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),ImGuiCond_Appearing,ImVec2(0.5f,0.5f));
-    if(ImGui::BeginPopupModal("Topology change###TopologyChange",nullptr,ImGuiWindowFlags_AlwaysAutoResize))
+    bool topologyOpen=true;
+    if(ImGui::BeginPopupModal("Topology change###TopologyChange",&topologyOpen,ImGuiWindowFlags_AlwaysAutoResize))
     {
         if(gPendingTopology)
         {
@@ -7312,6 +7321,8 @@ Add varied middle steps and lengths; check unseen sequences.
         ImGui::EndPopup();
     }
 
+    if(!topologyOpen) gPendingTopology.reset();
+
     // Toast overlay
     if(!gToastMsg.empty())
     {
@@ -7320,9 +7331,11 @@ Add varied middle steps and lengths; check unseen sequences.
         {
             ImGui::SetNextWindowBgAlpha(0.92f);
             ImGui::SetNextWindowPos(ImVec2(18, 18), ImGuiCond_Always);
-            ImGui::Begin("Message", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings);
+            bool messageOpen=true;
+            ImGui::Begin("Message", &messageOpen, ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings);
             ImGui::TextUnformatted(gToastMsg.c_str());
             ImGui::End();
+            if(!messageOpen) gToastMsg.clear();
         }
     }
 
@@ -7415,7 +7428,7 @@ Add varied middle steps and lengths; check unseen sequences.
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18,16));
                 ImVec4 bg = gTargetReachedVisual ? ImVec4(0.12f,0.55f,0.22f,0.95f) : ImVec4(0.90f,0.55f,0.15f,0.95f);
                 ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
-                ImGui::Begin("TrainingResult", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoInputs);
+                ImGui::Begin("TrainingResult", &gCelebrationVisible, ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoMove);
                 // Result title and status distinguish completion from interruption
                 ImGui::SetWindowFontScale(3.0f);
                 const char* titleTop = gTrainInterrupted ? "Training Interrupted" : "Training Finished";
@@ -7518,7 +7531,7 @@ Add varied middle steps and lengths; check unseen sequences.
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18,16));
         ImVec4 bg = gTargetReachedVisual ? ImVec4(0.12f,0.55f,0.22f,0.95f) : ImVec4(0.90f,0.55f,0.15f,0.95f);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
-        ImGui::Begin("TrainingResult", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoInputs);
+        ImGui::Begin("TrainingResult", &gCelebrationVisible, ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoMove);
         
         // Result title and status distinguish completion from interruption
         ImGui::SetWindowFontScale(3.0f);
