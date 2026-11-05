@@ -61,6 +61,7 @@ extern Engine* gEngine;
 #ifdef USE_IMGUI
 static bool IsTrainingActive();
 static bool gShowHelp = false;
+static ImFont* gHelpMonoFont = nullptr;
 static std::string gToastMsg; 
 static double gToastT=0.0; 
 static bool gShowTrainingWindow=false;
@@ -119,7 +120,7 @@ static const char* NetworkStatusName(NetworkStatus status)
     }
 }
 
-static float AccuracyFromMSE(float mse)
+static float TrainingScoreFromMSE(float mse)
 {
     return std::isfinite(mse) ? 100.0f*std::clamp(1.0f-mse,0.0f,1.0f) : 0.0f;
 }
@@ -2025,7 +2026,7 @@ struct SavedTrainingParams
     void read(const Json& document)
     {
         lr=JsonField(document,"learning_rate",lr); l1=JsonField(document,"l1",l1);
-        l2=JsonField(document,"l2",l2); target=JsonField(document,"target_mse",target);
+        l2=JsonField(document,"l2",l2); target=JsonField(document,"target_mse",0.01f);
         epochs=JsonField(document,"epochs",epochs);
         RequireJson(std::isfinite(lr) && std::isfinite(l1) && std::isfinite(l2) && std::isfinite(target) &&
                     lr>0 && l1>=0 && l2>=0 && epochs>0, "Invalid training parameters");
@@ -2724,10 +2725,11 @@ struct TrainState
     float lr=0.003f;
     float l1=0.0003f;
     float l2=0.0005f;
-    float targetMSE=0.004f; // <=0 means ignore
+    float targetMSE=0.01f; // <=0 means ignore
     float lastMSE=0.0f;
     std::vector<float> mseHistory;
     double avgEpochMs=0.0;
+    double epochStartTime=0.0;
     double startTime=0.0;
     size_t sampleCursor=0;
 };
@@ -3334,6 +3336,7 @@ static bool StartAutoPrune(NeuralGraph& graph,float tolerance)
     gAutoPrune=AutoPruneState{};
     auto& p=gAutoPrune;
     p.tolerance=tolerance; p.accepted=graph; p.evaluation=graph; p.lessons=gDataset;
+    InvalidateGraphCache();
     p.startedAt=std::chrono::steady_clock::now();
     p.evaluating=true; p.report="Evaluating baseline MSE...";
     seqPlaying=false;
@@ -3379,6 +3382,7 @@ static void UpdateAutoPrune(NeuralGraph& graph)
             NG_PreserveTopologyParameters(p.accepted,p.evaluation);
             std::string error;
             if(!NG_ValidateTopology(p.evaluation,error)) {++p.candidate;continue;}
+            InvalidateGraphCache();
             p.lesson=0; p.frame=0; p.sum=0; p.evaluating=true;
         }
         const auto& lesson=p.lessons[p.lesson];
@@ -3529,12 +3533,43 @@ static bool StartTraining(NeuralGraph& graph, bool toTarget)
     gPendingWeightRandomization=false;
     gTrain.lastMSE = initialMSE;
     gTrain.mseHistory = {initialMSE};
-    gTrain.startTime = nowSeconds(); gTrain.avgEpochMs = 0.0;
+    gTrain.startTime = nowSeconds(); gTrain.avgEpochMs = 0.0; gTrain.epochStartTime=0.0;
     gCelebrationVisible = false; gTargetReachedVisual = false; gTrainInterrupted = false;
     gShowTrainingWindow = true;
     Logf("Training started: epochs=%d, lr=%.6f, L1=%.6f, L2=%.6f, targetMSE=%.6f, initialMSE=%.6f",
          gTrain.totalEpochs, gTrain.lr, gTrain.l1, gTrain.l2, gTrain.targetMSE, initialMSE);
     return true;
+}
+
+// Re-evaluate the retained weights, including updates from an incomplete epoch.
+static void InterruptTraining(NeuralGraph& graph)
+{
+    gTrain.active=false;
+    gPendingWeightRandomization=false;
+    graph.status=NetworkStatus::NeedsRetraining;
+    graph.trainedMSE=std::numeric_limits<float>::quiet_NaN();
+    gTrainingError.clear();
+    const float mse=EvaluateTrainingMSE(graph,gTrainingError);
+    if(std::isfinite(mse))
+    {
+        gTrain.lastMSE=mse;
+        gTrain.mseHistory.push_back(mse);
+        Logf("Training interrupted after %d complete epochs; retained weights MSE=%.6f",gTrain.epoch,mse);
+        gTrain.done=true;
+        gCelebrationVisible=true;
+    }
+    else
+    {
+        gTrain.done=false;
+        gCelebrationVisible=false;
+        gToastMsg="Training interrupted; current MSE unavailable: "+gTrainingError;
+        gToastT=nowSeconds();
+        Logf("%s",gToastMsg.c_str());
+    }
+    gTargetReachedVisual=false;
+    gTrainInterrupted=true;
+    gInferenceNeedsReset=true;
+    MarkNetworkDirty();
 }
 
 static float sgn(float x){ return (x>0)-(x<0); }
@@ -4999,7 +5034,7 @@ void NeuralGraph::drawCanvas(bool& open, float width, float height)
         if(status==NetworkStatus::Trained && std::isfinite(trainedMSE))
         {
             char accuracy[32];
-            std::snprintf(accuracy,sizeof(accuracy)," %.2f%%",AccuracyFromMSE(trainedMSE));
+            std::snprintf(accuracy,sizeof(accuracy)," | Score: %.2f%%",TrainingScoreFromMSE(trainedMSE));
             statusText+=accuracy;
         }
         const ImVec2 textSize=ImGui::CalcTextSize(statusText.c_str());
@@ -5561,6 +5596,8 @@ bool Engine::init(const AppConfig& cfgIn)
     ImGui_ImplGlfw_InitForOpenGL((GLFWwindow*)window, true);
     ImGui_ImplOpenGL3_Init("#version 330 core");
     SetupDefaultFonts(16.0f);
+    // ImGui's embedded default font has fixed-width ASCII glyphs.
+    gHelpMonoFont=ImGui::GetIO().Fonts->AddFontDefault();
     // Fonts configured by SetupDefaultFonts()
 
     NG_BuildDinosaur(graph);
@@ -5675,7 +5712,7 @@ static void DrawTrainingHUD()
     if(!gTrain.active) return;
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 sz = io.DisplaySize;
-    ImVec2 winSz(560, 360);
+    ImVec2 winSz(640, std::min(520.0f,ImGui::GetMainViewport()->WorkSize.y));
     ImGui::SetNextWindowPos(ImVec2((sz.x-winSz.x)*0.5f, (sz.y-winSz.y)*0.5f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(winSz, ImGuiCond_Always);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
@@ -5690,8 +5727,11 @@ static void DrawTrainingHUD()
     float last = gTrain.mseHistory.empty()? 0.0f : gTrain.mseHistory.back();
     ImGui::Text("Epoch: %d / %d", gTrain.epoch, gTrain.totalEpochs);
     ImGui::Text("Lesson: %zu / %zu", std::min(gTrain.sampleCursor+1,gDataset.size()), gDataset.size());
-    ImGui::Text("MSE:   %.6f  (target: %s)", last, gTrain.targetMSE>0?std::to_string(gTrain.targetMSE).c_str():"-");
-    ImGui::TextColored(ImVec4(1.0f,0.84f,0.16f,1.0f),"Accuracy: %.2f%%", AccuracyFromMSE(last));
+    ImGui::Text("MSE: %.6f | Target MSE: %s", last, gTrain.targetMSE>0?std::to_string(gTrain.targetMSE).c_str():"Off");
+    ImGui::TextColored(ImVec4(1.0f,0.84f,0.16f,1.0f),"Training score: %.2f%%", TrainingScoreFromMSE(last));
+    if(gTrain.targetMSE>0) ImGui::Text("Target score: %.2f%%",TrainingScoreFromMSE(gTrain.targetMSE));
+    else ImGui::TextUnformatted("Target score: Off");
+    ImGui::Text("Learning rate: %.6g | L1: %.6g | L2: %.6g",gTrain.lr,gTrain.l1,gTrain.l2);
     ImGui::Text("Avg epoch time: %.2f ms", gTrain.avgEpochMs);
     const unsigned long long elapsedSeconds=(unsigned long long)std::max(0.0,
         gTrain.startTime>0.0 ? nowSeconds()-gTrain.startTime : 0.0);
@@ -5746,7 +5786,7 @@ static void DrawTrainingHUD()
         float pct = 0.0f;
         if(gTrain.totalEpochs > 0) pct = std::clamp(gTrain.epoch / (float)std::max(1, gTrain.totalEpochs), 0.0f, 1.0f);
         ImGui::Spacing();
-        char pbuf[32]; std::snprintf(pbuf, sizeof(pbuf), "%d%%", (int)std::round(pct*100.0f));
+        char pbuf[32]; std::snprintf(pbuf, sizeof(pbuf), "Epochs: %d%%", (int)std::round(pct*100.0f));
         ImGui::ProgressBar(pct, ImVec2(-1, 0), pbuf);
     }
         
@@ -6223,6 +6263,13 @@ void Engine::render()
             ImGui::SliderFloat("L1", &gTrain.l1, 0.0f, 0.1f, "%.6f", ImGuiSliderFlags_Logarithmic);
             ImGui::SliderFloat("L2", &gTrain.l2, 0.0f, 0.1f, "%.6f", ImGuiSliderFlags_Logarithmic);
             ImGui::InputFloat("Target MSE (<=0 off)", &gTrain.targetMSE, 0.0f, 0.0f, "%.6f");
+            float targetScore=TrainingScoreFromMSE(gTrain.targetMSE);
+            if(ImGui::InputFloat("Target score (%)",&targetScore,0.0f,0.0f,"%.2f") && std::isfinite(targetScore))
+            {
+                targetScore=std::clamp(targetScore,0.0f,99.99f);
+                gTrain.targetMSE=1.0f-targetScore/100.0f;
+            }
+
             ImGui::Separator();
             // Row 1: presets, help, training controls and config.
             if(ImGui::Button("Rabbit Example"))
@@ -6355,22 +6402,10 @@ void Engine::render()
             ImGui::TextDisabled("Training in progress...");
             if(ImGui::Button("Stop"))
             {
-                gTrain.active = false;
-                gTrain.done = true;
-
-                // Ensure any dimming overlay and HUD are cleared when stopping
-                gShowTrainingWindow = false;
-                gHUDHasRect = false;
-
-                // Show result window until confirmed
-                extern bool gCelebrationVisible; // already static above in same TU
-                extern bool gTargetReachedVisual;
-                extern bool gTrainInterrupted;
-                gCelebrationVisible = true;
-                gTargetReachedVisual = false;
-                gTrainInterrupted = true;
+                InterruptTraining(graph);
+                gShowTrainingWindow=false;
+                gHUDHasRect=false;
                 SaveEngineConf("engine.conf");
-                Logf("Training stopped at epoch %d (MSE=%.6f).", gTrain.epoch, gTrain.lastMSE);
             }
         }
 
@@ -7029,18 +7064,13 @@ void Engine::render()
     // Help overlay (keybinds + quick start)
     if(gShowHelp)
     {
-        ImGui::SetNextWindowBgAlpha(0.92f);
-        ImGui::SetNextWindowPos(ImVec2(18, 18), ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(0.92f);
-        ImVec2 helpCenter = ImGui::GetMainViewport()->GetCenter();
-        ImGui::SetNextWindowPos(helpCenter, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-        
-        ImGui::SetNextWindowBgAlpha(0.92f);
-
-        ImGui::SetNextWindowPos(helpCenter, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowBgAlpha(0.96f);
+        const ImGuiViewport* viewport=ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->GetCenter(),ImGuiCond_Appearing,ImVec2(0.5f,0.5f));
+        ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x*0.85f,viewport->WorkSize.y*0.85f),ImGuiCond_Always);
         ImGui::Begin("Help & Shortcuts", &gShowHelp,
-            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize |
-            ImGuiWindowFlags_NoSavedSettings);
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::PushTextWrapPos(0.0f);
         char help_title[128];
         std::snprintf(help_title, sizeof(help_title), "NeuralT - Help & Shortcuts (%s)", kAppVersion);
         ImGui::TextColored(ImVec4(1,0.95f,0.6f,1), help_title);
@@ -7086,7 +7116,7 @@ void Engine::render()
         ImGui::BulletText("Set labels and descriptions in neuron editor (select neuron)");
         ImGui::BulletText("Set Lesson target for each output and Apply; unspecified targets are zero");
         ImGui::BulletText("Add lessons (M) with current inputs and these targets");
-        ImGui::BulletText("GRU: Reset memory, then set inputs, Apply and Next sample for each step");
+        ImGui::BulletText("GRU manual inference: Reset memory once, then set inputs, Apply and Next sample for each step");
         ImGui::BulletText("Train (B or T) after setting parameters");
         ImGui::BulletText("Mouse                - LMB orbit, MMB or Shift+LMB pan, wheel zoom");
         ImGui::Separator();
@@ -7095,7 +7125,7 @@ void Engine::render()
         ImGui::BulletText("Learning rate - step size (typical start ~0.001)");
         ImGui::BulletText("L1 - L1 regularization (|w|), encourages sparsity");
         ImGui::BulletText("L2 - L2 regularization (w^2), stabilizes training");
-        ImGui::BulletText("Target MSE - early stop threshold; <= 0 disables");
+        ImGui::BulletText("Target score - default 99%% (Target MSE 0.01). Both fields edit the same stopping threshold; Target MSE <= 0 disables it.");
         ImGui::BulletText("MSE is evaluated on all training lessons after each epoch, with fixed weights");
         ImGui::BulletText("Sequence targets apply to the final step; GRU memory resets for each lesson");
         ImGui::Separator();
@@ -7105,17 +7135,98 @@ void Engine::render()
         ImGui::BulletText("If loss plateaus, adjust epochs or learning rate; consider lowering L2");
         ImGui::Separator();
         ImGui::Text("Quick start");
-        ImGui::BulletText("1) Add lessons: press M or use the panel (saved to lessons.json)");
+        ImGui::BulletText("1) Add lessons: press M or use F4; lessons remain in memory until the network is saved");
         ImGui::BulletText("2) Set epochs, learning rate, L1/L2, optional Target MSE in 'Training parameters'");
         ImGui::BulletText("3) Start: click 'Start' or press B (HUD shows in the center)");
         ImGui::BulletText("4) Watch MSE and epoch progress (The lower the better)"); 
         ImGui::BulletText("ESC is emergency 'Stop' and interrupts training just in case");
-        ImGui::BulletText("5) On finish: Skynet will be launched.");
+        ImGui::BulletText("5) Completed training saves network_trained.json; use S to save a named network with its lessons");
         ImGui::Separator();
         ImGui::Text("Metrics");
+        ImGui::BulletText("Training score = 100 * clamp(1 - MSE, 0, 1); MSE and target remain visible during training.");
         ImGui::BulletText("IQ gain - heuristic metric: percentage decrease in MSE vs. start");
         ImGui::BulletText("Formula: IQ_gain = round(max(0, (MSE_start - MSE_final)/max(MSE_start,1e-6)) * 100)");
-        ImGui::BulletText("Interpretation: baseline IQ 0 like you");
+        ImGui::BulletText("IQ gain describes relative training-error reduction; it is a heuristic, not intelligence");
+        ImGui::Separator();
+        if(ImGui::CollapsingHeader("MLP / GRU / MLP+GRU",ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::TextWrapped("MLP transforms one observation using weighted sums, biases and activations. Hidden layers extract features. Without recurrent memory, earlier sequence frames cannot affect the final prediction unless history is explicitly included in the inputs.");
+            ImGui::TextWrapped("GRU stores a hidden state h across steps. The update gate z controls how much candidate information replaces memory; reset gate r controls which previous-state components contribute to the candidate. GRU uses its own matrices; ordinary edges entering GRU are visual and their weights do not control its gates.");
+            ImGui::PushFont(gHelpMonoFont);
+            ImGui::PushTextWrapPos(-1.0f);
+            ImGui::TextUnformatted(R"HELP(
+MLP:     x --------> [Hidden: features] --------> y
+
+Hybrid:  x_t ------> [MLP] ------> [GRU] ------> [Output]
+                                  ^ |
+                                  | +-- h_t --> next step
+                                h_(t-1)
+
+z = sigmoid(Wz*x + Uz*h_prev + bz)
+r = sigmoid(Wr*x + Ur*h_prev + br)
+c = tanh(Wh*x + Uh*(r*h_prev) + bh)
+h = (1-z)*h_prev + z*c
+* means elementwise multiplication outside matrix products.
+)HELP");
+            ImGui::PopTextWrapPos();
+            ImGui::PopFont();
+            ImGui::TextWrapped("Use MLP for independent observations, GRU for ordered observations, and MLP+GRU when features must be extracted before remembering their history. More layers do not guarantee better predictions.");
+            ImGui::BulletText("Select Input, Hidden or GRU and use Add GRU layer in F1. A adds an ordinary hidden layer.");
+            ImGui::BulletText("Click an ordinary layer's activation label to change it. GRU gates use sigmoid and its candidate uses tanh.");
+        }
+        if(ImGui::CollapsingHeader("Sequence lessons - complete workflow",ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::BulletText("Open F4. Add Frame creates the first step from current inputs; subsequent frames copy the last step.");
+            ImGui::BulletText("Edit the input cells for every step. Duplicate, Delete Frame and Move Up/Down adjust the sequence.");
+            ImGui::BulletText("Set Expected Outputs (final sequence target), then Save Sequence Lesson. M adds only a single-step lesson.");
+            ImGui::BulletText("Select a step or Play Sequence to preview it. Seeking replays the prefix from reset memory.");
+            ImGui::BulletText("During training, memory resets for each lesson; the loss supervises only the final step. Gradients propagate backward through the sequence (BPTT).");
+            ImGui::BulletText("For manual inference, reset once before a new independent sequence. Resetting between every step erases its history.");
+            ImGui::PushFont(gHelpMonoFont);
+            ImGui::PushTextWrapPos(-1.0f);
+            ImGui::TextUnformatted(R"HELP(
+Example: remember the first bit (one input, one output)
+Lesson A:  [0] -> [0] -> [1]     final target: [0]
+Lesson B:  [1] -> [0] -> [1]     final target: [1]
+                         ^
+Same last input, different history: memory is necessary.
+Add varied middle steps and lengths; check unseen sequences.
+)HELP");
+            ImGui::PopTextWrapPos();
+            ImGui::PopFont();
+        }
+        if(ImGui::CollapsingHeader("Training advice and troubleshooting",ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::BulletText("Start with a small network and learning rate near 0.001. Change one parameter at a time.");
+            ImGui::BulletText("Scale inputs consistently during training and inference. F4 input cells are restricted to 0..1.");
+            ImGui::BulletText("Sigmoid outputs suit 0..1 targets, tanh suits -1..1, linear allows unrestricted regression. ReLU cannot predict negative targets.");
+            ImGui::BulletText("Single-step lessons do not teach long-term memory. Include histories that require different answers despite identical final inputs.");
+            ImGui::BulletText("Oscillating or non-finite loss: lower learning rate and check input/target scales. Flat loss: check targets, connectivity and activation before adding layers.");
+            ImGui::BulletText("Low training MSE with poor new predictions suggests overfitting: collect diverse lessons, reduce model size or adjust regularization.");
+            ImGui::BulletText("MSE is mean squared error over training lessons and outputs. No separate validation split is evaluated automatically; check new examples separately.");
+            ImGui::BulletText("B retains current weights. T also retains weights and raises the epoch budget to at least 200000; it can finish at the budget before reaching the target.");
+            ImGui::BulletText("X discards learned parameters. During training it queues randomization between lessons and retains the MSE history.");
+            ImGui::BulletText("ESC or Stop retains weights and re-evaluates their current MSE, including a partial epoch. Status remains Need Re-Training; interruption does not certify success.");
+            ImGui::BulletText("Current MSE evaluation after Stop can take time on large datasets. Interrupted weights are not automatically saved as network_trained.json; use S.");
+            ImGui::BulletText("Avg epoch time includes every lesson, the final MSE evaluation and time between training frames; it is a smoothed wall-clock measurement.");
+        }
+        if(ImGui::CollapsingHeader("Auto Prune, groups and Video Screen"))
+        {
+            ImGui::BulletText("Auto Prune in F4 tests removing hidden/GRU neurons. Tolerance is a percentage increase over the original baseline MSE, not a percentage of neurons.");
+            ImGui::BulletText("Only fully evaluated accepted reductions are retained by Stop. The minimum is one neuron per hidden/GRU layer. Retrain and check unseen examples afterwards.");
+            ImGui::BulletText("Input label prefixes before '_' form automatic groups. Expand groups independently; Hide hidden layers changes only the presentation.");
+            ImGui::BulletText("Ctrl+click selects multiple inputs. Synchronize links inputs; Opposite phase makes the follower equal 1-source.");
+            ImGui::BulletText("F6 configures Video Screen resolution, visibility, output pixel mapping and image lessons. Run pixel assignment after changing resolution and check the mapping message.");
+            ImGui::BulletText("Image lessons decode PNG/JPG to grayscale targets. Predictions drive the screen; expected targets do not replace network outputs.");
+        }
+        if(ImGui::CollapsingHeader("Saving and loading"))
+        {
+            ImGui::BulletText("S opens Save; O opens Load. Saved network JSON includes parameters, GRU matrices and collected lessons. Adding or editing a lesson alone does not save it to disk.");
+            ImGui::BulletText("engine.conf stores training defaults and scene/camera settings, not the lesson dataset. lessons.json is no longer the lesson storage format.");
+            ImGui::BulletText("Normal training completion attempts to save network_trained.json. Check F3 for save errors; keep a named copy before experimenting.");
+            ImGui::BulletText("Hidden topology changes preserve lessons when the input/output interface stays compatible. Interface changes or presets can replace lessons; read the warning.");
+        }
+        ImGui::PopTextWrapPos();
         ImGui::End();
         }
 
@@ -7222,7 +7333,7 @@ void Engine::render()
         // return to the event loop between updates, keeping ESC responsive.
         if(gTrain.active)
         {
-            double t0 = nowSeconds();
+            if(gTrain.sampleCursor==0) gTrain.epochStartTime=nowSeconds();
             gInferenceNeedsReset = true;
             const bool lastLesson=gTrain.sampleCursor+1>=gDataset.size();
             float mse = ApplyPendingWeightRandomization(graph)
@@ -7246,9 +7357,9 @@ void Engine::render()
                 gTrain.lastMSE = mse;
                 gTrain.mseHistory.push_back(mse);
                 gTrain.epoch++;
-                double t1 = nowSeconds();
-                double dt = (t1 - t0);
-                gTrain.avgEpochMs = (gTrain.avgEpochMs*0.9 + dt*1000.0*0.1);
+                const double epochMs=(nowSeconds()-gTrain.epochStartTime)*1000.0;
+                gTrain.avgEpochMs = gTrain.epoch==1 ? epochMs
+                    : gTrain.avgEpochMs*0.9 + epochMs*0.1;
 
                 // Early stop on target MSE
                 bool targetReached = (gTrain.targetMSE>0.0f && mse <= gTrain.targetMSE);
@@ -7305,9 +7416,9 @@ void Engine::render()
                 ImVec4 bg = gTargetReachedVisual ? ImVec4(0.12f,0.55f,0.22f,0.95f) : ImVec4(0.90f,0.55f,0.15f,0.95f);
                 ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
                 ImGui::Begin("TrainingResult", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoInputs);
-                // Title (always "Training Finished") and status line
+                // Result title and status distinguish completion from interruption
                 ImGui::SetWindowFontScale(3.0f);
-                const char* titleTop = "Training Finished";
+                const char* titleTop = gTrainInterrupted ? "Training Interrupted" : "Training Finished";
                 ImVec2 ts = ImGui::CalcTextSize(titleTop);
                 ImGui::SetCursorPosX((winSz.x - ts.x)*0.5f);
                 ImGui::TextUnformatted(titleTop);
@@ -7335,7 +7446,9 @@ void Engine::render()
                 // Summary
                 ImGui::Text("Epoch: %d / %d", gTrain.epoch, gTrain.totalEpochs);
                 ImGui::Text("Final MSE: %.6f  Target: %s", gTrain.lastMSE, gTrain.targetMSE>0?std::to_string(gTrain.targetMSE).c_str():"-");
-                ImGui::Text("Accuracy: %.2f%%", AccuracyFromMSE(gTrain.lastMSE));
+                ImGui::Text("Training score: %.2f%%", TrainingScoreFromMSE(gTrain.lastMSE));
+                if(gTrain.targetMSE>0) ImGui::Text("Target score: %.2f%%",TrainingScoreFromMSE(gTrain.targetMSE));
+                else ImGui::TextUnformatted("Target score: Off");
                 ImGui::Spacing();
                 // Final MSE plot with axes and legend
                 ImVec2 plotSize(std::max(400.0f, winSz.x - 80.0f), 160.0f);
@@ -7407,14 +7520,14 @@ void Engine::render()
         ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
         ImGui::Begin("TrainingResult", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoInputs);
         
-        // Title (always "Training Finished") and status line
+        // Result title and status distinguish completion from interruption
         ImGui::SetWindowFontScale(3.0f);
-        const char* titleTop = "Training Finished";
+        const char* titleTop = gTrainInterrupted ? "Training Interrupted" : "Training Finished";
         ImVec2 ts = ImGui::CalcTextSize(titleTop);
         ImGui::SetCursorPosX((winSz.x - ts.x)*0.5f);
         ImGui::TextUnformatted(titleTop);
         ImGui::SetWindowFontScale(1.4f);
-        const char* status = gTrainInterrupted ? "EMERGENCY STOP - ESC BUTTON PRESSED!" : (gTargetReachedVisual ? "Target Reached" : "Target Not Reached");
+        const char* status = gTrainInterrupted ? "Weights retained - training incomplete" : (gTargetReachedVisual ? "Target Reached" : "Target Not Reached");
         ImVec2 st = ImGui::CalcTextSize(status);
         ImGui::SetCursorPosX((winSz.x - st.x)*0.5f);
         ImGui::TextUnformatted(status);
@@ -7439,7 +7552,9 @@ void Engine::render()
         // Summary
         ImGui::Text("Epoch: %d / %d", gTrain.epoch, gTrain.totalEpochs);
         ImGui::Text("Final MSE: %.6f  Target: %s", gTrain.lastMSE, gTrain.targetMSE>0?std::to_string(gTrain.targetMSE).c_str():"-");
-        ImGui::Text("Accuracy: %.2f%%", AccuracyFromMSE(gTrain.lastMSE));
+        ImGui::Text("Training score: %.2f%%", TrainingScoreFromMSE(gTrain.lastMSE));
+        if(gTrain.targetMSE>0) ImGui::Text("Target score: %.2f%%",TrainingScoreFromMSE(gTrain.targetMSE));
+        else ImGui::TextUnformatted("Target score: Off");
         ImGui::Spacing();
 
         // Final MSE plot with axes and legend
@@ -7595,18 +7710,10 @@ void Engine::onKey(int key, int /*scancode*/, int action, int mods)
     {
         if(gTrain.active)
         {
-            gTrain.active = false;
-            graph.status=NetworkStatus::Trained;
-            graph.trainedMSE=gTrain.lastMSE;
-            graph.topologyWarningAcknowledged=false;
-            gShowTrainingWindow = false;
-            gHUDHasRect = false;
-            gTrain.done = true;
-            gCelebrationVisible = true;
-            gTargetReachedVisual = false;
-            gTrainInterrupted = true;
+            InterruptTraining(graph);
+            gShowTrainingWindow=false;
+            gHUDHasRect=false;
             SaveEngineConf("engine.conf");
-            Logf("Training interrupted (ESC) at epoch %d, MSE=%.6f", gTrain.epoch, gTrain.lastMSE);
             return;
         } 
         else

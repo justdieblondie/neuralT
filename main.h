@@ -14,7 +14,7 @@
 // ─────────────────────────────────────────
 // Paths and version
 // ─────────────────────────────────────────
-inline constexpr const char* kAppVersion             = "v4.3";
+inline constexpr const char* kAppVersion             = "v4.4";
 inline constexpr const char* kEngineConfFile         = "engine.conf";
 inline constexpr const char* kLessonsFile            = "lessons.json";
 inline constexpr const char* kNetworkFile            = "network.json";
